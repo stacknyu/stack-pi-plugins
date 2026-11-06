@@ -1,7 +1,5 @@
 # Stack Pi Plugins
 
-[![CI](https://github.com/stacknyu/stack-pi-plugins/actions/workflows/ci.yml/badge.svg)](https://github.com/stacknyu/stack-pi-plugins/actions/workflows/ci.yml)
-
 Stacknyu's collection of plugins for the [Pi coding agent](https://github.com/earendil-works/pi).
 One repository, one install, separate plugin folders.
 
@@ -56,7 +54,7 @@ pnpm install --frozen-lockfile
 pnpm test
 ```
 
-Use pnpm 12.14.0 (the version in `package.json`). Tests use temporary repositories and fake workers; they do not call models. CI runs the same suite on macOS/Linux with Node 22/24.
+Use pnpm 12.14.0 (the version in `package.json`). Tests use temporary repositories and fake workers; they do not call models. Run them locally before pushing; this repository has no GitHub Actions workflows.
 
 To use your checkout, remove the Git installation first, then:
 
@@ -77,7 +75,7 @@ Keep plugins independent. Preserve each plugin's internal relative paths; do not
 
 ### Release
 
-Open a pull request and let CI pass. Update the root version and `CHANGELOG.md`, refresh the lockfile with `pnpm install`, merge, then tag the tested commit:
+Update the root version and `CHANGELOG.md`, refresh the lockfile with `pnpm install`, and run `pnpm test` locally. Review and merge the changes, then tag the tested commit:
 
 ```sh
 git tag -a v0.2.0 -m 'v0.2.0'

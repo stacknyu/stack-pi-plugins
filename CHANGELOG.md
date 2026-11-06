@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Remove GitHub Actions CI; verification remains available locally through `pnpm test` and pi-check.
+
 ## 0.1.0
 
 - First standalone collection of Stacknyu's Pi plugins.
