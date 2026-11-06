@@ -1,0 +1,13 @@
+{
+  "speculate": false,
+  "warmBase": false,
+  "custom": [
+    {
+      "name": "plugins",
+      "cmd": "pnpm test",
+      "inputs": ["packages/**", "tests/**", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"],
+      "timeout": "3m",
+      "lane": "fast"
+    }
+  ]
+}
