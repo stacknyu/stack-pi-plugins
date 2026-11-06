@@ -9,8 +9,6 @@ Independent plugins for the [Pi coding agent](https://github.com/earendil-works/
 
 ## Install independently
 
-**First npm publication is pending registry access. The npm commands below become available after publication.**
-
 Requires Pi, Node.js **22.19+**, Git, and macOS or Linux. Tested against Pi 1.5.0. Pi Web is optional.
 
 ```sh
