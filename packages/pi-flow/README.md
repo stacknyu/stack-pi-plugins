@@ -53,7 +53,7 @@ Reload Pi. This installs pi-flow and pi-check together. See the [collection READ
 **4. It hands off by itself.** The planning agent calls `task_handoff`, which refuses until the plan is sound:
 - every question is answered
 - every item has an id, a "Done when" and `[areas: …]`
-- `[after: …]` names real ids
+- `[after: …]` names real ids and the dependency graph has no cycles
 - the checks pass on today's code
 - the tree is clean
 
@@ -69,7 +69,9 @@ Then it commits `.tasks/<slug>/` and starts the queue. The live panel appears un
 
 ## The manager
 
-Type `/task manage` in any chat (in Pi Web it is pinned). That chat becomes the queue's manager. It acts **only on what you ask**; it never starts work by itself. Ask it things like:
+An approved queue automatically gets a dedicated manager after its baseline passes. A detached supervisor checks health every 60 seconds without model calls; on a terminal failure the chat-only manager can propose bounded retries of existing items. Scope, checks, manual pause/stop and worker ownership remain enforced by code. It does not invent new work or reset uncertain worktrees. See [manager policy and limits](skills/pi-flow/references/manager.md).
+
+`/task manage` still makes any chat a separate **manual** manager (pinned in Pi Web), acting only on what you ask. Ask it things like:
 - "what is wrong?": it reads the failures together and tells you the real cause (e.g. "these 6 checks failed because P03 had not run yet")
 - "what happened with P28d?": the item's status, commit, last reply and activity
 - "re-run the checks for member detail", "retry P28", "let the parked items run", "run 3 at once", "stop", "start"
@@ -107,6 +109,7 @@ It steers a running queue through an inbox the runner reads between items, so no
 - **Smart re-queuing:**
   - An item that says `BLOCKED` while other work is still pending (usually a prerequisite that has not run yet) is **deferred** and tried again after that work (`DEFERRED` in the log). Only a second BLOCKED, with nothing left that could help, makes it fail. A real decision or missing environment still ends up as a failure for you.
   - A passed `[check]` runs again automatically (`RECHECK`) when an item it covers (overlapping areas, or named in its `[after: …]`) changes later.
+- **Dependency scheduling:** reject cycles and duplicate dependency/area tags. Prefer ready prerequisites on the longest remaining chain, preserve explicit `next` order, and fill slots with disjoint ready work. File order only breaks ties; do not serialize independent items with unnecessary `[after]` tags.
 - **Adaptive parallelism:** the queue runs up to `parallel` items at once. A conflict narrows it by one, and 3 clean passes in a row widen it by one, between `parallelMin` and `parallel`. A conflicting item is first redone in the same session on the latest code. Only if that fails too is it retried at the end.
 - **Safety:**
   - checks run once on the unchanged code before anything starts
@@ -120,9 +123,10 @@ When [pi-check](../pi-check) is installed, the queue uses it automatically (noth
 
 - Every check command goes through pi-check's shared broker. `go test` / `go vet` run per package and are cached by file content. Other commands run once per identical set of files, and every worktree shares the results. Heavy runs are throttled, so parallel items stop fighting for the CPU.
 - Go test failures that also fail on the base branch are "pre-existing": they no longer block items or the baseline.
+- Before starting a worktree worker, pi-flow exposes the discovered pi-check installation through an ignored directory symlink at `.pi/extensions/pi-flow-check`. Project-local installations therefore provide the `check` tool and `/check` immediately, without reinstalling packages or copying settings/secrets. Pi deduplicates the same physical extension when it is also installed globally. This does not copy other plugins or skills.
 - Item agents are told to use the `check` tool. It runs only what their change affects, and they see which failures are theirs.
 - `"checks": ["pi-check"]` is the native form. One entry runs the tests, type checks and lint the item affects in every Go/TypeScript/Python project, and ignores pre-existing failures in all of them. The planner suggests it when pi-check is installed.
-- `"checkBroker": false` in `.pi-queue/config.json` turns all of this off.
+- `"checkBroker": false` in `.pi-queue/config.json` disables this integration and removes the managed link when preparing a reused worktree. Independently installed global plugins remain enabled; existing sessions need restarting to change their loaded tools.
 
 ## Settings (`.pi-queue/config.json`, written by the handoff)
 
@@ -132,7 +136,8 @@ Your own edits are kept across tasks. Useful ones:
 |---|---|---|
 | `parallel` / `parallelMin` | from the plan / 1 | width range |
 | `adaptive` | true | change the width on conflicts and clean streaks |
-| `model`, `thinking` | Pi default, high | model for the item sessions |
+| `model`, `thinking` | Pi default, high | default model for item sessions and the isolated manager |
+| `manager` | true | automatic bounded supervision after approved handoff; false disables it |
 | `itemMinutes` | 40 | time limit per item (raised levels give more) |
 | `maxNetLines`, `maxFilesGrowing` | 150, 5 | starting size limits |
 | `escalate` | 15/600 → 40/1500 → 200/5000 | size levels |
@@ -156,11 +161,11 @@ Your own edits are kept across tasks. Useful ones:
 
 - Don't commit to the task's branch or edit files in the repo folder: the queue fast-forwards that branch.
 - Keep the machine awake (`caffeinate -dims` on a Mac). In Pi Web mode, keep the Pi Web server running. In terminal mode nothing needs to stay open: the runner and its items are background processes.
-- One queue per repo at a time. You can plan the next task while one runs; its handoff waits until the queue is free.
+- One queue per repo at a time. You can discuss the next task while one runs, but keep draft files outside the active checkout. Its handoff must wait until the queue is free.
 
 ## Plugin regression tests
 
-With Node 22.19+ and the declared Pi peer dependencies installed, `node --test runner.test.mjs` exercises parsing, planner validation and simulated CLI/Web workers without model calls or application tests. Route it through your check broker when installed.
+From the collection root, `pnpm test` exercises the broker, parsing, installation, real resource loading and supervised temporary-repository workflows with fake CLI/Web agents. No model calls or application tests. Route it through your check broker when installed.
 
 ## Requirements
 

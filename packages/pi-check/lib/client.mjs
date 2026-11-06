@@ -1,12 +1,13 @@
 // Talk to the repo's broker, starting it when needed.
 import { spawn } from "node:child_process";
-import { chmodSync, mkdirSync, openSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, openSync, realpathSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HOME_DIR, SHIM_DIR, STATE_DIR, VERSION, loadJson, pidAlive, repoRoots } from "./util.mjs";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
+// Worktree plugin links must not publish a temporary worktree path in the global CLI registry.
+const HERE = realpathSync(dirname(fileURLToPath(import.meta.url)));
 export const BROKER = join(HERE, "broker.mjs");
 export const CLI = join(HERE, "..", "cli.mjs");
 export { SHIM_DIR };
@@ -18,10 +19,11 @@ export function cleanPath(p = process.env.PATH ?? "") {
 		.join(delimiter);
 }
 
-function request(info, path, body, onEvent, timeoutMs) {
+export function request(info, path, body, onEvent, timeoutMs, signal) {
 	return new Promise((res, rej) => {
 		const data = body === undefined ? undefined : JSON.stringify(body);
-		const req = http.request({ host: "127.0.0.1", port: info.port, path, method: data === undefined ? "GET" : "POST", headers: { "x-pi-check-token": info.token, "content-type": "application/json" } }, (r) => {
+		const req = http.request({ host: "127.0.0.1", port: info.port, path, method: data === undefined ? "GET" : "POST", signal, headers: { "x-pi-check-token": info.token, "content-type": "application/json" } }, (r) => {
+			r.on("error", rej);
 			let buf = "";
 			let last;
 			const nd = String(r.headers["content-type"] ?? "").includes("ndjson");
@@ -81,7 +83,8 @@ export async function connect(cwd, { start = true } = {}) {
 	let info = loadJson(file);
 	if (info && pidAlive(info.pid)) {
 		const p = await ping(info);
-		if (p && p.version === VERSION) return { info, ...rr };
+		if (!p) throw new Error("pi-check broker is alive but unresponsive; no duplicate broker was started");
+		if (p.version === VERSION) return { info, ...rr };
 		if (p && p.version !== VERSION) {
 			const status = await request(info, "/status", undefined, undefined, 3000);
 			if (status.running?.length || status.pending?.requested) {
@@ -110,9 +113,11 @@ export async function connect(cwd, { start = true } = {}) {
 }
 
 export async function call(cwd, path, body, onEvent, opts = {}) {
+	opts.signal?.throwIfAborted();
 	const c = await connect(cwd, opts);
+	opts.signal?.throwIfAborted();
 	if (!c.info) return undefined;
-	return request(c.info, path, body === undefined ? undefined : { root: c.root, ...body }, onEvent, opts.timeoutMs);
+	return request(c.info, path, body === undefined ? undefined : { root: c.root, ...body }, onEvent, opts.timeoutMs, opts.signal);
 }
 
 /** `go` shim that routes `go test` / `go vet` through the broker. */

@@ -2,8 +2,9 @@
 // pi-check command line. Agents normally use the `check` tool; this is for people, scripts, the pi-flow
 // runner, and the `go` shim.
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { CLI, SHIM_DIR, call, cleanPath, connect, installShims } from "./lib/client.mjs";
 import { CONFIG_FILE } from "./lib/repo.mjs";
 import { STATE_DIR, VERSION, fmtMs, normRel, repoRoots, shq, tailLines, which } from "./lib/util.mjs";
@@ -214,13 +215,13 @@ function statusText(s) {
 	return lines.join("\n");
 }
 
-async function execCommand(cwd, command) {
+async function execCommand(cwd, command, env) {
 	if (process.env.PI_CHECK_BYPASS === "1") {
 		const r = spawnSync("/bin/sh", ["-c", command], { cwd, stdio: "inherit", env: { ...process.env, PATH: cleanPath() } });
 		return r.status ?? 1;
 	}
 	try {
-		const r = await call(cwd, "/exec", { cwd, cmd: command }, (ev) => ev.type === "progress" && progress(ev));
+		const r = await call(cwd, "/exec", { cwd, cmd: command, env }, (ev) => ev.type === "progress" && progress(ev));
 		process.stdout.write(r.output ?? "");
 		if (r.output && !r.output.endsWith("\n")) process.stdout.write("\n");
 		if (r.source !== "ran") process.stdout.write(Date.now() - r.at < 3000 ? `[pi-check] the same command on identical files was already running${r.source === "shared" ? ` in ${r.root}` : ""} — waited for it and reused its result\n` : `[pi-check] same command on identical files already ran${r.source === "shared" ? ` in ${r.root}` : ""} ${fmtMs(Date.now() - r.at)} ago — result reused, not rerun\n`);
@@ -234,26 +235,15 @@ async function execCommand(cwd, command) {
 
 // ---------- go shim ----------
 
-const GO_VALUE_FLAGS = new Set(["run", "skip", "timeout", "count", "p", "parallel", "tags", "shuffle", "cpu", "vet", "coverpkg", "covermode", "ldflags", "gcflags", "mod", "modfile", "C", "exec", "o", "outputdir", "coverprofile", "cpuprofile", "memprofile", "blockprofile", "mutexprofile", "trace", "bench", "benchtime", "fuzz", "fuzztime", "list", "json"]);
+const GO_VALUE_FLAGS = new Set(["run", "skip", "timeout", "count", "p", "parallel", "tags", "shuffle", "cpu", "vet", "coverpkg", "covermode", "ldflags", "gcflags", "mod", "modfile", "C", "exec", "o", "outputdir", "coverprofile", "cpuprofile", "memprofile", "blockprofile", "mutexprofile", "trace", "bench", "benchtime", "fuzz", "fuzztime", "list"]);
 const GO_PASSTHROUGH = new Set(["bench", "benchtime", "benchmem", "c", "o", "exec", "coverprofile", "cpuprofile", "memprofile", "blockprofile", "mutexprofile", "trace", "fuzz", "fuzztime", "list", "args", "json", "outputdir", "i", "n", "x", "work", "C", "modfile", "toolexec", "test.v"]);
-const GO_KEY_FLAGS = new Set(["run", "skip", "short", "race", "tags", "shuffle", "cpu", "cover", "covermode", "coverpkg", "msan", "asan", "mod", "ldflags", "gcflags", "vet", "timeout", "parallel"]);
 
-async function shim(args) {
-	const tool = args[0];
-	const rest = args.slice(1);
-	const real = which(tool, { skipDir: process.env.PI_CHECK_SHIM_DIR || SHIM_DIR }) ?? tool;
-	const passthrough = () => {
-		const r = spawnSync(real, rest, { stdio: "inherit", env: { ...process.env, PATH: cleanPath() } });
-		process.exit(r.status ?? 1);
-	};
-	if (tool !== "go" || process.env.PI_CHECK_BYPASS === "1" || !["test", "vet"].includes(rest[0])) return passthrough();
-	const sub = rest[0];
+export function parseGoArgs(a) {
 	const flags = [];
-	const keyFlags = [];
 	const pkgs = [];
 	let verbose = false;
 	let pass = false;
-	const a = rest.slice(1);
+	let refresh = false;
 	for (let i = 0; i < a.length; i++) {
 		const x = a[i];
 		if (x.startsWith("-") && x !== "-") {
@@ -267,34 +257,46 @@ async function shim(args) {
 				verbose = val !== "false";
 				continue;
 			}
-			if (["count", "p", "failfast", "parallel"].includes(name) && !(name === "count" && Number(val) > 1)) {
-				if (name === "parallel") { flags.push(`-parallel=${val}`); keyFlags.push(`-parallel=${val}`); }
-				if (name === "failfast") flags.push("-failfast");
-				continue;
-			}
+			if (name === "p") continue; // the broker owns build concurrency
+			if (name === "count") refresh = true;
 			const f = val === undefined ? `-${name}` : `-${name}=${val}`;
 			flags.push(f);
-			if (GO_KEY_FLAGS.has(name) || name === "count") keyFlags.push(f);
+
 		} else {
 			if (x.endsWith(".go")) pass = true;
 			pkgs.push(x);
 		}
 	}
+	return { flags, pkgs, verbose, pass, refresh };
+}
+
+async function shim(args) {
+	const tool = args[0], rest = args.slice(1);
+	const real = which(tool, { skipDir: process.env.PI_CHECK_SHIM_DIR || SHIM_DIR }) ?? tool;
+	const passthrough = () => {
+		const r = spawnSync(real, rest, { stdio: "inherit", env: { ...process.env, PATH: cleanPath() } });
+		process.exit(r.status ?? 1);
+	};
+	if (tool !== "go" || process.env.PI_CHECK_BYPASS === "1" || !["test", "vet"].includes(rest[0])) return passthrough();
+	const sub = rest[0];
+	const { flags, pkgs, verbose, pass, refresh } = parseGoArgs(rest.slice(1));
+	const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => /^(GO[A-Z0-9_]*|CGO_[A-Z0-9_]+|CC|CXX|PKG_CONFIG)$/.test(k)).sort());
+	env.PATH = cleanPath();
 	const cwd = process.cwd();
 	const rr = repoRoots(cwd);
 	if (!rr) return passthrough();
-	const viaExec = async () => process.exit(await execCommand(cwd, ["go", ...rest].map((s) => (/^[\w@%+=:,./-]+$/.test(s) ? s : shq(s))).join(" ")));
+	const viaExec = async () => process.exit(await execCommand(cwd, ["go", ...rest].map((s) => (/^[\w@%+=:,./-]+$/.test(s) ? s : shq(s))).join(" "), env));
 	if (pass) return viaExec();
 	const cwdRel = cwd === rr.root ? "." : normRel(cwd.slice(rr.root.length + 1));
 	let r;
 	try {
-		r = await call(cwd, "/run", { goSelect: { cwdRel, patterns: pkgs }, kinds: [sub], extraArgs: flags, extraKey: JSON.stringify(keyFlags.sort()), detail: true, label: `go ${sub} (agent)` }, (ev) => ev.type === "progress" && progress(ev));
+		r = await call(cwd, "/run", { goSelect: { cwdRel, patterns: pkgs }, kinds: [sub], extraArgs: flags, extraKey: JSON.stringify(flags), env, refresh, detail: true, label: `go ${sub} (agent)` }, (ev) => ev.type === "progress" && progress(ev));
 	} catch (e) {
 		err(`[pi-check] broker unavailable (${e.message}); inspect status before retrying. No unbudgeted duplicate was started.`);
 		process.exit(2);
 	}
 	const rep = r.report;
-	if (rep.go?.unsupported && !rep.units) return viaExec();
+	if (rep.go?.unsupported) return viaExec();
 	const byLabel = new Map((rep.results ?? []).map((x) => [x.label, x]));
 	let anyNew = !rep.ok;
 	const knownLines = [];
@@ -335,7 +337,7 @@ async function shim(args) {
 	process.exit(anyNew ? 1 : 0);
 }
 
-main().then(
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) main().then(
 	(code) => process.exit(code ?? 0),
 	(e) => {
 		err(`pi-check: ${e?.message ?? e}`);

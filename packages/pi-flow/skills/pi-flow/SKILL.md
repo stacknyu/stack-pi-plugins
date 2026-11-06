@@ -17,4 +17,4 @@ Read the reference that fits the question:
 Rules that always hold:
 - The runner, not an agent, decides whether an item passes: scope (allowed paths), size limits, checks.
 - Queue items never ask questions, never commit, and never use the queue tools.
-- The manager acts only on what the user asks; it never edits code, reverts commits or deletes branches.
+- The manual manager acts only when asked. The isolated automatic manager may propose bounded recovery of approved existing work; see references/manager.md. Neither manager edits code, reverts commits or deletes branches.

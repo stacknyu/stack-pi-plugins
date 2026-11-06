@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, realpathSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, realpathSync, existsSync, symlinkSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 import { Broker } from "./lib/broker.mjs";
 import { loadConfig } from "./lib/repo.mjs";
 import go from "./lib/adapters/go.mjs";
+import http from "node:http";
+import { request } from "./lib/client.mjs";
 
 const cli = fileURLToPath(new URL("./cli.mjs", import.meta.url));
 const quote = (s) => `'${s.replaceAll("'", `'\\''`)}'`;
@@ -40,7 +42,7 @@ test("automatic CPU budget is independent of agents and honors explicit ceilings
 	b.pending.push({ uid: "extra" });
 	assert.equal(b.allocation(b.pending[0]), 0);
 	b.running.clear();
-	assert.equal(b.allocation(b.pending[0]), 8);
+	assert.equal(b.allocation(b.pending[0]), 4); // leave room for staggered requests
 	b.config.threads = 2;
 	assert.equal(b.allocation(b.pending[0]), 2);
 });
@@ -196,9 +198,160 @@ test("a real short command completes while a heavy command is still running", as
 	} finally { writeFileSync(join(root, "release"), "done"); await slow; }
 });
 
+test("a late heavy request gets capacity even when the first arrived alone", (t) => {
+	const { b } = fixture(t, { maxJobs: 3, cpuBudget: 8 });
+	const task = { project: { lang: "go", dir: "." }, kind: "test" };
+	b.pending = [task];
+	const first = b.allocation(task);
+	assert.equal(first, 4);
+	b.running.add({ threads: first, lane: "heavy", group: b.groupOf(task) });
+	assert.equal(b.allocation(task), 3);
+});
+
+test("disconnect settles queued waiters without abandoning a live request", async (t) => {
+	const { root, b } = fixture(t, { custom: [{ name: "sample", cmd: "unused", inputs: ["input.txt"] }] });
+	b.pump = () => {};
+	const request = { root, scope: "all", strict: true };
+	const result = b.run(request);
+	b.cancelRequest(request);
+	assert.equal((await result).ok, false);
+	assert.equal(b.pending[0].waiters.length, 0);
+	assert.equal(b.pending[0].speculative, true);
+});
+
+for (const producerChanges of [false, true]) test(`joined checks reject changed ${producerChanges ? "producer" : "requester"} content`, { timeout: 10000 }, async (t) => {
+	const cmd = `${quote(process.execPath)} -e 'const fs=require("fs");fs.writeFileSync("started","1");const timer=setInterval(()=>{if(fs.existsSync("release"))clearInterval(timer)},10)'`;
+	const { root, b, git } = fixture(t, { custom: [{ name: "sample", cmd, inputs: ["input.txt"] }] });
+	const wt = `${root}-wt`;
+	git("worktree", "add", "--detach", wt);
+	t.after(() => rmSync(wt, { recursive: true, force: true }));
+	const request = { scope: "all", strict: true };
+	const both = Promise.all([b.run({ root, ...request }), b.run({ root: wt, ...request })]);
+	try {
+		while (!existsSync(join(root, "started"))) await new Promise((r) => setTimeout(r, 10));
+		writeFileSync(join(producerChanges ? root : wt, "input.txt"), "two");
+	} finally { writeFileSync(join(root, "release"), "done"); }
+	const [a, other] = await both;
+	assert.equal(a.ok, !producerChanges);
+	assert.equal(other.ok, false);
+	assert.equal(b.stats.ran, 1); // no implicit retry against different content
+});
+
+test("Go inputs ignore unrelated locks but retain explicit inputs, embeds and native dependencies", (t) => {
+	const { root, b } = fixture(t, { languages: { go: true, ts: false, python: false } });
+	mkdirSync(join(root, "lib", "testdata", "assets"), { recursive: true });
+	writeFileSync(join(root, "go.mod"), "module example.test/demo\n\ngo 1.22\n");
+	writeFileSync(join(root, "demo_test.go"), 'package demo\nimport _ "example.test/demo/lib"\n');
+	writeFileSync(join(root, "lib", "lib.go"), 'package lib\nimport _ "embed"\n//go:embed "testdata/*"\nvar data string\n');
+	writeFileSync(join(root, "lib", "lib.h"), "// native input\n");
+	writeFileSync(join(root, "lib", "testdata", "assets", "data.txt"), "embedded");
+	writeFileSync(join(root, "pnpm-lock.yaml"), "unrelated");
+	const rc = b.root(root).rc, project = go.detect(rc)[0];
+	const units = go.units(rc, project, "test");
+	assert.equal(units.length, 2); // no-test packages still require compilation
+	const inputs = units.find((u) => u.target === ".").inputs;
+	assert.equal(inputs.includes("pnpm-lock.yaml"), false);
+	assert.ok(inputs.includes("lib/lib.h"));
+	assert.ok(inputs.includes("lib/testdata/assets/data.txt"));
+	b.config.projects["."] = { inputs: ["pnpm-lock.yaml"] };
+	assert.ok(go.units(rc, project, "test")[0].inputs.includes("pnpm-lock.yaml"));
+});
+
 test("Go work is package-sized and timeout changes the cache key", () => {
 	assert.equal(go.batchSize("test"), 1);
 	assert.equal(go.group({ dir: "." }, "test", {}).limit, Infinity);
 	assert.equal(go.group({ dir: "." }, "test", { parallel: 1 }).limit, 1);
 	assert.notEqual(go.argsKey({ timeout: "1m" }), go.argsKey({ timeout: "2m" }));
+});
+
+test("CLI package-bin symlinks dispatch rather than silently succeeding", (t) => {
+	const { root } = fixture(t), bin = join(root, "pi-check-bin");
+	symlinkSync(cli, bin);
+	assert.match(execFileSync(process.execPath, [bin, "--help"], { encoding: "utf8" }), /pi-check run/);
+});
+
+for (const native of [true, false]) test(`${native ? "native" : "exec"} producer additions invalidate joined results before caching`, { timeout: 10000 }, async (t) => {
+	const cmd = `${quote(process.execPath)} -e 'const fs=require("fs");fs.writeFileSync(".pi-check/started","1");const timer=setInterval(()=>{if(fs.existsSync(".pi-check/release"))clearInterval(timer)},10)'`;
+	const { root, b, git } = fixture(t, { custom: [{ name: "sample", cmd, inputs: ["*.txt"] }] });
+	const wt = `${root}-wt`; git("worktree", "add", "--detach", wt);
+	t.after(() => rmSync(wt, { recursive: true, force: true }));
+	const run = (root) => native ? b.run({ root, scope: "all", strict: true }) : b.exec({ root, cwd: root, cmd });
+	const both = Promise.all([run(root), run(wt)]);
+	while (!existsSync(join(root, ".pi-check/started"))) await new Promise((r) => setTimeout(r, 10));
+	writeFileSync(join(root, "new.txt"), "new input");
+	writeFileSync(join(root, ".pi-check/release"), "done");
+	const results = await both;
+	for (const result of results) assert.equal(native ? result.ok : !result.stale, false);
+	assert.equal(b.mem.size, 0, "contaminated results must not enter the shared cache");
+});
+
+test("requester changes during baseline confirmation cannot become a pre-existing PASS", async (t) => {
+	const { root, b, git } = fixture(t, { custom: [{ name: "sample", cmd: `${quote(process.execPath)} -e 'process.exit(1)'`, inputs: ["input.txt"] }] });
+	const wt = `${root}-wt`; git("worktree", "add", "--detach", wt);
+	t.after(() => rmSync(wt, { recursive: true, force: true }));
+	writeFileSync(join(wt, "input.txt"), "different");
+	b.confirmBase = async (_r, results) => {
+		await new Promise((r) => setTimeout(r, 10));
+		for (const row of results) for (const f of row.res.failures) b.known.ids[f.id] = { source: "base" };
+		writeFileSync(join(wt, "input.txt"), "edited during classification");
+	};
+	assert.equal((await b.run({ root: wt, scope: "all" })).ok, false);
+});
+
+test("exec caller environment cannot override the allocated Go CPU budget", async (t) => {
+	const { root, b } = fixture(t, { maxJobs: 1, cpuBudget: 1 });
+	const result = await b.exec({ root, cmd: 'printf "%s" "$GOMAXPROCS"', env: { GOMAXPROCS: "64" } });
+	assert.equal(result.output, "1");
+});
+
+test("a requester joining an aborted exec gets a fresh execution", { timeout: 10000 }, async (t) => {
+	const { root, b } = fixture(t, { maxJobs: 1, cpuBudget: 1 });
+	const script = 'const fs=require("fs"),p=".pi-check/attempt";let n=fs.existsSync(p)?Number(fs.readFileSync(p)):0;fs.writeFileSync(p,String(n+1));if(n===0){process.on("SIGTERM",()=>setTimeout(()=>process.exit(0),100));setInterval(()=>{},10)}else console.log("completed")';
+	const cmd = `${quote(process.execPath)} -e ${quote(script)}`, req = { root, cmd };
+	const first = b.exec(req);
+	while (!existsSync(join(root, ".pi-check/attempt"))) await new Promise((r) => setTimeout(r, 10));
+	b.cancelRequest(req);
+	b.abortJob([...b.running][0], "preempted by a requested check");
+	const second = b.exec({ root, cmd });
+	assert.equal((await first).code, 130);
+	assert.equal((await second).output.trim(), "completed");
+});
+
+test("HTTP tool cancellation closes its own request", async (t) => {
+	let closed;
+	const done = new Promise((r) => { closed = r; });
+	const server = http.createServer((_req, res) => { res.writeHead(200, { "content-type": "application/x-ndjson" }); res.write('{"type":"start"}\n'); res.on("close", closed); });
+	await new Promise((r) => server.listen(0, "127.0.0.1", r));
+	t.after(() => server.close());
+	const ac = new AbortController();
+	const pending = request({ port: server.address().port, token: "fixture" }, "/run", {}, () => ac.abort(), undefined, ac.signal);
+	await assert.rejects(pending, /abort/i);
+	await done;
+});
+
+test("Go workspace keys share across checkouts and character-class embeds are inputs", (t) => {
+	const { root, b, git } = fixture(t, { languages: { go: true, ts: false, python: false } });
+	mkdirSync(join(root, "assets"));
+	writeFileSync(join(root, "go.mod"), "module example.test/demo\n\ngo 1.22\n");
+	writeFileSync(join(root, "go.work"), "go 1.22\nuse .\n");
+	writeFileSync(join(root, "demo.go"), 'package demo\nimport _ "embed"\n//go:embed assets/[ab].txt\nvar data string\n');
+	writeFileSync(join(root, "assets/a.txt"), "embedded");
+	git("add", "."); git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "go fixture");
+	const wt = `${root}-wt`; git("worktree", "add", "--detach", wt);
+	t.after(() => rmSync(wt, { recursive: true, force: true }));
+	const req = { scope: "all", kinds: ["test"] };
+	const a = b.plan(b.root(root).rc, req), other = b.plan(b.root(wt).rc, req);
+	assert.equal(a[0].key, other[0].key);
+	assert.ok(a[0].unit.inputs.includes("assets/a.txt"));
+});
+
+test("conditional Go packages follow Go's build eligibility and request tags", (t) => {
+	const { root, b } = fixture(t, { languages: { go: true, ts: false, python: false } });
+	writeFileSync(join(root, "go.mod"), "module example.test/demo\n\ngo 1.22\n");
+	writeFileSync(join(root, "demo.go"), "package demo\n");
+	mkdirSync(join(root, "tagged"));
+	writeFileSync(join(root, "tagged/only.go"), "//go:build fixture\n\npackage tagged\n");
+	const rc = b.root(root).rc, req = { scope: "all", kinds: ["test"] };
+	assert.deepEqual(b.plan(rc, req).map((it) => it.unit.target), ["."]);
+	assert.deepEqual(b.plan(rc, { ...req, extraArgs: ["-tags=fixture"] }).map((it) => it.unit.target).sort(), [".", "tagged"]);
 });

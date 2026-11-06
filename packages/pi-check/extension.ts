@@ -122,10 +122,11 @@ export default function (pi: ExtensionAPI) {
 						lastText = t;
 						onUpdate?.({ content: [{ type: "text", text: t }], details: {} });
 					}
-				});
+				}, { signal: _signal });
 				const rep = res.report;
 				return { content: [{ type: "text", text: rep.text }], details: { ok: rep.ok, newFailures: rep.newFailures, knownFailures: rep.knownFailures, units: rep.units, ran: rep.ran, cached: rep.cache, shared: rep.shared }, isError: !rep.ok };
 			} catch (e: any) {
+				if (_signal?.aborted) return { content: [{ type: "text", text: "check: cancelled this request; other sessions' checks were not cancelled." }], details: {}, isError: true };
 				return { content: [{ type: "text", text: `check: the check broker failed: ${e?.message ?? e}. Inspect /check status before retrying; do not start an unbudgeted duplicate.` }], details: {}, isError: true };
 			}
 		},

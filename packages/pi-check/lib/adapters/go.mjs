@@ -1,9 +1,12 @@
 // Go: one unit per package. Inputs = the package's files plus every in-repo package it (and its tests) import.
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
-import { kindOptions, rootLockfiles } from "../repo.mjs";
-import { SHIM_DIR, cleanEnv, baseOf, dirOf, isUnder, joinRel, matchGlob, normRel, parseDuration, runProc, which } from "../util.mjs";
+import { kindOptions, LOCKFILES } from "../repo.mjs";
+import { SHIM_DIR, cleanEnv, baseOf, dirOf, isUnder, joinRel, matchGlob, normRel, parseDuration, runProc, sha, which } from "../util.mjs";
 
 const SKIP_SEG = /(^|\/)(vendor|testdata|node_modules|_[^/]*|\.[^/]+)(\/|$)/;
+const GO_LOCKFILES = ["go.work", "go.work.sum"];
+const NATIVE_SOURCE = /\.(go|c|cc|cpp|cxx|m|mm|h|hh|hpp|hxx|s|S|sx|f|F|for|f90|swig|swigcxx|syso)$/;
 
 function goHeader(text) {
 	const cut = text.search(/^(func|type|var|const)\b/m);
@@ -20,7 +23,13 @@ function parseGoFile(text) {
 		else if (m[1]) for (const mm of m[1].matchAll(/"([^"]+)"/g)) imports.push(mm[1]);
 	}
 	const embeds = [];
-	for (const em of text.matchAll(/^\s*\/\/go:embed\s+(.+)$/gm)) for (const p of em[1].trim().split(/\s+/)) embeds.push(p.replace(/^"|"$/g, "").replace(/^all:/, ""));
+	for (const em of text.matchAll(/^\s*\/\/go:embed\s+(.+)$/gm)) {
+		for (const token of em[1].match(/"(?:[^"\\]|\\.)*"|`[^`]*`|\S+/g) ?? []) {
+			let pattern = token;
+			try { if (token.startsWith('"')) pattern = JSON.parse(token); } catch { pattern = "**"; }
+			embeds.push(pattern.replace(/^`|`$/g, "").replace(/^all:/, ""));
+		}
+	}
 	return { imports, embeds };
 }
 
@@ -53,7 +62,7 @@ export function goGraph(rc) {
 		let p = pkgs.get(d);
 		if (!p) {
 			const relInMod = d === mod.dir ? "" : mod.dir === "." ? d : d.slice(mod.dir.length + 1);
-			p = { dir: d, module: mod, importPath: relInMod ? `${mod.path}/${relInMod}` : mod.path, rel: relInMod ? `./${relInMod}` : ".", goFiles: [], imports: new Set(), testImports: new Set(), embeds: [], hasTests: false };
+			p = { dir: d, module: mod, importPath: relInMod ? `${mod.path}/${relInMod}` : mod.path, rel: relInMod ? `./${relInMod}` : ".", goFiles: [], imports: new Set(), testImports: new Set(), embeds: [], productionEmbeds: [], hasTests: false };
 			pkgs.set(d, p);
 		}
 		p.goFiles.push(f);
@@ -66,21 +75,29 @@ export function goGraph(rc) {
 		const isTest = f.endsWith("_test.go");
 		if (isTest) p.hasTests = true;
 		for (const i of parsed.imports) (isTest ? p.testImports : p.imports).add(i);
-		for (const e of parsed.embeds) p.embeds.push(e);
+		for (const e of parsed.embeds) { p.embeds.push(e); if (!isTest) p.productionEmbeds.push(e); }
 	}
 	const byImport = new Map();
 	for (const p of pkgs.values()) byImport.set(p.importPath, p);
-	// embed + testdata files per package
 	for (const p of pkgs.values()) {
-		const extra = [];
-		for (const f of files) {
-			if (!isUnder(f, p.dir)) continue;
-			const r = p.dir === "." ? f : f.slice(p.dir.length + 1);
-			if (r.startsWith("testdata/")) extra.push(f);
-			else if (p.embeds.some((e) => r === e || r.startsWith(`${e.replace(/\/$/, "")}/`) || matchGlob(e, r))) extra.push(f);
-		}
-		p.extra = extra;
+		p.extra = [];
+		p.productionExtra = [];
 		p.dirFiles = byDir.get(p.dir) ?? [];
+	}
+	// Visit ancestor packages, not the entire repository once per package.
+	for (const f of files) {
+		for (let d = dirOf(f); ; d = dirOf(d)) {
+			const p = pkgs.get(d);
+			if (p) {
+				const r = d === "." ? f : f.slice(d.length + 1);
+				const parts = r.split("/");
+				// Conservatively include character-class matches; the generic glob matcher has no Go path.Match classes.
+				const matches = (e) => parts.some((_, i) => matchGlob(e.replace(/\[[^\]]+\]/g, "?"), parts.slice(0, i + 1).join("/")));
+				if (r.startsWith("testdata/") || p.embeds.some(matches)) p.extra.push(f);
+				if (p.productionEmbeds.some(matches)) p.productionExtra.push(f);
+			}
+			if (d === ".") break;
+		}
 	}
 	const g = { modules, pkgs, byImport, depMemo: new Map() };
 	rc.memo.set("go:graph", g);
@@ -115,7 +132,7 @@ function closure(g, p) {
 
 const adapter = {
 	lang: "go",
-	version: 2,
+	version: 4,
 
 	detect(rc) {
 		if (!rc.config.languages.go) return [];
@@ -125,24 +142,34 @@ const adapter = {
 			.map((m) => ({ id: `go:${m.dir}`, lang: "go", dir: m.dir, name: m.path, kinds: ["vet", "test"].filter((k) => kindOptions(rc.config, m.dir, k) !== false) }));
 	},
 
-	units(rc, project, kind) {
+	units(rc, project, kind, request = {}) {
 		const g = goGraph(rc);
 		const opts = kindOptions(rc.config, project.dir, kind) || {};
+		const candidates = [...g.pkgs.values()].filter((p) => p.module.dir === project.dir);
+		let eligible;
+		// Ask Go only when build constraints can exclude whole packages; ordinary graphs stay filesystem-only.
+		if (candidates.some((p) => p.goFiles.some((f) => /_(?:aix|android|darwin|dragonfly|freebsd|illumos|ios|js|linux|netbsd|openbsd|plan9|solaris|wasip1|windows|386|amd64|arm|arm64|loong64|mips\w*|ppc64\w*|riscv64|s390x|wasm)(?:_test)?\.go$/.test(f) || /^\/\/(?:go:build|\s*\+build)\s/m.test(rc.text(f))))) {
+			const env = cleanEnv({ ...request.env, ...opts.env });
+			const args = [...(opts.args ?? []), ...(request.extraArgs ?? [])];
+			const tags = args.flatMap((a, i) => /^-(?:tags|mod)$/.test(a) ? [a, args[i + 1]] : /^-(?:tags|race|msan|asan|mod)(?:=|$)/.test(a) ? [a] : []);
+			const listed = spawnSync(which("go", { skipDir: SHIM_DIR, pathEnv: env.PATH }) ?? "go", ["list", "-e", ...tags, "-f", "{{if or .GoFiles .CgoFiles .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}", "./..."], { cwd: rc.path(project.dir), env, encoding: "utf8", timeout: 30000 });
+			if (listed.status !== 0) throw new Error(`Go package discovery failed: ${listed.error?.message ?? listed.stderr}`);
+			eligible = new Set(listed.stdout.trim().split(/\s+/));
+		}
 		const extraGlobs = opts.inputs ?? [];
 		const extraFiles = extraGlobs.length ? rc.filesUnder(project.dir).filter((f) => extraGlobs.some((gl) => matchGlob(gl, project.dir === "." ? f : f.slice(project.dir.length + 1)))) : [];
-		const roots = [...rootLockfiles(rc)];
+		const roots = GO_LOCKFILES.filter((f) => rc.has(f));
 		const out = [];
-		for (const p of g.pkgs.values()) {
-			if (p.module.dir !== project.dir) continue;
-			if (kind === "test" && !p.hasTests) continue;
-			const inputs = [...p.dirFiles, ...p.extra, ...extraFiles, ...roots];
+		for (const p of candidates) {
+			if (eligible && !eligible.has(p.importPath)) continue;
+			const inputs = [...p.dirFiles.filter((f) => !LOCKFILES.includes(baseOf(f)) || GO_LOCKFILES.includes(baseOf(f))), ...p.extra, ...extraFiles, ...roots];
 			const mods = new Set([p.module]);
 			for (const d of closure(g, p)) {
 				const q = g.pkgs.get(d);
 				if (!q) continue;
 				mods.add(q.module);
 				if (q === p) continue;
-				inputs.push(...q.goFiles.filter((f) => !f.endsWith("_test.go")), ...q.extra.filter((f) => !f.includes("/testdata/") && !f.startsWith("testdata/")));
+				inputs.push(...q.dirFiles.filter((f) => NATIVE_SOURCE.test(f) && !f.endsWith("_test.go")), ...q.productionExtra);
 			}
 			for (const m of mods) for (const f of ["go.mod", "go.sum"]) if (rc.has(joinRel(m.dir, f))) inputs.push(joinRel(m.dir, f));
 			out.push({ target: p.dir, label: p.importPath, inputs });
@@ -163,12 +190,27 @@ const adapter = {
 		return JSON.stringify({ args: opts?.args ?? [], env: opts?.env ?? {}, timeout: opts?.timeout ?? "10m" });
 	},
 
+	executionKey(rc, project, opts) {
+		const env = cleanEnv(opts?.env);
+		const binary = which("go", { skipDir: SHIM_DIR, pathEnv: env.PATH }) ?? "go";
+		const normalize = (k, v) => k === "GOWORK" && v.startsWith(`${rc.abs}/`) ? v.slice(rc.abs.length + 1) : v;
+		const settings = Object.entries(env).filter(([k]) => /^(GO[A-Z0-9_]*|CGO_[A-Z0-9_]+|CC|CXX|PKG_CONFIG|PATH)$/.test(k)).map(([k, v]) => [k, normalize(k, v)]).sort();
+		const key = `go:environment:${project.dir}:${sha(JSON.stringify([binary, rc.hasher.hash(binary), settings]))}`;
+		if (!rc.memo.has(key)) {
+			const r = spawnSync(binary, ["env", "-json", "GOVERSION", "GOROOT", "GOOS", "GOARCH", "GOFLAGS", "GOWORK", "CGO_ENABLED", "GOEXPERIMENT", "CC", "CXX"], { cwd: rc.path(project.dir), env, encoding: "utf8", timeout: 10000, maxBuffer: 1024 * 1024 });
+			let values;
+			try { values = Object.fromEntries(Object.entries(JSON.parse(r.stdout)).map(([k, v]) => [k, normalize(k, v)])); } catch { values = r.stdout ?? ""; }
+			rc.memo.set(key, sha(JSON.stringify([key, r.status, values, r.stderr ?? ""])));
+		}
+		return rc.memo.get(key);
+	},
+
 	async run({ rc, project, kind, units, opts, threads, signal, nice, extraArgs = [], onUnit, onProgress }) {
 		const g = goGraph(rc);
-		const goBin = which("go", { skipDir: SHIM_DIR }) ?? "go";
+		const goBin = which("go", { skipDir: SHIM_DIR, pathEnv: opts?.env?.PATH }) ?? "go";
 		const cwd = rc.path(project.dir);
 		const pkgs = units.map((u) => g.pkgs.get(u.target)).filter(Boolean);
-		const env = cleanEnv({ GOMAXPROCS: String(threads), GOFLAGS: `${process.env.GOFLAGS ?? ""} -p=${threads}`.trim(), ...(opts?.env ?? {}) });
+		const env = cleanEnv({ ...(opts?.env ?? {}), GOMAXPROCS: String(threads), GOFLAGS: `${opts?.env?.GOFLAGS ?? process.env.GOFLAGS ?? ""} -p=${threads}`.trim() });
 		const results = new Map();
 		if (kind === "vet") {
 			const r = await runProc({ cmd: goBin, args: ["vet", ...(opts?.args ?? []), ...extraArgs, ...pkgs.map((p) => p.rel)], cwd, env, signal, nice, timeoutMs: parseDuration(opts?.timeout, 15 * 60000) });
@@ -284,7 +326,7 @@ const adapter = {
 			env,
 			signal,
 			nice,
-			timeoutMs: goTimeout * Math.max(1, Math.ceil(pkgs.length / threads)) + 120000,
+			timeoutMs: goTimeout === 0 ? undefined : goTimeout * Math.max(1, Math.ceil(pkgs.length / threads)) + 120000,
 			onData: (d, stream) => {
 				if (stream !== "stdout") return;
 				buf += d;

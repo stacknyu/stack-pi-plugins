@@ -7,9 +7,10 @@
 // scope, size and the check commands. Passing items are rebased onto the branch, re-checked,
 // and fast-forwarded in one at a time. Failed work is kept on queue-failed/<id>.
 import { spawn, execFile } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, appendFileSync, rmSync, cpSync } from "node:fs";
-import { join, isAbsolute, basename, dirname } from "node:path";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, appendFileSync, rmSync, cpSync, openSync, closeSync, renameSync, lstatSync, readlinkSync, realpathSync, symlinkSync } from "node:fs";
+import { join, isAbsolute, basename, dirname, posix } from "node:path";
 import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
 
 export const DIR = ".pi-queue";
 
@@ -59,6 +60,7 @@ export const DEFAULTS = {
 	model: "", // empty: Pi's default model; or "provider/model-id"
 	thinking: "high",
 	piCommand: "",
+	manager: true, // a detached supervisor diagnoses failures after approved handoff; healthy ticks use no model
 	runIn: "auto", // "auto": items are Pi Web sessions when Pi Web runs, else background `pi`; or "web" / "cli"
 	piWebUrl: "", // empty: find the running Pi Web automatically
 	// What happens to finished (passed/split) item sessions: "end" deletes them when the run ends, "pass" right after
@@ -116,7 +118,7 @@ export function allItems(queueText, state) {
 export function applyControl(state, items, ctl) {
 	const pick = (ids) => {
 		const want = (ids ?? []).map((x) => String(x).trim()).filter(Boolean);
-		return items.filter((i) => want.length === 0 || want.some((w) => i.id === w || i.id.startsWith(w)));
+		return items.filter((i) => want.length === 0 || want.some((w) => i.id === w || (ctl.by !== "auto" && i.id.startsWith(w))));
 	};
 	const changed = [];
 	if (ctl.action === "retry") {
@@ -141,7 +143,8 @@ export function applyControl(state, items, ctl) {
 		}
 	} else if (ctl.action === "next") {
 		// run these next: un-park them and put them at the front (dependencies and overlapping areas still apply)
-		const keys = pick(ctl.ids).filter((i) => !state.done[i.key]).map((i) => i.key);
+		const selected = ctl.ids?.length ? ctl.ids.flatMap((id) => pick([id])) : pick([]);
+		const keys = [...new Set(selected.filter((i) => !state.done[i.key]).map((i) => i.key))];
 		for (const k of keys) {
 			delete state.failed[k];
 			if (state.retried) delete state.retried[k];
@@ -160,14 +163,19 @@ export function applyControl(state, items, ctl) {
 function splitPrompt(c, item, reason) {
 	return `This item could not be finished in one go (${firstLine(reason).slice(0, 200)}).
 
-Do NOT edit any file. Split it into 3 to ${c.splitMax} smaller items that together cover everything it requires. Each must be doable on its own by a fresh agent in one session (about 10 files at most), touch a different set of files than the others, and be checkable with the typecheck and build. Order them so each can be done after the ones before it.
+Do NOT edit any file. Split it into 3 to ${c.splitMax} smaller items that together cover everything it requires. Each must be doable on its own by a fresh agent in one session (about 10 files at most), touch a different set of files than the others, and be checkable with the typecheck and build. Use [after] only for actual prerequisites; independent parts must be runnable in parallel, not chained by list order.
 
 Reply with one line per item, in order, each starting with "ITEM: ", then what to do, then "Done when: <something observable>", then the tags [areas: <folders or files it changes, comma separated>] and, only if it needs earlier parts finished first, [after: <their numbers, e.g. 1, 2>]. Parts are numbered from 1 in the order you list them. No other text. If it truly cannot be split, reply with one line: BLOCKED: <reason>`;
 }
 
 /** Do two [areas: …] lists touch the same path? (prefix match; globs cut at the first *) */
 export function areasOverlap(a, b) {
-	const norm = (p) => p.split("*")[0].replace(/\/+$/, "");
+	const norm = (p) => {
+		const literal = p.split(/[*?[{]/)[0];
+		const prefix = literal === p ? literal : literal.slice(0, literal.lastIndexOf("/") + 1);
+		const value = posix.normalize(prefix || ".").replace(/\/+$/, "");
+		return value === "." ? "" : value;
+	};
 	for (const x of a.map(norm))
 		for (const y of b.map(norm)) {
 			if (!x || !y || x === y || x.startsWith(`${y}/`) || y.startsWith(`${x}/`)) return true;
@@ -209,6 +217,7 @@ export function parseQueue(text) {
 		const m = raw.match(/^\s*-\s\[\s\]\s+(.+?)\s*$/);
 		if (!m) continue;
 		const line = m[1];
+		for (const tag of ["areas?", "after"]) if ([...line.matchAll(new RegExp(`\\[${tag}:`, "gi"))].length > 1) throw new Error(`duplicate [${tag}] tag: ${line}`);
 		const id = line.match(/^([A-Z]+[0-9]+[A-Za-z0-9-]*)/)?.[1] ?? `item${items.length + 1}`;
 		const title = line
 			.split(/\s+Done when:/i)[0]
@@ -232,6 +241,49 @@ export function parseQueue(text) {
 	return items;
 }
 
+/** Resolve real prerequisites, including split-parent aliases; reject cycles before dispatch. */
+export function dependencyGraph(items) {
+	const byId = new Map(items.map((i) => [i.id, i]));
+	if (byId.size !== items.length) throw new Error("duplicate queue item ids");
+	const graph = new Map();
+	for (const i of items) {
+		const deps = (i.after ?? []).flatMap((id) => {
+			if (id === "*") return items.filter((o) => o !== i && !(o.after ?? []).includes("*")).map((o) => o.id);
+			if (byId.has(id)) return [id];
+			const children = items.filter((o) => o.child && o.id.startsWith(id) && /^[a-z]$/.test(o.id.slice(id.length)));
+			if (!children.length) throw new Error(`${i.id}: unknown dependency ${id}`);
+			return children.map((o) => o.id);
+		});
+		graph.set(i.id, [...new Set(deps)]);
+	}
+	const done = new Set(), visiting = [];
+	const visit = (id) => {
+		if (visiting.includes(id)) throw new Error(`dependency cycle: ${[...visiting.slice(visiting.indexOf(id)), id].join(" → ")}`);
+		if (done.has(id)) return;
+		visiting.push(id);
+		for (const dep of graph.get(id)) visit(dep);
+		visiting.pop();
+		done.add(id);
+	};
+	for (const id of graph.keys()) visit(id);
+	return graph;
+}
+
+/** Prefer work that unlocks the longest remaining chain; explicit next order wins. */
+export function orderQueue(items, state) {
+	const graph = dependencyGraph(items), children = new Map(items.map((i) => [i.id, []]));
+	for (const i of items) if (!state.done?.[i.key] && !state.failed?.[i.key]) for (const dep of graph.get(i.id)) children.get(dep).push(i.id);
+	const scores = new Map();
+	const score = (id) => {
+		if (!scores.has(id)) scores.set(id, 1 + Math.max(0, ...children.get(id).map(score)));
+		return scores.get(id);
+	};
+	const priority = state.priority ?? [];
+	const rank = (i) => priority.includes(i.key) ? priority.indexOf(i.key) : priority.length;
+	const parked = (i) => Number(!!(state.retried?.[i.key] || state.deferred?.[i.key]));
+	return [...items].sort((a, b) => parked(a) - parked(b) || rank(a) - rank(b) || score(b.id) - score(a.id));
+}
+
 export function loadJson(path, fallback) {
 	try {
 		return JSON.parse(readFileSync(path, "utf8"));
@@ -240,7 +292,49 @@ export function loadJson(path, fallback) {
 	}
 }
 
-export async function ensureDir(cwd) {
+export function saveJson(file, value) {
+	const tmp = `${file}.${randomUUID()}.tmp`;
+	writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
+	renameSync(tmp, file);
+}
+
+export function pidAlive(pid) {
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
+}
+
+/** Exclusive process ownership. Missing/partial owner records fail closed. */
+export function acquireProcessLock(file) {
+	const claim = () => {
+		const fd = openSync(file, "wx");
+		try { writeFileSync(fd, String(process.pid)); } finally { closeSync(fd); }
+	};
+	try { claim(); } catch (e) {
+		if (e.code !== "EEXIST") throw e;
+		const reclaim = `${file}.reclaim`;
+		const fd = openSync(reclaim, "wx");
+		try {
+			const pid = Number(readFileSync(file, "utf8"));
+			if (!pid || pidAlive(pid)) throw new Error(`process already owns ${file}`);
+			rmSync(file);
+			claim();
+		} finally { closeSync(fd); rmSync(reclaim, { force: true }); }
+	}
+	let released = false;
+	return () => {
+		if (released) return;
+		released = true;
+		try { if (readFileSync(file, "utf8") === String(process.pid)) rmSync(file); } catch {}
+	};
+}
+
+export function enqueueControl(repo, control) {
+	const dir = join(repo, DIR, "control");
+	mkdirSync(dir, { recursive: true });
+	saveJson(join(dir, `${Date.now()}-${randomUUID()}.json`), control);
+}
+
+export async function ensureDir(cwd, extraExcludes = []) {
 	mkdirSync(join(cwd, DIR), { recursive: true });
 	const rel = (await git(cwd, "rev-parse", "--git-path", "info/exclude")).out.trim();
 	if (!rel) return;
@@ -248,7 +342,8 @@ export async function ensureDir(cwd) {
 	try {
 		mkdirSync(dirname(exclude), { recursive: true });
 		const cur = existsSync(exclude) ? readFileSync(exclude, "utf8") : "";
-		if (!cur.split("\n").includes(`${DIR}/`)) appendFileSync(exclude, `${cur && !cur.endsWith("\n") ? "\n" : ""}${DIR}/\n`);
+		const missing = [`${DIR}/`, ...extraExcludes].filter((entry) => !cur.split("\n").includes(entry));
+		if (missing.length) appendFileSync(exclude, `${cur && !cur.endsWith("\n") ? "\n" : ""}${missing.join("\n")}\n`);
 	} catch {}
 }
 
@@ -279,11 +374,20 @@ function mutex() {
 
 // ---------- measuring a change against the item's base commit ----------
 
+export function pathAllowed(file, allowed) {
+	const path = posix.normalize(file.replaceAll("\\", "/")).replace(/\/$/, "");
+	if (isAbsolute(path) || path === ".." || path.startsWith("../") || /^[A-Za-z]:/.test(path)) return false;
+	return allowed.some((entry) => {
+		const prefix = posix.normalize(entry.replaceAll("\\", "/")).replace(/\/$/, "");
+		return prefix === "." || path === prefix || path.startsWith(`${prefix}/`);
+	});
+}
+
 export async function measure(cwd, base, allowed) {
 	const files = new Set();
 	let net = 0;
 	let growing = 0;
-	const inScope = (p) => allowed.some((a) => p.startsWith(a));
+	const inScope = (p) => pathAllowed(p, allowed);
 	const numstat = await git(cwd, "diff", "--numstat", "--no-renames", base);
 	for (const row of numstat.out.split("\n")) {
 		const [a, d, p] = row.split("\t");
@@ -437,16 +541,19 @@ function piTurn(ctx, cwd, sessionId, name, prompt, minutes, onActivity = () => {
 	const { c, pi, env, stopRequested } = ctx;
 	return new Promise((resolve) => {
 		// item sessions live in .pi-queue/sessions: easy to open (/queue open <id>, pi --session <file>) and to delete
-		const args = ["--mode", "json", "-a", "--session-dir", join(ctx.repo, DIR, "sessions"), "--session-id", sessionId, "-n", name];
+		const previous = sessionFiles(ctx.repo, [sessionId])[sessionId];
+		const args = ["--mode", "json", "--session-dir", join(ctx.repo, DIR, "sessions"), ...(previous ? ["--session", previous] : ["--session-id", sessionId]), "-n", name];
 		if (c.model) args.push("--model", c.model);
 		if (c.thinking) args.push("--thinking", c.thinking);
+		if (ctx.manager) args.push("--no-tools", "--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates");
 		args.push(prompt);
 		const child = spawn(pi, args, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+		ctx.onWorker?.({ pid: child.pid });
 		let buf = "";
 		let raw = "";
 		let reply = "";
 		let err = "";
-		let status = "ok";
+		let status = "ok", assistantError = "", killTimer;
 		const onRecord = (line) => {
 			let ev;
 			try {
@@ -462,6 +569,7 @@ function piTurn(ctx, cwd, sessionId, name, prompt, minutes, onActivity = () => {
 			else if (ev.type === "message_end" && ev.message?.role === "assistant") {
 				const t = textOf(ev.message);
 				if (t) reply = t;
+				assistantError = ["error", "aborted", "length"].includes(ev.message.stopReason) ? ev.message.errorMessage || `assistant stopped: ${ev.message.stopReason}` : "";
 			}
 		};
 		child.stdout.on("data", (d) => {
@@ -480,7 +588,7 @@ function piTurn(ctx, cwd, sessionId, name, prompt, minutes, onActivity = () => {
 			try {
 				process.kill(-child.pid, "SIGTERM");
 			} catch {}
-			setTimeout(() => {
+			killTimer = setTimeout(() => {
 				try {
 					process.kill(-child.pid, "SIGKILL");
 				} catch {}
@@ -494,10 +602,11 @@ function piTurn(ctx, cwd, sessionId, name, prompt, minutes, onActivity = () => {
 		});
 		child.on("close", (code) => {
 			clearTimeout(timer);
+			clearTimeout(killTimer);
 			clearInterval(poll);
 			if (buf.trim()) onRecord(buf.trim());
-			if (status === "ok" && code !== 0) status = "error";
-			resolve({ status, reply: reply || raw.trim(), err: err.trim(), code });
+			if (status === "ok" && (code !== 0 || assistantError)) status = "error";
+			resolve({ status, reply: reply || raw.trim(), err: (err + assistantError).trim(), code });
 		});
 	});
 }
@@ -523,7 +632,7 @@ export function webClient(c) {
 		} catch {
 			json = { error: text.slice(0, 300) };
 		}
-		if (!res.ok || json?.error) throw new Error(`Pi Web ${path}: ${res.status} ${json?.error ?? ""}`.trim());
+		if (!res.ok || json?.error || json?.success === false) throw new Error(`Pi Web ${path}: ${res.status} ${json?.error ?? ""}`.trim());
 		return json;
 	};
 	return {
@@ -599,18 +708,18 @@ async function webTurn(ctx, cwd, ref, name, prompt, minutes, onActivity = () => 
 		if (!ref.id) {
 			const r = await web.create({
 				cwd,
-				type: "prompt",
-				message: prompt,
+				type: "ensure_session",
+				...(ctx.manager ? { toolNames: [] } : {}),
 				...(provider && modelId ? { provider, modelId } : {}),
 				...(c.thinking ? { thinkingLevel: c.thinking } : {}),
 			});
 			ref.id = r.sessionId;
+			ctx.onWorker?.({ sessionId: ref.id, web: true });
 			await web.send(ref.id, { type: "set_session_name", name }).catch(() => {});
-		} else {
-			await web.send(ref.id, { type: "prompt", message: prompt });
 		}
+		await web.send(ref.id, { type: "prompt", message: prompt });
 	} catch (e) {
-		return { status: "error", reply: "", err: String(e?.message ?? e), code: -1 };
+		return { status: "error", reply: "", err: String(e?.message ?? e), code: -1, quiescent: false };
 	}
 	onActivity("thinking");
 	let sessionFile;
@@ -624,11 +733,9 @@ async function webTurn(ctx, cwd, ref, name, prompt, minutes, onActivity = () => 
 		try {
 			snap = await web.running();
 		} catch {
-			if (Date.now() > deadline) {
-				status = "timeout";
-				break;
-			}
-			continue; // Pi Web briefly unreachable: keep waiting until the deadline
+			if (!stopRequested() && Date.now() <= deadline) continue;
+			await web.send(ref.id, { type: "abort" }).catch(() => {});
+			return { status: "error", reply: "", err: "Pi Web unreachable; worker termination is unconfirmed", code: -1, quiescent: false };
 		}
 		const running = (snap.runningSessionIds ?? []).includes(ref.id);
 		const awaiting = (snap.awaitingInputSessionIds ?? []).includes(ref.id);
@@ -662,20 +769,24 @@ async function webTurn(ctx, cwd, ref, name, prompt, minutes, onActivity = () => 
 		if (why) {
 			status = why;
 			await web.send(ref.id, { type: "abort" }).catch(() => {});
+			let quiescent = false;
 			for (let i = 0; i < 20; i++) {
 				await new Promise((r) => setTimeout(r, 3000));
 				const s2 = await web.running().catch(() => null);
-				if (s2 && !(s2.runningSessionIds ?? []).includes(ref.id)) break;
+				if (s2 && !(s2.runningSessionIds ?? []).includes(ref.id)) { quiescent = true; break; }
 			}
+			if (!quiescent) return { status: "error", reply: "", err: "worker did not confirm termination", code: -1, quiescent: false };
 			if (why === "error") return { status, reply: "", err: "the agent waited for a person's answer for 2 minutes", code: -1 };
 			break;
 		}
 	}
-	const reply = await web
-		.send(ref.id, { type: "get_last_assistant_text" })
-		.then((r) => r?.data?.text ?? "")
-		.catch(() => "");
-	return { status, reply: String(reply).trim(), err: "", code: 0 };
+	try {
+		const response = await web.send(ref.id, { type: "get_messages" });
+		const last = response.data?.messages?.filter((m) => m.role === "assistant").at(-1);
+		if (!last) return { status: "error", reply: "", err: "Pi Web returned no assistant result", code: -1 };
+		const err = ["error", "aborted", "length"].includes(last.stopReason) ? last.errorMessage || `assistant stopped: ${last.stopReason}` : "";
+		return { status: status === "ok" && err ? "error" : status, reply: textOf(last), err, code: err ? -1 : 0 };
+	} catch (e) { return { status: "error", reply: "", err: String(e), code: -1 }; }
 }
 
 function problem(repo, text) {
@@ -716,7 +827,7 @@ export function checkBroker(c) {
 	if (c?.checkBroker === false) return undefined;
 	if (brokerInfo === undefined) {
 		try {
-			const info = JSON.parse(readFileSync(join(homedir(), ".pi", "agent", "pi-check", "cli.json"), "utf8"));
+			const info = JSON.parse(readFileSync(join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "pi-check", "cli.json"), "utf8"));
 			brokerInfo = existsSync(info.cli) && existsSync(join(info.shims, "go")) ? info : null;
 		} catch {
 			brokerInfo = null;
@@ -802,8 +913,23 @@ async function prepareWorktree(ctx, slot) {
 		if (add.code !== 0) throw new Error(`git worktree add failed: ${tail(add.out, 5)}`);
 		rmSync(ready, { force: true });
 	}
-	await git(wt, "checkout", "--detach", "--force", (await git(repo, "rev-parse", ctx.branch)).out.trim());
-	await git(wt, "clean", "-fd");
+	if (!(await treeIsClean(wt))) throw new Error(`worktree ${wt} has unpreserved changes; refusing to reset it`);
+	const tip = (await git(repo, "rev-parse", ctx.branch)).out.trim();
+	if ((await git(wt, "merge-base", "--is-ancestor", "HEAD", tip)).code !== 0) throw new Error(`worktree ${wt} has unintegrated commits; refusing to reset it`);
+	const checkout = await git(wt, "checkout", "--detach", tip);
+	if (checkout.code !== 0) throw new Error(checkout.out);
+	// Ignored project-local plugins are absent in fresh worktrees. Reuse the installed extension, not its state/settings.
+	const bridge = ".pi/extensions/pi-flow-check", link = join(wt, bridge);
+	const broker = checkBroker({}), packageDir = broker && realpathSync(dirname(broker.cli));
+	if (packageDir && c.checkBroker !== false && !existsSync(join(packageDir, "extension.ts"))) throw new Error(`pi-check extension missing at ${packageDir}; repair its installation before starting workers`);
+	const existing = lstatSync(link, { throwIfNoEntry: false });
+	if (existing && (!existing.isSymbolicLink() || readlinkSync(link) !== packageDir)) throw new Error(`reserved pi-flow plugin bridge ${link} belongs to something else; refusing to overwrite it`);
+	if (existing && c.checkBroker === false) rmSync(link);
+	if (packageDir && c.checkBroker !== false) {
+		await ensureDir(wt, [bridge]);
+		mkdirSync(dirname(link), { recursive: true });
+		if (!existing) symlinkSync(packageDir, link, "dir");
+	}
 	for (const rel of c.copyFromRepo ?? []) {
 		try {
 			if (existsSync(join(repo, rel))) cpSync(join(repo, rel), join(wt, rel), { recursive: true, force: true });
@@ -891,17 +1017,22 @@ async function workItem(ctx, slot, wt, item) {
 	const started = Date.now();
 	const solo = wt === repo; // working directly in the repo folder
 	let base = (await git(repo, "rev-parse", branch)).out.trim();
+	if (!(await treeIsClean(wt))) throw new Error(`worktree ${wt} has unpreserved changes`);
 	if (solo) await git(wt, "reset", "--hard", base);
 	else await git(wt, "checkout", "--detach", "--force", base);
 	await git(wt, "clean", "-fd");
 
-	const cliId = `queue-${item.id}-${new Date().toISOString().replace(/\D/g, "").slice(0, 14)}`.replace(/[^A-Za-z0-9._-]/g, "-");
+	const cliId = randomUUID();
 	const ref = { id: ctx.web ? undefined : cliId };
-	const turn = (prompt, minutes, onAct) =>
-		ctx.web ? webTurn({ ...ctx, c }, wt, ref, name, prompt, minutes, onAct) : piTurn({ ...ctx, c }, wt, cliId, name, prompt, minutes, onAct);
+	const turn = async (prompt, minutes, onAct) => {
+		const worker = { ...ctx, c, onWorker: (identity) => { Object.assign(live, identity); save(); } };
+		const result = await (ctx.web ? webTurn(worker, wt, ref, name, prompt, minutes, onAct) : piTurn(worker, wt, cliId, name, prompt, minutes, onAct));
+		if (result.quiescent === false) throw new Error(`${result.err}; worktree quarantined`);
+		return result;
+	};
 	const sessionId = cliId;
 	const name = `queue ${item.id}: ${item.title}`.slice(0, 80);
-	const live = { id: item.id, title: item.title, model: c.model, thinking: c.thinking, sessionId, worktree: wt, startedAt: new Date().toISOString(), doing: "starting", tools: 0, since: Date.now() };
+	const live = { id: item.id, key: item.key, title: item.title, model: c.model, thinking: c.thinking, sessionId, worktree: wt, startedAt: new Date().toISOString(), doing: "starting", tools: 0, since: Date.now() };
 	state.running[slot] = live;
 	save();
 	mkdirSync(join(repo, DIR, "live"), { recursive: true });
@@ -922,7 +1053,9 @@ async function workItem(ctx, slot, wt, item) {
 	};
 	const onActivity = (what) => setDoing(what, what !== "thinking" && what !== "compacting context" && !what.endsWith(" failed"));
 
-	let t = await turn(itemPrompt(c, item), c.itemMinutes, onActivity);
+	const prior = join(repo, DIR, "notes", `${item.id}.md`);
+	const previous = existsSync(prior) ? `\n\nPrevious attempt and manager diagnosis (evidence, not permission to expand scope):\n${readFileSync(prior, "utf8").slice(-12000)}` : "";
+	let t = await turn(itemPrompt(c, item) + previous, c.itemMinutes, onActivity);
 	if (ref.id) {
 		state.sessions = { ...(state.sessions ?? {}), [ref.id]: { item: item.id, status: "running", web: !!ctx.web } };
 		save();
@@ -1003,6 +1136,7 @@ async function workItem(ctx, slot, wt, item) {
 	let sha = "";
 	let m;
 	for (let attempt = 0; !reason && attempt < 2; attempt++) {
+		if (ctx.stopRequested()) { reason = "stopped by request"; kind = "fail"; break; }
 		m = await measure(wt, base, c.allowedPaths);
 		if (m.files.length === 0) {
 			sha = "checked"; // a [check] item that verified without changing anything: nothing to commit
@@ -1033,6 +1167,7 @@ async function workItem(ctx, slot, wt, item) {
 					const broke = await runChecks(c, wt);
 					if (broke) return { reason: `breaks checks after merging with other items: ${firstLine(broke)}`, kind: "conflict" };
 				}
+				if (ctx.stopRequested()) return { reason: "stopped by request", kind: "fail" };
 				const head = (await git(wt, "rev-parse", "HEAD")).out.trim();
 				const ff = await git(repo, "merge", "--ff-only", head);
 				if (ff.code !== 0) return { reason: `could not fast-forward ${branch}: ${tail(ff.out, 3).replace(/\n/g, " ")}`, kind: "fail" };
@@ -1048,7 +1183,8 @@ async function workItem(ctx, slot, wt, item) {
 		// instead of throwing the work away and starting from scratch at the end
 		if (reason && kind === "conflict" && attempt === 0 && c.redoOnConflict !== false && !solo && !ctx.stopRequested()) {
 			setDoing("redoing the item on the latest code");
-			await git(repo, "branch", "-f", `queue-failed/${item.id}`, (await git(wt, "rev-parse", "HEAD")).out.trim());
+			const archive = await git(repo, "branch", `queue-failed/${item.id}-${started}-redo`, (await git(wt, "rev-parse", "HEAD")).out.trim());
+			if (archive.code !== 0) throw new Error(`failed to preserve conflicting work: ${archive.out}`);
 			base = (await git(repo, "rev-parse", branch)).out.trim();
 			await git(wt, "checkout", "--detach", "--force", base);
 			await git(wt, "clean", "-fd");
@@ -1072,12 +1208,16 @@ async function workItem(ctx, slot, wt, item) {
 	let kept = "";
 	if (reason) {
 		await lock(async () => {
-			await git(wt, "add", "-A");
+			const staged = await git(wt, "add", "-A");
+			if (staged.code !== 0) throw new Error(`failed to preserve work: ${staged.out}`);
 			const hasWork = (await git(wt, "rev-parse", "HEAD")).out.trim() !== base || !(await treeIsClean(wt));
 			if (hasWork) {
-				await git(wt, "commit", "--no-verify", "--allow-empty", "-m", `queue FAILED ${item.id}: ${firstLine(reason)}`);
-				await git(repo, "branch", "-f", `queue-failed/${item.id}`, (await git(wt, "rev-parse", "HEAD")).out.trim());
-				kept = ` · work kept on queue-failed/${item.id}`;
+				const preserved = await git(wt, "commit", "--no-verify", "--allow-empty", "-m", `queue FAILED ${item.id}: ${firstLine(reason)}`);
+				if (preserved.code !== 0) throw new Error(`failed to preserve work: ${preserved.out}`);
+				const backup = `queue-failed/${item.id}-${started}`;
+				const archived = await git(repo, "branch", backup, (await git(wt, "rev-parse", "HEAD")).out.trim());
+				if (archived.code !== 0) throw new Error(`failed to preserve work: ${archived.out}`);
+				kept = ` · work kept on ${backup}`;
 			}
 		});
 	}
@@ -1089,7 +1229,6 @@ async function workItem(ctx, slot, wt, item) {
 	if (!reason) {
 		state.done[item.key] = sha;
 		delete state.failed[item.key];
-		await lock(() => git(repo, "branch", "-D", `queue-failed/${item.id}`)); // stale archive from an earlier attempt
 		log(sha === "checked" ? `PASS ${item.id} · checked, nothing to change · ${mins} min · w${slot}` : `PASS ${item.id} · ${sha} · ${m.files.length} files · net ${m.net} lines · ${mins} min · w${slot}`);
 	} else if (kind === "gaps") {
 		state.fixes = { ...(state.fixes ?? {}), [item.key]: [...(state.fixes?.[item.key] ?? []), ...fixLines] };
@@ -1128,24 +1267,31 @@ export async function main(repo) {
 	await ensureDir(repo);
 	const log = makeLog(repo);
 	const pidFile = join(repo, DIR, "runner.pid");
-	writeFileSync(pidFile, String(process.pid));
-	process.on("exit", () => {
-		try {
-			if (readFileSync(pidFile, "utf8").trim() === String(process.pid)) rmSync(pidFile, { force: true });
-		} catch {}
-	});
-	for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, () => process.exit(1));
-
+	const release = acquireProcessLock(pidFile);
+	const onSignal = () => writeFileSync(join(repo, DIR, "STOP"), "signal");
+	const signals = ["SIGTERM", "SIGINT", "SIGHUP"];
+	process.on("exit", release);
+	for (const sig of signals) process.on(sig, onSignal);
+	let heartbeat;
+	try {
 	const c = readConfig(repo);
 	const statePath = join(repo, DIR, "state.json");
-	const state = { done: {}, failed: {}, retried: {}, ...loadJson(statePath, {}), running: {}, phase: "starting" };
-	const save = () => writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
-	save();
-	rmSync(join(repo, DIR, "STOP"), { force: true });
-	rmSync(join(repo, DIR, "problem.txt"), { force: true });
-	rmSync(join(repo, DIR, "PAUSE"), { force: true });
+	const state = { done: {}, failed: {}, retried: {}, running: {}, ...loadJson(statePath, {}) };
 	const stopRequested = () => existsSync(join(repo, DIR, "STOP"));
 	const pauseRequested = () => existsSync(join(repo, DIR, "PAUSE"));
+	if (stopRequested() || pauseRequested()) return log("NOT STARTED: manually stopped/paused; explicit /queue start is required");
+	if (Object.keys(state.running).length) {
+		problem(repo, "Interrupted workers/worktrees require reconciliation; refusing to reset or reuse them.");
+		return log("NOT STARTED: interrupted workers remain; worktrees preserved");
+	}
+	state.phase = "starting";
+	delete state.startedAt;
+	state.task = c.task;
+	state.runId = randomUUID();
+	const save = () => { state.heartbeat = Date.now(); saveJson(statePath, state); };
+	save();
+	heartbeat = setInterval(save, 60000);
+	rmSync(join(repo, DIR, "problem.txt"), { force: true });
 
 	const branch = (await git(repo, "branch", "--show-current")).out.trim();
 	if (!branch) return log("NOT STARTED: the repo is on a detached HEAD; check out a branch first");
@@ -1153,6 +1299,8 @@ export async function main(repo) {
 	const queuePath = join(repo, c.queue);
 	if (!c.queue) return log("NOT STARTED: no work list set (run /task to plan one, or set \"queue\" in .pi-queue/config.json)");
 	if (!existsSync(queuePath)) return log(`NOT STARTED: queue file ${c.queue} not found`);
+	try { dependencyGraph(allItems(readFileSync(queuePath, "utf8"), state)); }
+	catch (e) { return log(`NOT STARTED: ${e.message}`); }
 
 	const ctx = { repo, c, state, save, log, lock: mutex(), branch, stopRequested, pi: await resolvePi(c), env: await loginEnv(), web: null };
 	if (c.runIn !== "cli") {
@@ -1194,6 +1342,9 @@ export async function main(repo) {
 		return log(`NOT STARTED: ${firstLine(baseline)} — the checks already fail before any change. Full output and diagnosis: ${DIR}/problem.txt`);
 	}
 
+	state.startedAt = Date.now();
+	save();
+	process.send?.({ type: "ready" });
 	const inFlight = new Map(); // key -> item
 	const nextItem = () => {
 		let items = [];
@@ -1213,15 +1364,14 @@ export async function main(repo) {
 		};
 		const open = items.filter((i) => !finished(i) && !inFlight.has(i.key));
 		const parked = (i) => state.retried[i.key] || state.deferred?.[i.key];
-		const prio = state.priority ?? [];
-		const rank = (i) => (prio.includes(i.key) ? prio.indexOf(i.key) : prio.length);
-		const ordered = [...open.filter((i) => !parked(i)), ...(inFlight.size === 0 ? open.filter(parked) : [])].sort((a, b) => rank(a) - rank(b));
+		const eligible = new Set(open.filter((i) => !parked(i) || inFlight.size === 0).map((i) => i.key));
+		const ordered = orderQueue(items, state).filter((i) => eligible.has(i.key));
 		for (const i of ordered) {
 			let wait = false;
 			for (const d of i.after ?? []) {
 				const st = depState(d);
-				if (st === "failed") {
-					state.failed[i.key] = `depends on ${d}, which failed`;
+				if (st === "failed" || st === "unknown") {
+					state.failed[i.key] = `depends on ${d}, which ${st === "unknown" ? "is unknown" : "failed"}`;
 					log(`FAIL ${i.id} · depends on ${d}, which failed · not started`);
 					save();
 					wait = true;
@@ -1245,14 +1395,12 @@ export async function main(repo) {
 			return false;
 		}
 	};
-	const controlFile = join(repo, DIR, "control.json");
+	const controlDir = join(repo, DIR, "control");
 	const readControl = () => {
-		if (!existsSync(controlFile)) return;
-		let list = [];
-		try {
-			list = JSON.parse(readFileSync(controlFile, "utf8"));
-		} catch {}
-		rmSync(controlFile, { force: true });
+		if (!existsSync(controlDir)) return;
+		const files = readdirSync(controlDir).filter((f) => f.endsWith(".json")).sort();
+		if (!files.length) return;
+		const list = files.filter((f) => !(state.controlReceipts ?? []).includes(f)).map((f) => loadJson(join(controlDir, f), {}));
 		const items = (() => {
 			try {
 				return allItems(readFileSync(queuePath, "utf8"), state);
@@ -1260,7 +1408,9 @@ export async function main(repo) {
 				return [];
 			}
 		})();
-		for (const ctl of Array.isArray(list) ? list : [list]) {
+		for (const ctl of list) {
+			if (ctl.task !== c.task) { log("CONTROL ignored: stale task"); continue; }
+			if (ctl.by === "auto" && (stopRequested() || pauseRequested() || ctl.action !== "retry" || !ctl.ids?.length || !ctl.ids.every((id) => items.some((i) => i.id === id && state.failed[i.key] === ctl.failures?.[id])))) continue;
 			if (ctl?.action === "parallel") {
 				const n = Math.max(1, Math.floor(Number(ctl.value)) || 1);
 				if (!c.worktrees) {
@@ -1277,9 +1427,12 @@ export async function main(repo) {
 				continue;
 			}
 			const changed = applyControl(state, items, ctl ?? {});
+			if (changed.length && ["retry", "rerun", "recheck", "next"].includes(ctl.action)) { failsInARow = 0; state.failureStreak = 0; halted = ""; }
 			log(`CONTROL ${ctl?.action} ${(ctl?.ids ?? []).join(",") || (ctl?.action === "add" ? "" : "all")} · ${changed.length ? changed.join(", ") : "nothing matched"}${ctl?.by ? ` · by ${ctl.by}` : ""}`);
 		}
+		state.controlReceipts = [...(state.controlReceipts ?? []), ...files].slice(-1000);
 		save();
+		for (const file of files) rmSync(join(controlDir, file), { force: true });
 	};
 	// a passed [check] runs again when an item it covers changes after it
 	const recheckAfter = (passed) => {
@@ -1298,9 +1451,9 @@ export async function main(repo) {
 		save();
 	};
 
-	let failsInARow = 0;
+	let failsInARow = state.failureStreak ?? 0;
 	let cleanStreak = 0;
-	let halted = "";
+	let halted = failsInARow >= c.stopAfterFailuresInARow ? `${failsInARow} failures in a row` : "";
 	const free = Array.from({ length: maxW }, (_, i) => i);
 	let slots = maxW; // worktree slots created so far
 	const running = new Map();
@@ -1311,6 +1464,7 @@ export async function main(repo) {
 		state.width = w;
 		save();
 	};
+	try {
 	while (true) {
 		readControl();
 		while (!halted && running.size < width && free.length && !stopRequested() && !pauseRequested()) {
@@ -1321,6 +1475,8 @@ export async function main(repo) {
 			free.sort((a, b) => a - b);
 			const slot = free.shift();
 			inFlight.set(item.key, item);
+			state.running[slot] = { id: item.id, key: item.key, doing: "preparing worktree", startedAt: new Date().toISOString() };
+			save();
 			const p = (async () => {
 				if (!wts[slot]) {
 					wts[slot] = await prepLock(() => prepareWorktree(ctx, slot));
@@ -1328,7 +1484,10 @@ export async function main(repo) {
 				return workItem(ctx, slot, wts[slot], item);
 			})()
 				.catch((e) => {
-					log(`ERROR ${item.id} · ${e?.message ?? e}`);
+					state.failed[item.key] = `runner error: ${e?.message ?? e}`;
+					state.running[slot] = { ...(state.running[slot] ?? {}), id: item.id, key: item.key, worktree: wts[slot], quarantined: true };
+					save();
+					log(`ERROR ${item.id} · ${e?.message ?? e} · slot quarantined; work preserved`);
 					return { pass: false, kind: "fail" };
 				})
 				.then((r) => ({ r, slot, item }));
@@ -1336,20 +1495,24 @@ export async function main(repo) {
 		}
 		if (running.size === 0) {
 			readControl();
-			if (!halted && !stopRequested() && !pauseRequested() && nextItem()) continue; // the manager queued more work
+			if (!halted && !stopRequested() && !pauseRequested() && free.some((slot) => slot < maxW) && nextItem()) continue; // the manager queued more work
 			break;
 		}
 		// wake every few seconds to apply control requests while items run
-		const done = await Promise.race([...running.values(), new Promise((res) => setTimeout(() => res(null), 5000))]);
+		let wake;
+		const done = await Promise.race([...running.values(), new Promise((res) => { wake = setTimeout(() => res(null), 5000); })]);
+		clearTimeout(wake);
 		if (!done) continue;
 		const { r, slot, item } = done;
 		running.delete(slot);
-		free.push(slot);
+		if (!state.running[slot]?.quarantined) free.push(slot);
 		inFlight.delete(item.key);
 		if (r.pass) {
 			failsInARow = 0;
 			recheckAfter(item);
-		} else if (r.kind === "fail") failsInARow++;
+		} else if (r.kind === "fail" && !r.stopped) failsInARow++;
+		state.failureStreak = failsInARow;
+		save();
 		if (c.adaptive !== false && c.worktrees) {
 			if (r.redone || r.kind === "conflict") {
 				cleanStreak = 0;
@@ -1366,8 +1529,13 @@ export async function main(repo) {
 		if (stopRequested() && !halted) halted = "stop requested";
 		if (pauseRequested() && !halted) halted = "paused after running items finished";
 	}
+	} catch (e) {
+		onSignal();
+		await Promise.all(running.values());
+		throw e;
+	}
 	if (pauseRequested() && !halted) halted = "paused after running items finished";
-	state.phase = halted || "finished";
+	state.phase = halted || (Object.keys(state.running).length ? "blocked: quarantined workers" : "finished");
 	save();
 	const left = allItems(readFileSync(queuePath, "utf8"), state).filter((i) => !state.done[i.key] && !state.failed[i.key]).length;
 	log(`END · passed ${Object.keys(state.done).length} · failed ${Object.keys(state.failed).length} · still open ${left}${halted ? ` · ${halted}` : ""}`);
@@ -1379,9 +1547,15 @@ export async function main(repo) {
 		const n = await deleteSessions(ctx, ids, mode);
 		if (n) log(`CLEANUP · ${mode === "archive" ? "archived" : "removed"} ${n} finished item sessions (sessions of failed items are kept; /task cleanup removes the rest)`);
 	}
+	} finally {
+		clearInterval(heartbeat);
+		for (const sig of signals) process.off(sig, onSignal);
+		process.off("exit", release);
+		release();
+	}
 }
 
-export { piTurn, webTurn, checksText };
+export { piTurn, webTurn, checksText, prepareWorktree };
 
 const isMain = process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href;
 if (isMain) {

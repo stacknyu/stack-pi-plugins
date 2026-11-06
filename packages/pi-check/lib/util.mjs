@@ -7,7 +7,7 @@ import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "no
 
 export const STATE_DIR = ".pi-check";
 export const VERSION = "1.0.0";
-export const HOME_DIR = join(homedir(), ".pi", "agent", "pi-check");
+export const HOME_DIR = join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "pi-check");
 export const SHIM_DIR = join(HOME_DIR, "shims");
 
 export const CPUS = Math.max(1, cpus()?.length || 2);
@@ -282,7 +282,7 @@ export function runProc({ cmd, args = [], cwd, env, signal, timeoutMs, nice = 10
 		}
 		let stdout = "";
 		let stderr = "";
-		let killed = false;
+		let killed = false, killTimer;
 		const cap = (buf, add) => {
 			buf += add;
 			return buf.length > maxBytes ? buf.slice(buf.length - maxBytes) : buf;
@@ -303,7 +303,7 @@ export function runProc({ cmd, args = [], cwd, env, signal, timeoutMs, nice = 10
 			try {
 				process.kill(-child.pid, "SIGTERM");
 			} catch {}
-			setTimeout(() => {
+			killTimer = setTimeout(() => {
 				try {
 					process.kill(-child.pid, "SIGKILL");
 				} catch {}
@@ -311,12 +311,14 @@ export function runProc({ cmd, args = [], cwd, env, signal, timeoutMs, nice = 10
 		};
 		const onAbort = () => kill();
 		signal?.addEventListener("abort", onAbort);
+		if (signal?.aborted) kill();
 		const timer = timeoutMs ? setTimeout(kill, timeoutMs) : undefined;
 		child.on("error", (e) => {
 			stderr += String(e?.message ?? e);
 		});
 		child.on("close", (code) => {
 			if (timer) clearTimeout(timer);
+			clearTimeout(killTimer);
 			signal?.removeEventListener("abort", onAbort);
 			resolveP({ code: code ?? (killed ? 143 : 1), stdout, stderr, killed, ms: Date.now() - started });
 		});

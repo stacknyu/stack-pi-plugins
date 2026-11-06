@@ -1,6 +1,20 @@
 # The manager
 
-`/task manage` makes the current chat the queue's manager. In Pi Web it is pinned. It acts **only on what the user asks in each message**; it never starts work on its own and never loops.
+## Automatic manager
+
+After an approved handoff passes its baseline, a detached supervisor creates a dedicated manager session. It survives closing the planning terminal/chat. In Pi Web the manager is pinned; in terminal mode its session is in `.pi-queue/sessions/`, with its ID/reply in `.pi-queue/manager.json`.
+
+- A 60-second filesystem/process health tick makes **no model calls** while work is healthy. Runner readiness/exit also wakes the supervisor.
+- After the initial manager turn, a new terminal failure can trigger a diagnostic turn; subsequent interventions are spaced at least 10 minutes apart. An unchanged incident is not prompted repeatedly.
+- The manager is chat-only, with no tools or extension capabilities. It proposes exact existing-item retries with repair guidance, or a clean runner restart. Code validates proposals. Workers make repairs under the original scope, checks and model selection.
+- At most two automatic retries per item and two clean runner restarts per task, persisted across supervisor restarts. Manual pause/stop, changed approval/configuration, missing decisions/credentials and uncertain worker ownership prevent automatic recovery. Exhausted or rejected interventions stop supervision and leave evidence for the user.
+- A crash with recorded workers quarantines their worktrees: no reset, cleanup or automatic orphan reclamation. Quiet tests/provider retries are not treated as hangs.
+- Set `manager: false` in `.pi-queue/config.json` to disable automatic management. A direct `node runner.mjs` invocation is unsupervised; normal handoff and `/queue start` launch the supervisor.
+- Models requiring a custom provider extension cannot run in the isolated chat-only manager; configure an available built-in/configured provider. No model fallback is guessed.
+
+## Manual manager
+
+`/task manage` makes the current chat a separate interactive manager. In Pi Web it is pinned. This chat acts **only on what the user asks in each message**; the automatic supervisor does not prompt it.
 
 ## Tools
 
@@ -23,7 +37,7 @@
 | `parallel` | how many run at once. Works while running; the number becomes the ceiling and is saved for the next start |
 | `stop` / `start` | stop the run (running items' work kept on branches) / start it |
 
-While the queue runs, changes go through an inbox (`.pi-queue/control.json`) that the runner applies within seconds, each logged as a `CONTROL` line. When it is not running they apply directly, and `start` acts on them.
+Controls go through atomic files in `.pi-queue/control/`. The runner alone applies them, within seconds while running or on the next start otherwise; applied actions are logged. `/queue pause` lets current workers finish; `/queue stop` aborts them and preserves work. Only an explicit `/queue start` clears those markers. Wait for the old runner/supervisor to exit before starting.
 
 The same actions exist as commands: `/queue retry [id]`, `/queue recheck [id]`, `/queue rerun <id>`, `/queue unpark`, `/queue next <ids>`, `/queue parallel <n>`.
 

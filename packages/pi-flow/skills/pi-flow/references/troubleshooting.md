@@ -12,7 +12,7 @@ The checks fail on today's code, so every item would fail. `/queue problem` show
 
 **"Working tree is not clean".** The queue fast-forwards your branch, so it needs a clean tree. Commit or stash your edits. The handoff commits only the plan folder.
 
-**Edits made by hand in a worktree disappear.** Each worktree is reset to the branch tip before every item. Put fixes on the branch (commit in your main folder) or in `setup`/`copyFromRepo`.
+**Interrupted workers / quarantined worktrees.** The runner refuses to reset dirty or unintegrated worktrees and retains worker ownership after an uncertain exit. Stop/confirm termination of those exact CLI/Web workers, preserve their changes/commits, and reconcile the recorded slots before restarting. Do not delete `state.running` or force-clean a worktree merely to bypass this protection. The automatic manager will not do that for you.
 
 **Many items are BLOCKED with "not built yet / absent / still uses the old …".** They ran before their prerequisites. pi-flow defers such items and retries them after the rest. If the run ended anyway, ask the manager: "retry everything that was blocked by missing prerequisites". For future plans, tag `[after: …]`.
 
@@ -20,7 +20,7 @@ The checks fail on today's code, so every item would fail. `/queue problem` show
 
 **Parked items run one at a time at the end.** Parked items (after a conflict or a deferral) wait for quiet so they don't conflict again. To speed up: `unpark`, or `next <ids>`.
 
-**The run stopped with "5 failures in a row".** That's the safety stop. Read the reasons (`queue_overview`, or "what's wrong?" to the manager), deal with the shared cause, then `retry` and `start`.
+**The run stopped with "5 failures in a row".** That's the safety stop. The automatic manager may diagnose it and propose bounded retries within the approved task; unresolved blockers or exhausted budgets remain stopped. Read the reasons, address the cause, then explicitly `retry` and `start`. Manual stops do not count as real failures.
 
 **You continued a failed item by hand and another item clashed with it.** When an item fails, its worktree goes to the next item. Don't keep working in a failed item's session; `retry` it, or raise its limits through the queue.
 
@@ -34,6 +34,6 @@ The checks fail on today's code, so every item would fail. `/queue problem` show
 
 **Pi Web isn't used although it runs.** The runner looks for Pi Web's run records and port 30141. Set `piWebUrl` in `.pi-queue/config.json` if yours differs. `runIn: "web"` refuses to start without it, and `"cli"` never uses it.
 
-**Nothing happens overnight.** The Mac slept (`caffeinate -dims`), or Pi Web was closed in Pi Web mode. The runner continues from `state.json` when started again.
+**Nothing happens overnight.** Keep the machine awake (`caffeinate -dims`) and Pi Web running for Web workers. The detached supervisor survives closing the planning chat, not a machine shutdown or killed supervisor. Explicit start resumes saved state only when no interrupted worker ownership remains. Grant project trust before starting unattended CLI workers; saved trust denials are not overridden.
 
 **Parallel items rerun the same tests and the machine crawls.** Install pi-check (a separate plugin). The queue then sends every check through one shared broker per repo. Results are cached by file content and shared by all worktrees, identical runs in progress are joined, and heavy runs are throttled. Go failures that already fail on the base branch stop blocking items. See `/check status` for what runs and how much time was saved.

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- pi-flow: automatic isolated manager with a detached, no-model health tick and bounded approved-scope recovery; durable controls, explicit resume, worker quarantine and preserved failure work.
+- pi-flow: reject dependency cycles and conflicting tags; prioritize critical-path prerequisites without serializing independent work; expose installed pi-check in worker worktrees.
+- pi-check: correct shared-result invalidation and cancellation, reserve capacity for staggered heavy jobs, and preserve Go execution semantics and language-specific inputs. Fix symlinked CLI entrypoints and isolated-profile discovery.
+- Add temporary-repository, fake-agent and real-resource-loader regressions. No active installations are migrated automatically.
+
 - Remove GitHub Actions CI; verification remains available locally through `pnpm test` and pi-check.
 
 ## 0.1.0

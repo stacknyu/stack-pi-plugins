@@ -10,7 +10,7 @@
  *   /queue start|stop|status|watch|retry|problem   control the queue directly
  */
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
@@ -21,8 +21,11 @@ import {
 	DIR,
 	LOGIN_SHELL,
 	allItems,
-	applyControl,
+	acquireProcessLock,
+	enqueueControl,
+	pidAlive,
 	areasOverlap,
+	dependencyGraph,
 	checkBroker,
 	checkLine,
 	cleanEnv,
@@ -42,7 +45,7 @@ import {
 import { FLOW_DIR, TASKS_DIR, exclude, saveProfile, setupRepo } from "./setup.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const RUNNER = join(HERE, "runner.mjs");
+const RUNNER = join(HERE, "supervisor.mjs");
 
 // ---------- small helpers ----------
 
@@ -54,12 +57,11 @@ function readText(path: string): string {
 	}
 }
 
-function runnerPid(cwd: string): number | undefined {
+function runnerPid(cwd: string, owner = "runner"): number | undefined {
 	try {
-		const pid = Number(readText(join(cwd, DIR, "runner.pid")).trim());
+		const pid = Number(readText(join(cwd, DIR, `${owner}.pid`)).trim());
 		if (!pid) return undefined;
-		process.kill(pid, 0);
-		return pid;
+		return pidAlive(pid) ? pid : undefined;
 	} catch {
 		return undefined;
 	}
@@ -120,7 +122,7 @@ function taskStatus(cwd: string, t: any): string {
 		cfg = readConfig(cwd);
 	} catch {}
 	if (cfg.task !== t.slug) return fs.status ?? t.status;
-	if (runnerPid(cwd)) return "running";
+	if (runnerPid(cwd) || runnerPid(cwd, "supervisor")) return "running";
 	const state = readState(cwd);
 	const open = allItems(readText(join(cwd, cfg.queue)), state).filter((i: any) => !state.done?.[i.key] && !state.failed?.[i.key]).length;
 	if (open > 0) return "queued (stopped)";
@@ -184,6 +186,8 @@ function liveLines(cwd: string): string[] {
 		.filter((l) => /\b(PASS|FAIL|CONFLICT|REDO|SPLIT|WIDTH|LIMITS RAISED|STOPP|END|NOT STARTED|ERROR|CRASH|CLEANUP)\b/.test(l))
 		.slice(-5)
 		.map((l) => `  ${l.replace(/^- \d{4}-\d\d-\d\d /, "")}`);
+	const manager = loadJson(join(cwd, DIR, "manager.json"), {});
+	if (manager.id) lines.push(`  automatic manager ${runnerPid(cwd, "supervisor") ? "watching" : "idle"} · ${manager.id}`);
 	return [...lines, ...log];
 }
 
@@ -212,19 +216,26 @@ function startWatch(ctx: any) {
 }
 
 /** Start the background runner. Returns an error text, or "" when it started (or already ran to the end). */
-async function startRunner(cwd: string): Promise<string> {
+async function startRunner(cwd: string, resume = false): Promise<string> {
 	await ensureDir(cwd);
+	if (runnerPid(cwd) || runnerPid(cwd, "supervisor")) return "Queue or supervisor is still active; wait for it to finish before starting again.";
+	const release = acquireProcessLock(join(cwd, DIR, "start.pid"));
+	try {
+	if (resume) for (const marker of ["STOP", "PAUSE"]) rmSync(join(cwd, DIR, marker), { force: true });
 	const logFile = join(cwd, DIR, "log.md");
 	const before = readText(logFile).length;
 	const out = openSync(join(cwd, DIR, "runner.out"), "a");
 	const child = spawn(LOGIN_SHELL, ["-lc", 'exec node "$0" "$1"', RUNNER, cwd], { cwd, detached: true, stdio: ["ignore", out, out] });
+	child.on("error", () => {});
 	child.unref();
+	closeSync(out);
 	await new Promise((r) => setTimeout(r, 1500));
 	if (runnerPid(cwd)) return "";
 	const fresh = readText(logFile).slice(before);
 	if (/\bSTART\b/.test(fresh) && !/NOT STARTED|CRASH/.test(fresh)) return "";
 	const last = fresh.trim().split("\n").slice(-1).join("\n");
 	return `${last || "(no log line)"}\n\n${problemText(cwd) || "(see .pi-queue/runner.out)"}`;
+	} finally { release(); }
 }
 
 // ---------- planning ----------
@@ -286,10 +297,10 @@ When every file is written (in an earlier step, not in the same batch of tool ca
 
 Rules for items:
 - Each item is done by a fresh agent that has never seen this conversation. It reads AGENTS.md, brief.md, rules.md, the answers in questions.md, and the map/inventory parts the item names. Everything it needs must be there or in the item line.
-- Ids: a capital-letter prefix plus a number (A01, A02, B01…), unique, in the order they should run.
+- Ids: a capital-letter prefix plus a number (A01, A02, B01…), unique. File order breaks ties; actual prerequisites belong in [after].
 - Size: one coherent change, normally at most 5 files gaining lines and 150 net added lines. A bigger item is fine when splitting it would be artificial; the queue raises limits on request and splits items that stall.
 - [areas: …] is required: the narrowest folders/files the item changes. Items with overlapping areas never run at the same time; disjoint ones run in parallel. Accurate areas mean speed and no conflicts.
-- [after: …] only for real dependencies (a helper built in A01 used by A05). Put foundations first.
+- [after: …] only for real dependencies (a helper built in A01 used by A05). Do not chain independent items or add blanket stage barriers. The scheduler prioritizes prerequisites on the longest remaining dependency chain and fills free slots with disjoint ready items. Use [after: *] only for genuinely whole-task verification; otherwise give checks their exact prerequisites.
 - Every item must leave the checks passing. No item may depend on an unanswered question.
 - Verification goes into [check] items: "- [ ] V01 — Check <what>. Done when: <what must hold>. [check] [areas: <what it verifies>] [after: <the items it verifies>]". A check passes without changes when everything holds; it may fix tests/docs; when it finds production gaps it reports them and the queue adds fix items and checks again. A passed check runs again automatically when an item it covers changes later.
 - No "investigate" or "review" items that produce nothing: every item either changes code/docs or is a [check].`;
@@ -301,12 +312,14 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 	const W = `${TASKS_DIR}/${slug}`;
 	const task: any = loadJson(taskFile(cwd, slug), null);
 	if (!task) return { ok: false, text: `${W}/task.json not found. Is the slug right?` };
-	if (runnerPid(cwd)) return { ok: false, text: "A queue is already running in this repo. Wait for it to finish (or /queue stop), then call task_handoff again." };
+	if (runnerPid(cwd) || runnerPid(cwd, "supervisor") || Object.keys(readState(cwd).running ?? {}).length) return { ok: false, text: "A queue/supervisor or interrupted workers still own this repo. Wait for completion or reconcile interrupted work before handing off another task." };
 
 	const problems: string[] = [];
 	const warnings: string[] = [];
 	const itemsText = readText(join(cwd, W, "items.md"));
-	const items = parseQueue(itemsText);
+	let items;
+	try { items = parseQueue(itemsText); }
+	catch (e: any) { return { ok: false, text: `Not handed off: ${e.message}` }; }
 	if (items.length === 0) problems.push(`${W}/items.md has no "- [ ] ID — …" lines.`);
 	const ids = new Map<string, number>();
 	for (const i of items as any[]) ids.set(i.id, (ids.get(i.id) ?? 0) + 1);
@@ -328,13 +341,12 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 			if (selected.thinking && model && !getSupportedThinkingLevels(model).includes(selected.thinking)) problems.push(`${item.id}: ${selected.thinking} is not supported by ${model.provider}/${model.id}.`);
 		} catch (e: any) { problems.push(e.message); }
 	}
-	const badAfter = (items as any[]).flatMap((i) => (i.after ?? []).filter((d: string) => d !== "*" && !ids.has(d)).map((d: string) => `${i.id}→${d}`));
-	if (badAfter.length) problems.push(`[after: …] names unknown ids: ${badAfter.slice(0, 6).join(", ")}`);
+	try { dependencyGraph(items); } catch (e: any) { problems.push(e.message); }
 	const openQs = readText(join(cwd, W, "questions.md"))
 		.split("\n")
 		.filter((l) => /^\s*-\s\[\s\]/.test(l));
 	if (openQs.length) problems.push(`${openQs.length} question(s) in questions.md are still open. Ask the user, record the answers ("- [x] … — Answer: …"), then hand off.`);
-	for (const f of ["brief.md", "rules.md"]) if (!existsSync(join(cwd, W, f))) problems.push(`${W}/${f} is missing.`);
+	for (const f of ["brief.md", "rules.md", "questions.md"]) if (!existsSync(join(cwd, W, f))) problems.push(`${W}/${f} is missing.`);
 	const allowed: string[] = Array.isArray(task.allowedPaths) ? task.allowedPaths.filter((p: any) => typeof p === "string" && p.trim()) : [];
 	if (allowed.length === 0) problems.push(`task.json has no "allowedPaths".`);
 	const outside = (items as any[]).filter((i) => i.areas?.length && !i.areas.every((a: string) => allowed.some((p) => areasOverlap([a], [p]) && a.startsWith(p.split("*")[0].replace(/\/+$/, "")))));
@@ -390,7 +402,7 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 	if (prev) {
 		const dest = join(cwd, DIR, "archive", `${readConfig(cwd).task || "previous"}-${new Date().toISOString().replace(/\D/g, "").slice(0, 12)}`);
 		mkdirSync(dest, { recursive: true });
-		for (const f of ["state.json", "log.md", "notes", "live", "problem.txt"]) {
+		for (const f of ["state.json", "log.md", "notes", "live", "problem.txt", "manager.json", "control"]) {
 			if (existsSync(join(cwd, DIR, f))) renameSync(join(cwd, DIR, f), join(dest, f));
 		}
 	}
@@ -413,7 +425,7 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 	};
 	writeFileSync(join(cwd, DIR, "config.json"), `${JSON.stringify(config, null, 2)}\n`);
 
-	const err = await startRunner(cwd);
+	const err = await startRunner(cwd, true);
 	if (err) return { ok: false, text: `The plan is committed, but the queue did not start:\n${err}` };
 	// In Pi Web, pin this planning chat while the queue runs: it is the task's control room
 	const sid = ctx?.sessionManager?.getSessionId?.();
@@ -431,10 +443,14 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 // ---------- cleanup ----------
 
 async function cleanup(cwd: string, all: boolean, currentSession: string): Promise<string> {
-	if (runnerPid(cwd)) return "The queue is still running. /queue stop first, or wait for it to finish.";
+	if (runnerPid(cwd) || runnerPid(cwd, "supervisor") || Object.keys(readState(cwd).running ?? {}).length) return "The queue/supervisor or interrupted workers still own the worktrees. Stop and reconcile them before cleanup.";
 	const notes: string[] = [];
 	const state = readState(cwd);
 	const web = await piWeb(cwd);
+	const managerFile = join(cwd, DIR, "manager.json"), manager = loadJson(managerFile, {});
+	if (pidAlive(manager.pid)) return "The automatic manager turn is still active; wait before cleanup.";
+	if (manager.web && manager.id && web && (await web.running()).runningSessionIds?.includes(manager.id)) return "The automatic manager is still active in Pi Web; wait before cleanup.";
+	if (manager.id && manager.id !== currentSession) state.sessions = { ...state.sessions, [manager.id]: { ...state.sessions?.[manager.id], web: !!manager.web, status: "manager" } };
 	const rctx = { repo: cwd, state, web, save: () => writeFileSync(join(cwd, DIR, "state.json"), `${JSON.stringify(state, null, 2)}\n`), log: (m: string) => notes.push(m) };
 
 	// item sessions: Pi Web ones through its API, terminal ones by file
@@ -442,7 +458,11 @@ async function cleanup(cwd: string, all: boolean, currentSession: string): Promi
 	const webLeft = items.filter((id) => state.sessions[id].web);
 	if (webLeft.length && !web) notes.push(`${webLeft.length} item session(s) are in Pi Web, which is not running now; run /task cleanup again with Pi Web open to remove them`);
 	const n = items.length ? await deleteSessions(rctx, items) : 0;
-	notes.push(n ? `deleted ${n} item session(s)` : "no item sessions left to delete");
+	notes.push(n ? `deleted ${n} item/manager session(s)` : "no item sessions left to delete");
+	if (state.sessions?.[manager.id]?.deleted) {
+		delete manager.id; manager.initialized = false;
+		writeFileSync(managerFile, `${JSON.stringify(manager, null, 2)}\n`);
+	}
 
 	// planning chats of finished tasks (never the one you are in)
 	const fs = flowStatus(cwd);
@@ -539,7 +559,7 @@ async function itemText(cwd: string, id: string): Promise<string> {
 	return [`${item.line}`, `status: ${status}`, diff ? `commit:\n${diff}` : "", note ? `last result:\n${note}` : "", live ? `activity:\n${live}` : ""].filter(Boolean).join("\n\n");
 }
 
-/** Apply a control request: through the runner's inbox while it runs, directly otherwise. */
+/** Persist controls in one inbox; only the runner mutates queue state. */
 async function control(cwd: string, ctl: any): Promise<string> {
 	if (ctl.action === "pause") {
 		mkdirSync(join(cwd, DIR), { recursive: true });
@@ -553,30 +573,12 @@ async function control(cwd: string, ctl: any): Promise<string> {
 	}
 	if (ctl.action === "start") {
 		if (runnerPid(cwd)) return "The queue is already running.";
-		const err = await startRunner(cwd);
+		const err = await startRunner(cwd, true);
 		return err ? `The queue did not start:\n${err}` : "Queue started.";
 	}
-	if (runnerPid(cwd)) {
-		const f = join(cwd, DIR, "control.json");
-		let list: any[] = [];
-		try {
-			list = JSON.parse(readText(f) || "[]");
-		} catch {}
-		list.push({ ...ctl, by: "manager" });
-		writeFileSync(f, JSON.stringify(list));
-		return `Sent to the running queue (${ctl.action}); it applies within a few seconds and logs a CONTROL line.`;
-	}
-	if (ctl.action === "parallel") {
-		const cfg: any = loadJson(join(cwd, DIR, "config.json"), {});
-		cfg.parallel = Math.max(1, Math.floor(Number(ctl.value)) || 1);
-		writeFileSync(join(cwd, DIR, "config.json"), `${JSON.stringify(cfg, null, 2)}\n`);
-		return `parallel set to ${cfg.parallel} for the next start.`;
-	}
 	const cfg: any = readConfig(cwd);
-	const state = readState(cwd);
-	const changed = applyControl(state, allItems(readText(join(cwd, cfg.queue || "")), state), ctl);
-	writeFileSync(join(cwd, DIR, "state.json"), `${JSON.stringify(state, null, 2)}\n`);
-	return `${ctl.action}: ${changed.length ? changed.join(", ") : "nothing matched"}. The queue is not running; start it to act on this.`;
+	enqueueControl(cwd, { ...ctl, task: cfg.task, by: "user" });
+	return `${ctl.action} queued; ${runnerPid(cwd) ? "the runner applies it within seconds" : "it applies on the next start"}.`;
 }
 
 function managerPrompt(cwd: string): string {
@@ -596,7 +598,7 @@ Start with a short overview of where things stand and anything that needs my att
 }
 
 // exported for tests
-export { cleanup, handoff, planPrompt };
+export { cleanup, handoff, planPrompt, control, startRunner };
 
 // ---------- the extension ----------
 
@@ -852,30 +854,9 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(problemText(cwd, 200) || "queue: no recorded problem.", "info");
 				return;
 			}
-			if (cmd === "stop") {
-				mkdirSync(join(cwd, DIR), { recursive: true });
-				writeFileSync(join(cwd, DIR, "STOP"), "");
-				ctx.ui.notify(runnerPid(cwd) ? "queue: stopping. Running items stop within seconds; their work is kept on queue-failed/ branches." : "queue: not running.", "warning");
-				return;
-			}
-			if (["pause", "recheck", "rerun", "unpark", "parallel", "retry", "next"].includes(cmd)) {
+			if (["stop", "pause", "recheck", "rerun", "unpark", "parallel", "retry", "next"].includes(cmd)) {
 				const ids = (args ?? "").trim().split(/[\s,]+/).filter(Boolean).slice(1);
 				ctx.ui.notify(`queue: ${await control(cwd, cmd === "parallel" ? { action: cmd, value: Number(arg) } : { action: cmd, ids })}`, "info");
-				return;
-			}
-			if (cmd === "retry") {
-				if (runnerPid(cwd)) {
-					ctx.ui.notify("queue: /queue stop first, then /queue retry, then /queue start.", "warning");
-					return;
-				}
-				const state = readState(cwd);
-				const keys = Object.keys(state.failed ?? {}).filter((k) => !arg || k.startsWith(arg));
-				for (const k of keys) {
-					delete state.failed[k];
-					if (state.retried) delete state.retried[k];
-				}
-				writeFileSync(join(cwd, DIR, "state.json"), `${JSON.stringify(state, null, 2)}\n`);
-				ctx.ui.notify(`queue: ${keys.length} failed item(s) will run again on the next /queue start.`, "info");
 				return;
 			}
 			if (cmd !== "start") {
@@ -892,7 +873,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("queue: nothing queued yet. Plan a task with /task <request>; it starts the queue itself.", "warning");
 				return;
 			}
-			const err = await startRunner(cwd);
+			const err = await startRunner(cwd, true);
 			if (!err) startWatch(ctx);
 			ctx.ui.notify(err ? `queue: the runner stopped right away.\n${err}` : `queue: started.\n${liveLines(cwd).join("\n")}`, err ? "error" : "info");
 		},

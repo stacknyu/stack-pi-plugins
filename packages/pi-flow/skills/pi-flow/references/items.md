@@ -6,7 +6,7 @@
 - [ ] A01 — <what to do, naming files/functions>. Done when: <observable result>. [areas: <folders/files it changes>] [after: <ids>]
 ```
 
-- **Id:** capital letters plus a number (`A01`, `P03`, `V04`), unique, in run order. Ids made by the queue: `A01a…` (split parts), `V01-fix1…` (gap fixes).
+- **Id:** capital letters plus a number (`A01`, `P03`, `V04`), unique. File order breaks ties, not dependencies. Ids made by the queue: `A01a…` (split parts), `V01-fix1…` (gap fixes).
 - **Done when:** what a reviewer can verify. Every item needs one.
 - **Context:** each item runs in a fresh session that has never seen the planning chat. It reads `AGENTS.md`, `brief.md`, `rules.md`, the answers in `questions.md`, and the map and inventory parts it names. Anything it needs must be there or in its line.
 
@@ -61,7 +61,7 @@ If a check fails, the agent gets `fixRounds` (1) chances in the same session. Fa
 
 ## Good plans
 
-- Foundations first, with real `[after]` dependencies only.
+- Use `[after]` only for real prerequisites, not blanket stage barriers. Ready prerequisites on longer chains get preference; independent work stays parallel. Cycles and duplicate tags are rejected.
 - Narrow, accurate `[areas]`. They decide parallelism and prevent conflicts.
 - One coherent change per item. Splitting artificially is worse than one `[big]` item.
 - No items that only investigate or review: every item builds something or is a `[check]`.

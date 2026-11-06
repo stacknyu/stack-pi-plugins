@@ -166,25 +166,21 @@ export class Broker {
 		return p;
 	}
 
-	unitsOf(rc, project, kind) {
-		const k = `units:${project.id}|${kind}`;
+	unitsOf(rc, project, kind, env, extraArgs) {
+		const k = `units:${project.id}|${kind}|${JSON.stringify([env, extraArgs])}`;
 		let u = rc.memo.get(k);
 		if (!u) {
-			try {
-				u = ADAPTERS[project.lang].units(rc, project, kind);
-			} catch (e) {
-				this.log("units failed", project.id, kind, String(e?.stack ?? e));
-				u = [];
-			}
+			u = ADAPTERS[project.lang].units(rc, project, kind, { env, extraArgs });
 			rc.memo.set(k, u);
 		}
 		return u;
 	}
 
-	keyOf(rc, project, kind, unit, extra = "") {
+	keyOf(rc, project, kind, unit, extra = "", env) {
 		const a = ADAPTERS[project.lang];
 		const opts = kindOptions(rc.config, project.dir, kind) || {};
-		return sha(JSON.stringify([2, process.platform, process.arch, process.version, project.lang, a.version, project.dir, kind, unit.target, a.argsKey(opts, project), extra, rc.digest(unit.inputs)]));
+		if (env) opts.env = { ...env, ...opts.env };
+		return sha(JSON.stringify([4, process.platform, process.arch, process.version, project.lang, a.version, project.dir, kind, unit.target, a.argsKey(opts, project), a.executionKey?.(rc, project, opts), extra, rc.digest(unit.inputs)]));
 	}
 
 	/** Units a request covers, with their current keys. */
@@ -201,6 +197,7 @@ export class Broker {
 			}
 			let extra = req.extraKey ?? (req.extraArgs?.length ? JSON.stringify(req.extraArgs) : "");
 			if (extra === "[]") extra = "";
+			if (req.env) extra += sha(JSON.stringify(Object.entries(req.env).map(([k, v]) => [k, k === "GOWORK" && v.startsWith(`${rc.abs}/`) ? v.slice(rc.abs.length + 1) : v]).sort()));
 			const goSel = req.goSelect ? this.resolveGo(rc, req.goSelect).map : undefined;
 			const out = [];
 			for (const project of this.projects(rc)) {
@@ -212,13 +209,13 @@ export class Broker {
 					if (req.kinds?.length && !req.kinds.includes(kind)) continue;
 					if (req.select && kind !== req.select.kind) continue;
 					const sel = goSel ? goSel.get(project.dir) : req.select?.targets ? new Set(req.select.targets) : undefined;
-					for (const unit of this.unitsOf(rc, project, kind)) {
+					for (const unit of this.unitsOf(rc, project, kind, req.env, req.extraArgs)) {
 						if (sel && !sel.has(unit.target)) continue;
 						if (changed && !sel) {
 							const hit = unit.inputs.some((f) => changed.has(f)) || (gone.size && unit.inputs.some((f) => gone.has(dirOf(f))));
 							if (!hit) continue;
 						}
-						out.push({ project, kind, unit, uid: `${project.id}|${kind}|${unit.target}`, key: this.keyOf(rc, project, kind, unit, extra), extra });
+						out.push({ project, kind, unit, uid: `${project.id}|${kind}|${unit.target}`, key: this.keyOf(rc, project, kind, unit, extra, req.env), extra });
 					}
 				}
 			}
@@ -243,7 +240,8 @@ export class Broker {
 			let hits = [];
 			if (p.startsWith(".")) {
 				const dir = normRel(`${cwdRel}/${p}`);
-				hits = [...g.pkgs.values()].filter((q) => (recursive ? isUnder(q.dir, dir) : q.dir === dir));
+				const owner = g.modules.find((m) => isUnder(dir, m.dir));
+				hits = owner ? [...g.pkgs.values()].filter((q) => q.module === owner && (recursive ? isUnder(q.dir, dir) : q.dir === dir)) : [];
 			} else if (["all", "std", "cmd"].includes(p)) unsupported = true;
 			else hits = [...g.pkgs.values()].filter((q) => (recursive ? q.importPath === p || q.importPath.startsWith(`${p}/`) : q.importPath === p));
 			if (!hits.length) unsupported = true;
@@ -337,7 +335,7 @@ export class Broker {
 		if (speculative) {
 			if ((this.unstable.get(item.uid) ?? 0) >= 2) return undefined;
 		}
-		t = { key: item.key, uid: item.uid, root: r, project: item.project, kind: item.kind, unit: item.unit, extra: item.extra, extraArgs: item.extraArgs, exec: item.exec, priority, speculative, waiters: [], attempts: 0, seq: jobSeq++ };
+		t = { key: item.key, uid: item.uid, root: r, project: item.project, kind: item.kind, unit: item.unit, extra: item.extra, extraArgs: item.extraArgs, extraEnv: item.extraEnv, exec: item.exec, priority, speculative, waiters: [], seq: jobSeq++ };
 		this.inflight.set(item.key, t);
 		this.pending.push(t);
 		const p = speculative ? Promise.resolve(undefined) : new Promise((res) => t.waiters.push({ res, request }));
@@ -348,6 +346,15 @@ export class Broker {
 		if (this.inflight.get(t.key) === t) this.inflight.delete(t.key);
 		for (const w of t.waiters) w.res(result);
 		t.waiters = [];
+	}
+
+	cancelRequest(request) {
+		request.cancelled = true;
+		for (const t of this.inflight.values()) {
+			for (const w of t.waiters.filter((w) => w.request === request)) w.res({ status: "error", code: 130, failures: [{ id: `${t.uid}:[cancelled]`, title: "request cancelled", output: "" }] });
+			t.waiters = t.waiters.filter((w) => w.request !== request);
+			if (!t.waiters.length) { t.speculative = true; t.priority = PRIO.speculative; }
+		}
 	}
 
 	groupOf(t) {
@@ -401,7 +408,9 @@ export class Broker {
 			ready++;
 		}
 		const slots = Math.max(1, Math.min(ready, limit - peers.length));
-		return Math.min(this.config.threads || available, Math.max(1, Math.floor(available / slots)));
+		// Leave capacity for a late requester instead of leasing the whole budget to one job.
+		const ceiling = this.config.threads || Math.ceil(budget / Math.min(limit, 2));
+		return Math.min(ceiling, Math.max(1, Math.floor(available / slots)));
 	}
 
 	pump() {
@@ -505,32 +514,21 @@ export class Broker {
 		const { project, kind } = job;
 		const a = ADAPTERS[project.lang];
 		const opts = kindOptions(this.config, project.dir, kind) || {};
-		// re-key at start: files may have changed while this waited
+		if (job.tasks[0].extraEnv) opts.env = { ...job.tasks[0].extraEnv, ...opts.env };
+		// A joined request owns this snapshot, not whatever the producer edits next.
 		const live = [];
+		rc.invalidate(true);
 		rc.batch(() => {
 			for (const t of job.tasks) {
-				const unit = this.unitsOf(rc, project, kind).find((u) => u.target === t.unit.target);
+				const unit = this.unitsOf(rc, project, kind, t.extraEnv, t.extraArgs).find((u) => u.target === t.unit.target);
 				if (!unit) {
 					this.resolveTask(t, { status: "error", failures: [{ id: `${t.uid}:[gone]`, title: `${t.unit.target} no longer exists`, output: "" }] });
 					continue;
 				}
-				const k = this.keyOf(rc, project, kind, unit, t.extra);
+				const k = this.keyOf(rc, project, kind, unit, t.extra, t.extraEnv);
 				if (k !== t.key) {
-					const hit = this.cacheGet(k);
-					if (this.inflight.get(t.key) === t) this.inflight.delete(t.key);
-					if (hit) {
-						for (const w of t.waiters) w.res({ ...hit, source: "cache" });
-						t.waiters = [];
-						continue;
-					}
-					const other = this.inflight.get(k);
-					if (other && other !== t) {
-						other.waiters.push(...t.waiters);
-						t.waiters = [];
-						continue;
-					}
-					t.key = k;
-					this.inflight.set(k, t);
+					this.resolveTask(t, { status: "error", stale: true, failures: [] });
+					continue;
 				}
 				t.unit = unit;
 				live.push(t);
@@ -546,14 +544,16 @@ export class Broker {
 			if (finalized.has(t)) return;
 			finalized.add(t);
 			job.completed++;
-			const after = rc.batch(() => this.keyOf(rc, project, kind, t.unit, t.extra));
+			rc.invalidate(true);
+			const current = this.unitsOf(rc, project, kind, t.extraEnv, t.extraArgs).find((u) => u.target === t.unit.target);
+			const after = current && rc.batch(() => this.keyOf(rc, project, kind, current, t.extra, t.extraEnv));
 			const rec = { ...result, key: t.key, uid: t.uid, lang: project.lang, project: project.dir, kind, target: t.unit.target, label: t.unit.label, ms, at: Date.now(), root: r.name, speculative: t.speculative && !t.waiters.length };
 			if (t.speculative && !t.waiters.length) this.stats.speculativeRan++;
 			else this.stats.ran++;
 			if (after === t.key) {
 				if (result.status !== "error") this.cachePut(t.key, rec);
 				if (result.status !== "error") {
-					if (baseClean) this.updateKnown(rec, baseClean, t.unit.inputs);
+					if (baseClean) this.updateKnown(rec, this.baseIsClean(rc) ?? { dirty: new Set(current.inputs) }, current.inputs);
 					else this.noteIfBase(r, project, kind, t, rec);
 				}
 				this.unstable.delete(t.uid);
@@ -561,18 +561,7 @@ export class Broker {
 				return;
 			}
 			this.unstable.set(t.uid, (this.unstable.get(t.uid) ?? 0) + 1);
-			if (this.inflight.get(t.key) === t) this.inflight.delete(t.key);
-			if (t.waiters.length && t.attempts < 2) {
-				t.attempts++;
-				t.key = after;
-				const other = this.inflight.get(after);
-				if (other) other.waiters.push(...t.waiters);
-				else {
-					this.inflight.set(after, t);
-					this.pending.push(t);
-					setImmediate(() => this.pump());
-				}
-			} else this.resolveTask(t, { ...rec, source: "ran", stale: true });
+			this.resolveTask(t, { ...rec, source: "ran", stale: true });
 		};
 		const onUnit = (target, result) => {
 			const t = byTarget.get(target);
@@ -610,21 +599,22 @@ export class Broker {
 		const unknown = results.filter(({ res }) => res && res.status === "fail" && (res.failures ?? []).some((f) => !this.known.ids[f.id]));
 		if (!unknown.length) return;
 		const m = this.root(this.main);
-		const base = this.baseCached(m.rc);
+		m.rc.invalidate(true);
+		const base = this.baseIsClean(m.rc);
 		if (!base) return;
 		const waits = [];
 		m.rc.batch(() => {
 			for (const { it } of unknown.slice(0, 60)) {
 				const mp = this.projects(m.rc).find((x) => x.id === it.project.id);
-				const mu = mp && this.unitsOf(m.rc, mp, it.kind).find((u) => u.target === it.unit.target);
+				const mu = mp && this.unitsOf(m.rc, mp, it.kind, req.env, req.extraArgs).find((u) => u.target === it.unit.target);
 				if (!mu || mu.inputs.some((f) => base.dirty.has(f))) continue;
-				const key = this.keyOf(m.rc, mp, it.kind, mu, it.extra);
+				const key = this.keyOf(m.rc, mp, it.kind, mu, it.extra, req.env);
 				const hit = this.cacheGet(key);
 				if (hit) {
 					if (hit.status !== "error") this.updateKnown({ ...hit, uid: it.uid, project: mp.dir, kind: it.kind }, base, mu.inputs);
 					continue;
 				}
-				const w = this.want(m, { project: mp, kind: it.kind, unit: mu, uid: it.uid, key, extra: it.extra, extraArgs: req.extraArgs }, { priority: PRIO.normal, speculative: false });
+				const w = this.want(m, { project: mp, kind: it.kind, unit: mu, uid: it.uid, key, extra: it.extra, extraArgs: req.extraArgs, extraEnv: req.env }, { priority: PRIO.normal, speculative: false, request: req });
 				if (w) waits.push(w.promise);
 			}
 		});
@@ -638,18 +628,14 @@ export class Broker {
 	noteIfBase(r, project, kind, t, rec) {
 		try {
 			const m = this.root(this.main);
-			const base = this.baseCached(m.rc);
+			m.rc.invalidate(true);
+			const base = this.baseIsClean(m.rc);
 			if (!base) return;
 			const mp = this.projects(m.rc).find((x) => x.id === project.id);
-			const mu = mp && this.unitsOf(m.rc, mp, kind).find((u) => u.target === t.unit.target);
+			const mu = mp && this.unitsOf(m.rc, mp, kind, t.extraEnv, t.extraArgs).find((u) => u.target === t.unit.target);
 			if (!mu) return;
-			if (m.rc.batch(() => this.keyOf(m.rc, mp, kind, mu, t.extra)) === t.key) this.updateKnown(rec, base, mu.inputs);
+			if (m.rc.batch(() => this.keyOf(m.rc, mp, kind, mu, t.extra, t.extraEnv)) === t.key) this.updateKnown(rec, base, mu.inputs);
 		} catch {}
-	}
-
-	baseCached(rc) {
-		if (!this._base || Date.now() - this._base.at > 5000) this._base = { at: Date.now(), v: this.baseIsClean(rc) };
-		return this._base.v;
 	}
 
 	/** Main checkout on the base branch tip, and which of its files are uncommitted. */
@@ -685,7 +671,7 @@ export class Broker {
 
 	// ---------- exec (whole commands agents run in bash) ----------
 
-	execPlan(r, cwdAbs, cmd) {
+	execPlan(r, cwdAbs, cmd, env) {
 		const rc = r.rc;
 		let eff = cwdAbs.startsWith(rc.abs) ? normRel(cwdAbs.slice(rc.abs.length + 1)) : ".";
 		const cdm = cmd.match(/^\s*cd\s+(["']?)([^"'&;|]+?)\1\s*(&&|;)/);
@@ -697,7 +683,7 @@ export class Broker {
 		const projectDir = dirs[0] ?? eff;
 		const inputs = [...rc.filesUnder(projectDir), ...rootLockfiles(rc), ...["package.json", "go.work"].filter((f) => rc.has(f))];
 		const cwdRel = cwdAbs.startsWith(rc.abs) ? normRel(cwdAbs.slice(rc.abs.length + 1)) : ".";
-		const key = rc.batch(() => sha(JSON.stringify(["exec", 1, cmd, cwdRel, rc.digest(inputs)])));
+		const key = rc.batch(() => sha(JSON.stringify(["exec", 3, process.platform, process.arch, process.version, cmd, cwdRel, env ? Object.entries(env).sort() : [], rc.digest(inputs)])));
 		return { key, projectDir, inputs, cwdRel };
 	}
 
@@ -706,37 +692,46 @@ export class Broker {
 		const rc = job.root.rc;
 		// A broker-owned shell already holds a CPU lease. Nested shims execute inside that
 		// lease rather than requesting a second slot and deadlocking maxJobs=1.
-		const env = cleanEnv({ CI: "1", FORCE_COLOR: "0", NO_COLOR: "1", PY_COLORS: "0", PI_CHECK_BYPASS: "1", GOMAXPROCS: String(threads), GOFLAGS: `${process.env.GOFLAGS ?? ""} -p=1`.trim() });
-				const r = await runProc({ cmd: "/bin/sh", args: ["-c", t.exec.cmd], cwd: rc.path(t.exec.cwdRel), env, signal: job.ac.signal, nice, timeoutMs: parseDuration(this.config.execTimeout, 45 * 60000), maxBytes: 2 * 1024 * 1024 });
-		if (job.ac.signal.aborted && !t.waiters.length) {
+		const env = cleanEnv({ CI: "1", FORCE_COLOR: "0", NO_COLOR: "1", PY_COLORS: "0", ...t.exec.env, PI_CHECK_BYPASS: "1", GOMAXPROCS: String(threads), GOFLAGS: `${t.exec.env?.GOFLAGS ?? process.env.GOFLAGS ?? ""} -p=1`.trim() });
+		const r = await runProc({ cmd: "/bin/sh", args: ["-c", t.exec.cmd], cwd: rc.path(t.exec.cwdRel), env, signal: job.ac.signal, nice, timeoutMs: parseDuration(this.config.execTimeout, 45 * 60000), maxBytes: 2 * 1024 * 1024 });
+		if (job.ac.signal.aborted) {
 			if (this.inflight.get(t.key) === t) this.inflight.delete(t.key);
+			if (t.waiters.length) {
+				t.speculative = false;
+				this.inflight.set(t.key, t);
+				this.pending.push(t);
+			}
 			return;
 		}
 		this.stats.execRuns++;
 		this.stats.ranMs += r.ms;
-		rc.invalidate(false);
-		const again = this.execPlan(job.root, rc.path(t.exec.cwdRel), t.exec.cmd);
+		rc.invalidate(true);
+		const again = this.execPlan(job.root, rc.path(t.exec.cwdRel), t.exec.cmd, t.exec.env);
 		const rec = { exec: true, key: t.key, code: r.code, output: `${r.stdout}${r.stderr ? (r.stdout ? "\n" : "") + r.stderr : ""}`, ms: r.ms, at: Date.now(), root: job.root.name, cmd: t.exec.cmd, killed: r.killed };
-		if (again.key === t.key && !r.killed) this.cachePut(t.key, rec);
-		this.resolveTask(t, { ...rec, source: "ran", stale: again.key !== t.key });
+		if (t.exec.cache && again.key === t.exec.inputKey && !r.killed && !/panic: test timed out after/.test(rec.output)) this.cachePut(t.key, rec);
+		this.resolveTask(t, { ...rec, source: "ran", stale: again.key !== t.exec.inputKey });
 	}
 
 	async exec(req, emit) {
 		this.lastUse = Date.now();
 		const r = this.root(req.root);
 		this.refreshRoot(r);
-		const p = this.execPlan(r, req.cwd ?? r.abs, req.cmd);
-		const hit = this.cacheGet(p.key);
+		const p = this.execPlan(r, req.cwd ?? r.abs, req.cmd, req.env);
+		// Measurements and artifact-producing commands must actually execute in each requesting checkout.
+		const cache = req.cache !== false && !/(?:^|[\s'"])-(?:test\.)?(?:c|o|bench\w*|fuzz\w*|\w*profile|trace|outputdir|count)(?:=|[\s'"]|$)|--(?:coverage|output)|(?:^|\s)(?:>>?|tee)\s/.test(req.cmd);
+		const hit = cache && this.cacheGet(p.key);
 		if (hit) {
 			this.stats.execHits++;
 			this.stats.savedMs += hit.ms ?? 0;
 			return { ...hit, source: hit.root === r.name ? "cache" : "shared" };
 		}
-		const w = this.want(r, { key: p.key, uid: `exec|${p.cwdRel}|${req.cmd}`, exec: { cmd: req.cmd, cwdRel: p.cwdRel, projectDir: p.projectDir, inputs: p.inputs } }, { priority: req.priority ?? PRIO.normal, speculative: false, request: req });
+		const w = this.want(r, { key: cache ? p.key : sha(`${p.key}:${randomBytes(16).toString("hex")}`), uid: `exec|${p.cwdRel}|${req.cmd}`, exec: { cmd: req.cmd, cwdRel: p.cwdRel, projectDir: p.projectDir, inputs: p.inputs, inputKey: p.key, cache, env: req.env } }, { priority: req.priority ?? PRIO.normal, speculative: false, request: req });
 		const tick = setInterval(() => emit?.({ type: "progress", text: this.waitingText(r) }), 5000);
 		this.pump();
 		try {
-			return await w.promise;
+			const result = await w.promise;
+			r.rc.invalidate(true);
+			return { ...result, stale: result.stale || this.execPlan(r, req.cwd ?? r.abs, req.cmd, req.env).key !== p.key };
 		} finally {
 			clearInterval(tick);
 		}
@@ -756,6 +751,10 @@ export class Broker {
 		const r = this.root(req.root);
 		this.refreshRoot(r);
 		if (req.reloadConfig) this.reload();
+		if (req.goSelect) {
+			const selected = this.resolveGo(r.rc, req.goSelect);
+			if (selected.unsupported) return { ...this.report(r, req, [], Date.now() - started), ok: false, go: selected };
+		}
 		const items = this.plan(r.rc, req);
 		this.stats.unitsAsked += items.length;
 		const priority = req.priority ?? PRIO.normal;
@@ -770,7 +769,7 @@ export class Broker {
 					rmSync(this.cachePath(it.key), { force: true });
 				} catch {}
 			}
-			const w = this.want(r, { ...it, extraArgs: req.extraArgs }, { priority, speculative: false, request: req });
+			const w = this.want(r, { ...it, extraArgs: req.extraArgs, extraEnv: req.env }, { priority, speculative: false, request: req });
 			if (w.cached) cached++;
 			else if (w.joined) joined++;
 			else queued++;
@@ -780,14 +779,23 @@ export class Broker {
 		this.pump();
 		let done = 0;
 		const tick = setInterval(() => emit?.({ type: "progress", done, total: items.length, text: this.waitingText(r) }), 4000);
-		const results = await Promise.all(waits.map((p) => p.then((x) => (done++, x))));
-		clearInterval(tick);
+		let results;
+		try {
+			results = await Promise.all(waits.map((p) => p.then((x) => (done++, x))));
+		} finally { clearInterval(tick); }
+		if (!req.cancelled && r.abs !== this.main && !(req.strict ?? this.config.strict)) await this.confirmBase(r, results, emit, req);
+		// Revalidate after every wait, including baseline classification.
+		if (!req.cancelled) {
+			r.rc.invalidate(true);
+			const current = new Map(this.plan(r.rc, req).map((it) => [it.uid, it.key]));
+			const added = [...current.keys()].some((uid) => !items.some((it) => it.uid === uid));
+			for (const row of results) if (added || current.get(row.it.uid) !== row.it.key) row.res = { ...row.res, stale: true };
+		}
 		if (r.abs === this.main) {
 			// results on the base branch (cached or fresh) define what is "pre-existing"
 			const base = this.baseIsClean(r.rc);
 			if (base) for (const { it, res } of results) if (res && res.status !== "error" && !res.stale && !res.exec) this.updateKnown({ ...res, uid: it.uid, project: it.project.dir, kind: it.kind }, base, it.unit.inputs);
 		}
-		if (r.abs !== this.main && !(req.strict ?? this.config.strict)) await this.confirmBase(r, results, emit, req);
 		const report = this.report(r, req, results, Date.now() - started);
 		if (req.goSelect) {
 			const gs = this.resolveGo(r.rc, req.goSelect);
@@ -868,6 +876,7 @@ export class Broker {
 	}
 
 	speculate(r, changedSet, priority = PRIO.speculative) {
+		if (!this.loadOk() || this.pending.some((t) => !t.speculative)) return 0;
 		let items;
 		try {
 			items = this.plan(r.rc, { changedSet });
@@ -947,7 +956,7 @@ export class Broker {
 		return {
 			pid: process.pid,
 			version: VERSION,
-			scheduler: "lanes-v1",
+			scheduler: "lanes-v2",
 			fastLane: !!this.laneReserved(),
 			lanes: Object.fromEntries(["fast", "heavy"].map((lane) => [lane, {
 				running: [...this.running].filter((j) => j.lane === lane).length,
@@ -1046,15 +1055,7 @@ export async function serve(main) {
 			let open = true;
 			res.on("close", () => {
 				open = false;
-				// requester went away: its queued work becomes speculative (can be preempted, still cached)
-				for (const t of [...b.pending, ...[...b.running].flatMap((j) => j.tasks)]) {
-					if (!t.waiters.some((w) => w.request === body)) continue;
-					t.waiters = t.waiters.filter((w) => w.request !== body);
-					if (!t.waiters.length) {
-						t.speculative = true;
-						t.priority = 0;
-					}
-				}
+				b.cancelRequest(body);
 			});
 			return (o) => open && res.write(`${JSON.stringify(o)}\n`);
 		};
