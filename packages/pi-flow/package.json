@@ -1,10 +1,15 @@
 {
-  "name": "pi-flow",
-  "version": "1.4.0",
+  "name": "@stacknyu/pi-flow",
+  "version": "1.5.0",
   "description": "Plan a large task, answer its questions, and let a queue of fresh Pi sessions build it \u2014 with verified checks, adaptive parallelism and session cleanup.",
   "type": "module",
   "license": "MIT",
-  "private": true,
+  "engines": { "node": ">=22.19.0" },
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org/" },
+  "repository": { "type": "git", "url": "git+https://github.com/stacknyu/stack-pi-plugins.git", "directory": "packages/pi-flow" },
+  "homepage": "https://github.com/stacknyu/stack-pi-plugins/tree/main/packages/pi-flow#readme",
+  "bugs": { "url": "https://github.com/stacknyu/stack-pi-plugins/issues" },
+  "files": ["extension.ts", "runner.mjs", "setup.mjs", "supervisor.mjs", "skills", "CHANGELOG.md"],
   "keywords": [
     "pi-package"
   ],

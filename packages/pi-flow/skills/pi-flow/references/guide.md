@@ -6,7 +6,7 @@ Large work (hours) fails in one long agent session: context fills up, the agent 
 
 ## One-time install
 
-- `pi install git:github.com/stacknyu/stack-pi-plugins` installs pi-flow and pi-check personally, so they work in every repo. Reload Pi / Pi Web.
+- `pi install npm:@stacknyu/pi-flow` installs pi-flow personally for every repo. Optionally install the independent check plugin with `pi install npm:@stacknyu/pi-check`. Reload Pi / Pi Web.
 - In a repo whose plugins you like: `/task save-profile`. That set becomes your profile.
 
 ## Per repo, once: `/task setup`

@@ -1,10 +1,15 @@
 {
-  "name": "pi-check",
-  "version": "1.0.0",
+  "name": "@stacknyu/pi-check",
+  "version": "1.1.0",
   "description": "One shared, cached, speculative check runner per repo for every Pi session and worktree: Go, TypeScript/JavaScript and Python tests, type checks and linters run once per file content, pre-run while you edit, and throttled so parallel agents stop fighting for the CPU.",
   "type": "module",
   "license": "MIT",
-  "private": true,
+  "engines": { "node": ">=22.19.0" },
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org/" },
+  "repository": { "type": "git", "url": "git+https://github.com/stacknyu/stack-pi-plugins.git", "directory": "packages/pi-check" },
+  "homepage": "https://github.com/stacknyu/stack-pi-plugins/tree/main/packages/pi-check#readme",
+  "bugs": { "url": "https://github.com/stacknyu/stack-pi-plugins/issues" },
+  "files": ["extension.ts", "cli.mjs", "lib", "skills", "CHANGELOG.md"],
   "keywords": ["pi-package"],
   "bin": { "pi-check": "./cli.mjs" },
   "pi": {

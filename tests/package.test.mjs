@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +10,46 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 const sdk = import.meta.resolve("@earendil-works/pi-coding-agent");
 const cli = fileURLToPath(new URL("./cli.js", sdk));
 const runner = new URL("../packages/pi-flow/runner.mjs", import.meta.url).href;
+
+for (const plugin of ["pi-flow", "pi-check"]) test(`${plugin} npm archive loads independently with its own version, skill and license`, { timeout: 60000 }, (t) => {
+	const home = realpathSync(mkdtempSync(join(tmpdir(), `stack-${plugin}-pack-`)));
+	t.after(() => rmSync(home, { recursive: true, force: true }));
+	const agentDir = join(home, "agent"), npmRoot = join(agentDir, "npm");
+	const env = { PATH: process.env.PATH, HOME: home, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_TELEMETRY: "0" };
+	execFileSync("pnpm", ["--dir", join(root, "packages", plugin), "pack", "--pack-destination", home], { cwd: root, env, encoding: "utf8", stdio: "pipe", timeout: 30000 });
+	const archive = join(home, readdirSync(home).find((f) => f.endsWith(".tgz")));
+	const files = execFileSync("tar", ["-tzf", archive], { encoding: "utf8" }).trim().split("\n");
+	for (const file of ["package.json", "README.md", "LICENSE", "CHANGELOG.md", "extension.ts", `skills/${plugin}/SKILL.md`]) assert.ok(files.includes(`package/${file}`), file);
+	assert.equal(files.some((f) => /(?:\.test\.mjs|node_modules|\.env|\.npmrc)/.test(f)), false);
+	execFileSync("npm", ["install", "--prefix", npmRoot, "--ignore-scripts", "--legacy-peer-deps", "--offline", "--no-audit", "--no-fund", archive], { cwd: home, env, encoding: "utf8", stdio: "pipe", timeout: 30000 });
+	assert.deepEqual(readdirSync(join(npmRoot, "node_modules/@stacknyu")), [plugin]);
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: [`npm:@stacknyu/${plugin}`] }));
+	const installed = join(npmRoot, "node_modules/@stacknyu", plugin);
+	const pkg = JSON.parse(readFileSync(join(installed, "package.json"), "utf8"));
+	assert.equal(pkg.private, undefined);
+	assert.equal(pkg.publishConfig.access, "public");
+	const result = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", `
+		import assert from "node:assert/strict";
+		import { DefaultResourceLoader, SettingsManager } from ${JSON.stringify(sdk)};
+		import { parseChangelog } from ${JSON.stringify(new URL("./utils/changelog.js", sdk).href)};
+		const loader = new DefaultResourceLoader({ cwd: process.cwd(), agentDir: process.env.PI_CODING_AGENT_DIR, settingsManager: SettingsManager.create(process.cwd(), process.env.PI_CODING_AGENT_DIR) });
+		await loader.reload();
+		const { extensions, errors } = loader.getExtensions();
+		const entries = parseChangelog(${JSON.stringify(join(installed, "CHANGELOG.md"))});
+		assert.equal([entries[0].major, entries[0].minor, entries[0].patch].join("."), ${JSON.stringify(pkg.version)});
+		console.log(JSON.stringify({ errors, commands: extensions.flatMap(e => [...e.commands.keys()]), tools: extensions.flatMap(e => [...e.tools.keys()]), skills: loader.getSkills().skills.map(s => s.name) }));
+	`], { cwd: home, env, encoding: "utf8", stdio: "pipe", timeout: 15000 }));
+	assert.deepEqual(result.errors, []);
+	assert.deepEqual(result.commands.sort(), plugin === "pi-flow" ? ["queue", "task"] : ["check"]);
+	assert.deepEqual(result.skills, [plugin]);
+	assert.equal(result.tools.includes("check"), plugin === "pi-check");
+	if (plugin === "pi-check") {
+		assert.equal(JSON.parse(readFileSync(join(agentDir, "pi-check/cli.json"), "utf8")).version, pkg.version);
+		assert.match(execFileSync(process.execPath, [join(installed, "cli.mjs"), "--help"], { env, encoding: "utf8" }), /pi-check run/);
+	} else {
+		for (const file of ["runner.mjs", "supervisor.mjs", "setup.mjs"]) assert.ok(files.includes(`package/${file}`));
+	}
+});
 
 test("Pi detects unpinned Git updates without installing them and parses this release's notes", { timeout: 30000 }, (t) => {
 	const home = realpathSync(mkdtempSync(join(tmpdir(), "stack-pi-updates-")));

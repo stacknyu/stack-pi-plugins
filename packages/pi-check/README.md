@@ -12,10 +12,10 @@ One check runner per repo, shared by every Pi session and every worktree. It han
 ## Install
 
 ```bash
-pi install git:github.com/stacknyu/stack-pi-plugins   # then reload Pi / Pi Web
+pi install npm:@stacknyu/pi-check   # then reload Pi / Pi Web
 ```
 
-This installs pi-check and pi-flow. See the [collection README](../../README.md) for local development, pinned releases and selecting plugins. The first check starts the broker. It runs in the background and stops after 3 idle hours.
+This installs only pi-check; pi-flow is not required. Update only this plugin with `pi update npm:@stacknyu/pi-check`, or remove it with `pi remove npm:@stacknyu/pi-check`. See the [repository README](https://github.com/stacknyu/stack-pi-plugins#readme) for publication status, migration, local development and release procedures. The first check starts the broker. It runs in the background and stops after 3 idle hours.
 
 ## Use
 

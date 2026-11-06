@@ -21,10 +21,10 @@ Full documentation ships with the package as the **pi-flow skill** (`skills/pi-f
 ## Install
 
 ```sh
-pi install git:github.com/stacknyu/stack-pi-plugins
+pi install npm:@stacknyu/pi-flow
 ```
 
-Reload Pi. This installs pi-flow and pi-check together. See the [collection README](../../README.md) for local development, pinned releases and selecting plugins.
+Reload Pi. This installs only pi-flow. pi-check is optional: install it separately with `pi install npm:@stacknyu/pi-check` if wanted. Update only this plugin with `pi update npm:@stacknyu/pi-flow`, or remove it with `pi remove npm:@stacknyu/pi-flow`. See the [repository README](https://github.com/stacknyu/stack-pi-plugins#readme) for publication status, migration, local development and release procedures.
 
 ## The workflow
 
@@ -119,7 +119,7 @@ It steers a running queue through an inbox the runner reads between items, so no
 
 ## With pi-check (optional, separate plugin)
 
-When [pi-check](../pi-check) is installed, the queue uses it automatically (nothing to configure):
+When [pi-check](https://github.com/stacknyu/stack-pi-plugins/tree/main/packages/pi-check) is installed, the queue uses it automatically (nothing to configure):
 
 - Every check command goes through pi-check's shared broker. `go test` / `go vet` run per package and are cached by file content. Other commands run once per identical set of files, and every worktree shares the results. Heavy runs are throttled, so parallel items stop fighting for the CPU.
 - Go test failures that also fail on the base branch are "pre-existing": they no longer block items or the baseline.

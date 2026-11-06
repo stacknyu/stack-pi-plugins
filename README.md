@@ -1,58 +1,67 @@
 # Stack Pi Plugins
 
-Stacknyu's collection of plugins for the [Pi coding agent](https://github.com/earendil-works/pi).
-One repository, one install, separate plugin folders.
+Independent plugins for the [Pi coding agent](https://github.com/earendil-works/pi), maintained in one repository. Each has its own npm package, version, changelog and update lifecycle.
 
-| Plugin | What it does | Commands |
+| Package | What it does | Commands |
 | --- | --- | --- |
-| [pi-flow](packages/pi-flow/README.md) | Plans large tasks and runs a queue of fresh agent sessions with checks and commits | `/task`, `/queue` |
-| [pi-check](packages/pi-check/README.md) | Shares and caches tests, type checks and lint across sessions and worktrees | `/check`, agent `check` tool |
+| [@stacknyu/pi-flow](packages/pi-flow/README.md) | Plans large tasks and runs checked, committed work in fresh agent sessions | `/task`, `/queue` |
+| [@stacknyu/pi-check](packages/pi-check/README.md) | Shares and caches tests, type checks and lint across sessions and worktrees | `/check`, agent `check` tool |
 
-## Install
+## Install independently
+
+**First npm publication is pending registry access. The npm commands below become available after publication.**
 
 Requires Pi, Node.js **22.19+**, Git, and macOS or Linux. Tested against Pi 1.5.0. Pi Web is optional.
 
 ```sh
-pi install git:github.com/stacknyu/stack-pi-plugins
+pi install npm:@stacknyu/pi-flow    # only task planning and queues
+pi install npm:@stacknyu/pi-check   # only shared checks
 ```
 
-Restart Pi (or `/reload`). The plugins and their skills are available in every project. For a project-only installation, add `-l` from that project and commit its `.pi/settings.json`; teammates must trust the project before it loads. A personal install is simplest for pi-flow's worker worktrees.
+Run either command, or both. Neither package depends on the other. Restart Pi or `/reload` after installing. When both are loaded, pi-flow discovers pi-check automatically.
 
-For a pinned team release:
+For project-only installation, add `-l` from that project and commit its `.pi/settings.json`; teammates must trust the project before it loads. A personal install is simplest for pi-flow's worker worktrees. To pin a release, append its exact version, for example `npm:@stacknyu/pi-flow@1.5.0`.
+
+### Update and remove independently
 
 ```sh
-pi install git:github.com/stacknyu/stack-pi-plugins@v0.2.0
+pi update npm:@stacknyu/pi-flow
+pi update npm:@stacknyu/pi-check
+# or: pi update --extensions      # all installed packages
+
+pi remove npm:@stacknyu/pi-flow   # leaves pi-check installed
+pi remove npm:@stacknyu/pi-check  # leaves pi-flow installed
 ```
 
-### Update detection and upgrades
+Pi's interactive terminal checks unpinned npm packages for newer versions at startup and notifies you; it does **not** automatically install updates. Exact versions, local paths and offline mode disable these checks. Each package's versioned `CHANGELOG.md` provides its own **Extension Updates** notes on a fresh launch after an upgrade; first installs only record the version. Pi Web/SDK hosts control their own notification UI.
 
-Both plugins are one native Pi package. With the unpinned install above, Pi's interactive terminal checks for remote Git changes at startup and notifies you; it does **not** automatically install updates. Offline mode disables the check. Explicit refs (including `@main`, tags and commits) and local-path installs are excluded from automatic notifications. Pi Web/SDK hosts control their own notification UI; terminal startup notices are not automatically inherited.
+Bare `pi update` updates Pi itself, not its packages. Before upgrading/removing either plugin, let active queues/checks finish. Restart Pi after updating; restart the idle pi-check broker too when its code changed. `/reload` does not replace a running broker or queue process, and `/check reload` reloads configuration rather than code.
 
-After active queues/checks finish, update explicitly:
+See Pi's [package documentation](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/packages.md) and [update commands](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/cli.md#update-pi-or-packages). If pi-flow must not use a previously discovered pi-check installation, set `"checkBroker": false` in `.pi-queue/config.json`.
+
+### Migrate from the Git bundle or local copies
+
+The original `git:github.com/stacknyu/stack-pi-plugins` installation remains compatible, but loads both plugins as one package. Do not enable it alongside the standalone npm packages: different package identities can register duplicate tools/commands.
+
+After queues/checks finish, remove the old declaration, then install only the npm packages you want:
 
 ```sh
-pi update git:github.com/stacknyu/stack-pi-plugins  # this collection
-# or: pi update --extensions                     # all installed packages
+pi remove git:github.com/stacknyu/stack-pi-plugins
+pi install npm:@stacknyu/pi-flow   # and/or pi-check
 ```
 
-Bare `pi update` updates Pi itself, not its packages. Restart Pi after updating; restart the idle pi-check broker too when its code changed. `/reload` alone does not replace a running broker or queue process.
-
-Git notifications compare commits, not `package.json.version`. The root version and matching `CHANGELOG.md` entries let Pi show **Extension Updates** on a fresh launch after an upgrade; first installs only record the version. Pinned tags stay on their tag; install a newer tag explicitly to upgrade. Explicit branch refs can move when manually updated despite skipping notifications. See Pi's [package documentation](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/packages.md) and [update commands](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/cli.md#update-pi-or-packages).
-
-Use `pi config` to select extensions and skills. Disabling pi-check does not erase its discovery registry; set `"checkBroker": false` in a project's `.pi-queue/config.json` if pi-flow must not use it.
-
-**Already using local copies?** Remove their package declarations before enabling this bundle, or commands/tools may load twice. Wait for active queues and checks to finish before switching copies. `/check reload` reloads configuration, not running broker code. This repository does not migrate existing installations automatically.
+Use `pi list` to find old local-path declarations and remove those too. Match their original personal/project scope (`-l` for project-local removal). No existing installation is migrated automatically.
 
 ## Start using it
 
 In your application's Git repository:
 
-- `/check run all` runs detected checks. Your project still needs its own language tools and dependencies.
-- `/task setup` detects the stack and verifies checks. **It can install profile plugins, edit `AGENTS.md`/Pi settings and commit setup changes.** Review the [pi-flow guide](packages/pi-flow/skills/pi-flow/references/guide.md) first.
+- pi-check: `/check run all` runs detected checks; your project still needs its language tools and dependencies.
+- pi-flow: `/task setup` detects the stack and verifies checks. **It can install profile plugins, edit `AGENTS.md`/Pi settings and commit setup changes.** Review the [guide](packages/pi-flow/skills/pi-flow/references/guide.md) first.
 - `/task <request>` plans a task and asks its questions before handing it to the queue.
-- `/skill:pi-flow` and `/skill:pi-check` load the detailed guides.
+- `/skill:pi-flow` and `/skill:pi-check` load the installed plugins' guides.
 
-Extensions run with your user permissions. pi-flow executes commands, creates worktrees and commits work; cleanup can remove task sessions and failed branches. pi-check runs project check commands and keeps local cache/state. Review the source and use trusted repositories. No credentials are distributed with this package.
+Extensions run with your user permissions. pi-flow executes commands, creates worktrees and commits work; cleanup can remove task sessions and failed branches. pi-check runs project check commands and keeps local cache/state. Review the source and use trusted repositories. No credentials are distributed with these packages.
 
 ## Develop locally
 
@@ -63,35 +72,34 @@ pnpm install --frozen-lockfile
 pnpm test
 ```
 
-Use pnpm 12.14.0 (the version in `package.json`). Tests use temporary repositories and fake workers; they do not call models. Run them locally before pushing; this repository has no GitHub Actions workflows.
+Use pnpm 12.14.0 (the root `package.json` version). Tests use temporary repositories/profiles and fake workers, not model calls. They pack and independently load the actual npm archives, checking included runtime files and absence of the sibling plugin. There are no GitHub Actions workflows.
 
-To use your checkout, remove the Git installation first, then:
-
-```sh
-pi install /absolute/path/to/stack-pi-plugins
-```
-
-Local installs read your checkout directly. Edit the plugin and restart Pi or `/reload`. For pi-check broker changes, let active checks finish and stop the idle broker before loading new code. The standalone CLI is `node packages/pi-check/cli.mjs`; a Git package install does not promise a global `pi-check` executable.
-
-### Add a plugin
-
-1. Add `packages/<plugin>/` with `package.json`, an extension entrypoint and README; include `skills/` when needed.
-2. List its entrypoint and skill directory explicitly in the root `package.json` under `pi`. Do not glob all source files as extensions.
-3. Declare host-provided Pi packages as peers, not runtime dependencies. Add actual runtime dependencies at the appropriate manifests and verify a production-only Git install.
-4. Add `*.test.mjs` tests, run the suite, and document the plugin above.
-
-Keep plugins independent. Preserve each plugin's internal relative paths; do not commit caches, credentials, local profiles or task sessions.
-
-### Release
-
-For each release, bump the root version and move its notes from `Unreleased` to a matching numeric heading (for example `## 0.3.0`) in `CHANGELOG.md`. Update the lockfile when dependencies change, and run `pnpm test` locally. Review and merge the changes, then create an immutable tag on the tested commit:
+Remove the corresponding managed installation before using a local checkout:
 
 ```sh
-git tag -a v0.3.0 -m 'v0.3.0'
-git push origin main v0.3.0
+pi install /absolute/path/to/stack-pi-plugins/packages/pi-flow
+pi install /absolute/path/to/stack-pi-plugins/packages/pi-check
 ```
 
-The root version/tag is Pi's release and changelog identity for the whole collection. Child manifests describe internal packages, not independently published Pi releases. Never move an existing release tag. `private: true` prevents accidental npm publication; it does **not** make this GitHub repository private or prevent Pi Git installation. No npm release service is needed.
+Local installs read that directory directly; they do not get registry update notifications. Restart Pi or `/reload` after edits, and let active checks finish before restarting a changed broker. The standalone check CLI is `node packages/pi-check/cli.mjs`; a Pi-managed package does not promise a globally available `pi-check` executable.
+
+## Release one plugin
+
+1. Bump only that plugin's `packages/<plugin>/package.json` version and add a matching numeric heading to its `CHANGELOG.md`. Keep runtime files in its `files` allowlist; host-provided Pi dependencies remain peers. Never depend on sibling source paths.
+2. Update the lockfile only when dependencies change. Run `pnpm test` locally through your check broker, review the diff, then commit it.
+3. Log into npm with an account authorized for `@stacknyu`. Publish only the selected workspace from a clean checkout; pnpm carries the root MIT license into its archive. Complete npm's browser/2FA approval if requested.
+4. Verify the registry version and package contents, then tag the published version and push. Never move a published tag or overwrite an npm version.
+
+Example for the initial pi-flow release (pi-check uses its own name/version/tag):
+
+```sh
+pnpm --filter @stacknyu/pi-flow publish --access public
+npm view @stacknyu/pi-flow version
+git tag -a pi-flow/v1.5.0 -m '@stacknyu/pi-flow 1.5.0'
+git push origin main pi-flow/v1.5.0
+```
+
+The root package stays private to prevent accidental npm publication of the bundle. Existing root `v0.x` tags identify historical Git collection releases; standalone releases use `pi-flow/v…` and `pi-check/v…`. Publishing is local and needs no CI service.
 
 ## License
 

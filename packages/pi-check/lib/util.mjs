@@ -6,7 +6,7 @@ import { cpus, homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export const STATE_DIR = ".pi-check";
-export const VERSION = "1.0.0";
+export const VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 export const HOME_DIR = join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "pi-check");
 export const SHIM_DIR = join(HOME_DIR, "shims");
 
