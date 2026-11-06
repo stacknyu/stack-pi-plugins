@@ -21,16 +21,25 @@ Restart Pi (or `/reload`). The plugins and their skills are available in every p
 For a pinned team release:
 
 ```sh
-pi install git:github.com/stacknyu/stack-pi-plugins@v0.1.0
+pi install git:github.com/stacknyu/stack-pi-plugins@v0.2.0
 ```
 
-Unpinned installs follow the default branch when updated:
+### Update detection and upgrades
+
+Both plugins are one native Pi package. With the unpinned install above, Pi's interactive terminal checks for remote Git changes at startup and notifies you; it does **not** automatically install updates. Offline mode disables the check. Explicit refs (including `@main`, tags and commits) and local-path installs are excluded from automatic notifications. Pi Web/SDK hosts control their own notification UI; terminal startup notices are not automatically inherited.
+
+After active queues/checks finish, update explicitly:
 
 ```sh
-pi update git:github.com/stacknyu/stack-pi-plugins
+pi update git:github.com/stacknyu/stack-pi-plugins  # this collection
+# or: pi update --extensions                     # all installed packages
 ```
 
-Pinned installations stay on their tag; install a newer tag explicitly to upgrade. Use `pi config` to select extensions and skills. Disabling pi-check does not erase its discovery registry; set `"checkBroker": false` in a project's `.pi-queue/config.json` if pi-flow must not use it.
+Bare `pi update` updates Pi itself, not its packages. Restart Pi after updating; restart the idle pi-check broker too when its code changed. `/reload` alone does not replace a running broker or queue process.
+
+Git notifications compare commits, not `package.json.version`. The root version and matching `CHANGELOG.md` entries let Pi show **Extension Updates** on a fresh launch after an upgrade; first installs only record the version. Pinned tags stay on their tag; install a newer tag explicitly to upgrade. Explicit branch refs can move when manually updated despite skipping notifications. See Pi's [package documentation](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/packages.md) and [update commands](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/cli.md#update-pi-or-packages).
+
+Use `pi config` to select extensions and skills. Disabling pi-check does not erase its discovery registry; set `"checkBroker": false` in a project's `.pi-queue/config.json` if pi-flow must not use it.
 
 **Already using local copies?** Remove their package declarations before enabling this bundle, or commands/tools may load twice. Wait for active queues and checks to finish before switching copies. `/check reload` reloads configuration, not running broker code. This repository does not migrate existing installations automatically.
 
@@ -75,14 +84,14 @@ Keep plugins independent. Preserve each plugin's internal relative paths; do not
 
 ### Release
 
-Update the root version and `CHANGELOG.md`, refresh the lockfile with `pnpm install`, and run `pnpm test` locally. Review and merge the changes, then tag the tested commit:
+For each release, bump the root version and move its notes from `Unreleased` to a matching numeric heading (for example `## 0.3.0`) in `CHANGELOG.md`. Update the lockfile when dependencies change, and run `pnpm test` locally. Review and merge the changes, then create an immutable tag on the tested commit:
 
 ```sh
-git tag -a v0.2.0 -m 'v0.2.0'
-git push origin main --follow-tags
+git tag -a v0.3.0 -m 'v0.3.0'
+git push origin main v0.3.0
 ```
 
-The root version/tag identifies the collection. Child package versions identify the bundled plugins. `private: true` prevents accidental npm publication; it does **not** make this GitHub repository private or prevent Pi Git installation. No npm release service is needed.
+The root version/tag is Pi's release and changelog identity for the whole collection. Child manifests describe internal packages, not independently published Pi releases. Never move an existing release tag. `private: true` prevents accidental npm publication; it does **not** make this GitHub repository private or prevent Pi Git installation. No npm release service is needed.
 
 ## License
 

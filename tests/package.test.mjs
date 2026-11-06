@@ -11,6 +11,53 @@ const sdk = import.meta.resolve("@earendil-works/pi-coding-agent");
 const cli = fileURLToPath(new URL("./cli.js", sdk));
 const runner = new URL("../packages/pi-flow/runner.mjs", import.meta.url).href;
 
+test("Pi detects unpinned Git updates without installing them and parses this release's notes", { timeout: 30000 }, (t) => {
+	const home = realpathSync(mkdtempSync(join(tmpdir(), "stack-pi-updates-")));
+	t.after(() => rmSync(home, { recursive: true, force: true }));
+	const remote = join(home, "remote"), agentDir = join(home, "agent");
+	const installed = join(agentDir, "git/github.com/stacknyu/stack-pi-plugins");
+	const source = "git:github.com/stacknyu/stack-pi-plugins";
+	const env = { PATH: process.env.PATH, HOME: home, PI_CODING_AGENT_DIR: agentDir, PI_TELEMETRY: "0", GIT_CONFIG_NOSYSTEM: "1" };
+	mkdirSync(remote);
+	const git = (cwd, ...args) => execFileSync("git", args, { cwd, env, encoding: "utf8", stdio: "pipe" }).trim();
+	git(remote, "init", "-b", "main");
+	git(remote, "config", "user.name", "Plugin Test");
+	git(remote, "config", "user.email", "test@example.invalid");
+	writeFileSync(join(remote, "README.md"), "initial\n");
+	git(remote, "add", "."); git(remote, "commit", "-m", "initial");
+	git(home, "clone", remote, installed);
+	const original = git(installed, "rev-parse", "HEAD");
+	const probe = (declared = source, action = "check") => JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", `
+		import { DefaultPackageManager, SettingsManager } from ${JSON.stringify(sdk)};
+		const source = process.argv[1];
+		const pm = new DefaultPackageManager({ cwd: process.cwd(), agentDir: process.env.PI_CODING_AGENT_DIR, settingsManager: SettingsManager.inMemory({ packages: [source] }) });
+		if (process.argv[2] === "update") await pm.update(source);
+		if (process.argv[2] === "offline") process.env.PI_OFFLINE = "1";
+		console.log(JSON.stringify((await pm.checkForAvailableUpdates()).map(x => x.source)));
+	`, declared, action], { cwd: home, env, encoding: "utf8", stdio: "pipe", timeout: 15000 }).trim().split("\n").at(-1));
+	assert.deepEqual(probe(), []);
+	writeFileSync(join(remote, "README.md"), "new commit without a version change\n");
+	git(remote, "add", "."); git(remote, "commit", "-m", "update");
+	assert.deepEqual(probe(), [source]);
+	assert.equal(git(installed, "rev-parse", "HEAD"), original, "checking must not install the update");
+	for (const declared of [`${source}@main`, `${source}@v0.1.0`, installed]) assert.deepEqual(probe(declared), []);
+	assert.deepEqual(probe(source, "offline"), []);
+	assert.deepEqual(probe(source, "update"), []);
+	assert.equal(git(installed, "rev-parse", "HEAD"), git(remote, "rev-parse", "HEAD"));
+	const notes = execFileSync(process.execPath, ["--input-type=module", "-e", `
+		import assert from "node:assert/strict";
+		import { readFileSync } from "node:fs";
+		import { parseChangelog, getNewEntries } from ${JSON.stringify(new URL("./utils/changelog.js", sdk).href)};
+		const { version } = JSON.parse(readFileSync(${JSON.stringify(join(root, "package.json"))}, "utf8"));
+		const entries = parseChangelog(${JSON.stringify(join(root, "CHANGELOG.md"))});
+		assert.equal([entries[0].major, entries[0].minor, entries[0].patch].join("."), version);
+		assert.equal(getNewEntries(entries, version).length, 0);
+		console.log(getNewEntries(entries, "0.1.0").map(e => e.content).join("\\n"));
+	`], { cwd: home, env, encoding: "utf8", timeout: 15000 });
+	assert.match(notes, /pi-flow:/);
+	assert.match(notes, /pi-check:/);
+});
+
 test("a clean Pi profile installs the bundle and loads both plugins and skills once", { timeout: 60000 }, async (t) => {
 	const home = mkdtempSync(join(tmpdir(), "stack-pi-install-"));
 	t.after(() => rmSync(home, { recursive: true, force: true }));
