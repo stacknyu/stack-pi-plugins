@@ -152,17 +152,52 @@ test("manual worker stop preserves work without counting a real failure", { time
 });
 
 test("Web manager is chat-only and session identity is persisted before prompting", { timeout: 15000 }, async (t) => {
-	let created, recorded = false;
+	let created, recorded = false, prompted = false;
 	const web = {
 		create: async (body) => { created = body; return { sessionId: "web-manager" }; },
 		send: async (_id, body) => {
-			if (body.type === "prompt") assert.ok(recorded);
-			return { data: { messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: 'CONTROL: {"action":"wait","reason":"healthy"}' }] }] } };
+			if (body.type === "prompt") { assert.ok(recorded); prompted = true; }
+			return { data: null };
 		},
+		history: async () => ({ context: { entryIds: prompted ? ["answer"] : [], messages: prompted ? [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: 'CONTROL: {"action":"wait","reason":"healthy"}' }] }] : [] } }),
 		running: async () => ({ runningSessionIds: [] }),
 	};
 	const result = await webTurn({ c: DEFAULTS, web, manager: true, stopRequested: () => false, onWorker: () => { recorded = true; } }, fixture(t).repo, {}, "manager", "review", 1);
 	assert.deepEqual(created.toolNames, []);
 	assert.equal(created.type, "ensure_session");
 	assert.equal(result.status, "ok");
+});
+
+test("planning cleanup honors Web refusal/errors and remains retryable; CLI cleanup stays local", async (t) => {
+	const { repo } = fixture(t), id = "planning", file = join(repo, "planning.jsonl");
+	const taskFile = join(repo, ".tasks/sample/task.json"), statusFile = join(repo, ".pi-flow/status.json");
+	saveJson(taskFile, { ...loadJson(taskFile, {}), slug: "sample", planningSessions: [id] });
+	mkdirSync(join(repo, ".pi-flow"));
+	saveJson(statusFile, { sample: { planningFiles: { [id]: file } } });
+	writeFileSync(file, "preserve this session\n");
+	let response = "running", attempts = 0;
+	t.mock.method(globalThis, "fetch", async (url) => {
+		if (response === "offline") throw new Error("offline");
+		const path = new URL(url).pathname;
+		if (path === "/api/agent/running") return Response.json({ runningSessionIds: [] });
+		assert.equal(path, "/api/sessions/delete");
+		attempts++;
+		if (response === "error") return Response.json({ error: "unavailable" }, { status: 500 });
+		if (response === "deleted") { rmSync(file); return Response.json({ deleted: [id] }); }
+		return Response.json({ running: [id], deleted: [] });
+	});
+	for (response of ["running", "error"]) {
+		assert.match(await cleanup(repo, false, "current"), /deletion was not confirmed/);
+		assert.equal(readFileSync(file, "utf8"), "preserve this session\n");
+		assert.equal(loadJson(statusFile, {}).sample.cleanedAt, undefined);
+	}
+	response = "deleted";
+	await cleanup(repo, false, "current");
+	assert.equal(attempts, 3);
+	assert.ok(loadJson(statusFile, {}).sample.cleanedAt);
+	response = "offline";
+	saveJson(statusFile, { sample: { planningFiles: { [id]: file } } });
+	writeFileSync(file, "CLI session\n");
+	await cleanup(repo, false, "current");
+	assert.equal(existsSync(file), false);
 });

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULTS, parseQueue, itemConfig, piTurn, webTurn, applyControl, checksText, checkLine, dependencyGraph, orderQueue, areasOverlap } from "./runner.mjs";
+import { DEFAULTS, parseQueue, itemConfig, piTurn, webTurn, applyControl, checksText, checkLine, dependencyGraph, orderQueue, areasOverlap, webClient, deleteSessions } from "./runner.mjs";
 
 const item = (tags = "") => parseQueue(`- [ ] A01 — Edit one file. Done when: tested. [areas: src/a] ${tags}`)[0];
 const model = { provider: "example", id: "small", reasoning: false, cost: { input: 1, output: 2 } };
@@ -87,11 +87,12 @@ test("CLI worker receives resolved model and thinking flags", async (t) => {
 });
 
 test("Pi Web worker receives the same resolved pair", async (t) => {
-	let created;
+	let created, prompted = false;
 	const c = itemConfig(DEFAULTS, item("[model: example/small] [thinking: off]"));
 	const web = {
 		create: async (body) => { created = body; return { sessionId: "fake" }; },
-		send: async () => ({ data: { messages: [{ role: "assistant", content: [{ type: "text", text: "DONE" }], stopReason: "stop" }] } }),
+		send: async (_id, body) => { if (body.type === "prompt") prompted = true; return { data: null }; },
+		history: async () => ({ context: { entryIds: prompted ? ["answer"] : [], messages: prompted ? [{ role: "assistant", content: [{ type: "text", text: "DONE" }], stopReason: "stop" }] : [] } }),
 		running: async () => ({ runningSessionIds: [] }),
 	};
 	const result = await webTurn({ c, web, stopRequested: () => false }, fixture(t), {}, "test", "hello", 1);
@@ -100,6 +101,106 @@ test("Pi Web worker receives the same resolved pair", async (t) => {
 	assert.equal(created.provider, "example");
 	assert.equal(created.modelId, "small");
 	assert.equal(created.thinkingLevel, "off");
+});
+
+test("Pi Web HTTP contract reads fresh results and waits for subagents, including after abort", async (t) => {
+	const schedule = globalThis.setTimeout;
+	t.mock.method(globalThis, "setTimeout", (fn) => schedule(fn, 0));
+	for (const scenario of ["stop", "error", "toolUse", "stale", "compacted", "descendants", "grandchildren", "abort-descendants", "abort-grandchildren"]) {
+		let prompted = false, polls = 0, aborted = false, pages = 0, catalogReads = 0;
+		t.mock.method(globalThis, "fetch", async (url, options) => {
+			const path = new URL(url).pathname;
+			assert.match(options.headers.authorization, /^Basic /);
+			if (path === "/api/agent/new") return Response.json({ success: true, sessionId: "worker/1" });
+			if (path === "/api/agent/worker%2F1") {
+				const body = JSON.parse(options.body);
+				assert.ok(["prompt", "abort", "set_session_name", "get_state"].includes(body.type), body.type);
+				if (body.type === "prompt") prompted = true;
+				if (body.type === "abort") aborted = true;
+				return Response.json({ success: true, data: {} });
+			}
+			if (path === "/api/agent/running") {
+				polls++;
+				const busy = scenario.startsWith("abort-") || (["descendants", "grandchildren"].includes(scenario) && polls <= 2);
+				return Response.json({ runningSessionIds: [], subagentsActiveSessionIds: busy ? [scenario.includes("grandchildren") ? "child" : "worker/1"] : [] });
+			}
+			if (path === "/api/sessions") {
+				catalogReads++;
+				return Response.json({ sessions: [{ id: "grandchild", relation: { kind: "subagent", parentSessionId: "child" } }, { id: "child", relation: { kind: "subagent", parentSessionId: "worker/1" } }] });
+			}
+			if (path.endsWith("/context")) {
+				assert.equal(scenario, "compacted");
+				assert.equal(new URL(url).searchParams.get("before"), "compaction /1");
+				pages++;
+			} else {
+				assert.equal(path, "/api/sessions/worker%2F1");
+				if (scenario === "compacted") return Response.json({ context: { entryIds: ["compaction /1"], messages: [{ role: "custom", customType: "compaction" }], oldestEntryId: "compaction /1", hasMore: true } });
+			}
+			const fresh = prompted && scenario !== "stale";
+			return Response.json({ context: { entryIds: [fresh ? "new" : "old"], messages: [{ role: "assistant", content: [{ type: "text", text: "DONE" }], stopReason: ["error", "toolUse"].includes(scenario) ? scenario : "stop", ...(scenario === "error" ? { errorMessage: "provider failed" } : {}) }] } });
+		});
+		const c = { ...DEFAULTS, piWebUrl: "http://example.invalid", piWebPassword: "test-only" };
+		const result = await webTurn({ c, web: webClient(c), stopRequested: () => false }, fixture(t), {}, "test", "hello", scenario.startsWith("abort-") ? -1 : 1);
+		assert.equal(result.status, ["stop", "compacted", "descendants", "grandchildren"].includes(scenario) ? "ok" : "error", scenario);
+		if (scenario === "stale") assert.match(result.err, /no new assistant/);
+		if (scenario === "error") assert.equal(result.err, "provider failed");
+		if (scenario === "toolUse") assert.match(result.err, /toolUse/);
+		if (scenario === "compacted") assert.equal(pages, 2);
+		if (["descendants", "grandchildren"].includes(scenario)) assert.equal(polls, 4);
+		if (scenario === "grandchildren") assert.equal(catalogReads, 2);
+		if (scenario.startsWith("abort-")) { assert.equal(aborted, true); assert.equal(result.quiescent, false); }
+	}
+});
+
+test("queue widgets belong to their own native/RPC extension instance", async (t) => {
+	const { default: extension } = await import("./extension.ts");
+	const timers = new Set();
+	t.mock.method(globalThis, "setInterval", (tick) => { const timer = { tick, unref() {} }; timers.add(timer); return timer; });
+	t.mock.method(globalThis, "clearInterval", (timer) => timers.delete(timer));
+	const instances = ["tui", "rpc", "json"].map((mode) => {
+		const commands = new Map(), events = new Map(), widgets = [];
+		extension({ registerTool() {}, registerCommand: (name, command) => commands.set(name, command), on: (name, handler) => events.set(name, handler) });
+		return { commands, events, widgets, ctx: { mode, hasUI: mode !== "json", cwd: fixture(t), ui: { notify() {}, setWidget: (_key, lines) => widgets.push(lines) } } };
+	});
+	for (const instance of instances) await instance.commands.get("queue").handler("watch", instance.ctx);
+	assert.equal(timers.size, 2);
+	await instances[0].events.get("session_shutdown")({}, instances[0].ctx);
+	assert.equal(timers.size, 1);
+	for (const timer of timers) timer.tick();
+	assert.equal(instances[1].widgets.length, 2);
+	assert.equal(instances[0].widgets.at(-1), undefined);
+	await instances[1].commands.get("queue").handler("watch off", instances[1].ctx);
+	assert.equal(timers.size, 0);
+});
+
+test("queue open switches native sessions and explains unsupported Web navigation", async (t) => {
+	const { default: extension } = await import("./extension.ts");
+	const cwd = fixture(t), sessions = join(cwd, ".pi-queue", "sessions"), commands = new Map();
+	mkdirSync(sessions, { recursive: true });
+	writeFileSync(join(sessions, "native.jsonl"), "fixture\n");
+	writeFileSync(join(cwd, ".pi-queue", "state.json"), JSON.stringify({ sessions: { native: { item: "A01", status: "done" } } }));
+	extension({ registerTool() {}, on() {}, registerCommand: (name, command) => commands.set(name, command) });
+	for (const mode of ["tui", "rpc"]) {
+		const notices = [];
+		await commands.get("queue").handler("open A01", { cwd, mode, hasUI: true,
+			switchSession: async (file) => { assert.equal(file, join(sessions, "native.jsonl")); return { cancelled: mode === "rpc" }; },
+			ui: { setWidget() {}, notify: (text) => notices.push(text) } });
+		assert.equal(notices.length, mode === "rpc" ? 1 : 0);
+		if (mode === "rpc") assert.match(notices[0], /pi --session/);
+	}
+});
+
+test("Web cleanup batches at 500 IDs and retains refused or failed sessions", async () => {
+	for (const mode of ["delete", "archive"]) {
+		const ids = Array.from({ length: 501 }, (_, i) => `session-${i}`), batches = [];
+		const state = { sessions: Object.fromEntries(ids.map((id) => [id, { web: true }])) };
+		const accept = async (batch) => { batches.push(batch); if (batches.length === 2) throw new Error("unavailable"); return { deleted: batch.slice(1), running: batch.slice(0, 1) }; };
+		const count = await deleteSessions({ state, web: { del: accept, ui: ({ ids }) => accept(ids) }, save() {}, log() {} }, ids, mode);
+		assert.deepEqual(batches.map((b) => b.length), [500, 1]);
+		assert.equal(count, mode === "archive" ? 500 : 499);
+		assert.equal(state.sessions[ids[0]].deleted, undefined);
+		assert.equal(state.sessions[ids[500]][mode === "archive" ? "archived" : "deleted"], undefined);
+	}
 });
 
 test("dependency validation rejects cycles and unknown ids, including wildcard cycles", () => {

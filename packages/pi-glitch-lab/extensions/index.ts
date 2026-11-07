@@ -34,11 +34,12 @@ const result = (text: string, ok: boolean, details: any = {}, images: any[] = []
 });
 
 export default function (pi: ExtensionAPI) {
-  async function authorize(p: any, ctx: any) {
+  async function authorize(p: any, signal: AbortSignal | undefined, ctx: any) {
+    signal?.throwIfAborted();
     if (p.allowWrites && !p.interact) throw new Error("allowWrites requires interact=true");
     if (p.interact && ctx.hasUI && !(await ctx.ui.confirm("Glitch Lab interaction approval", p.allowWrites
       ? "Allow writes and repeated browser interactions against the approved disposable test environment? No rollback is provided."
-      : "Allow browser interactions against the approved test environment? HTTP writes are blocked, but GET handlers and page scripts can still have side effects."))) throw new Error("Interaction approval declined");
+      : "Allow browser interactions against the approved test environment? HTTP writes are blocked, but GET handlers and page scripts can still have side effects.", { signal }))) throw new Error("Interaction approval declined");
   }
   async function run(script: string, args: string[], signal: AbortSignal | undefined, ctx: any) {
     signal?.throwIfAborted();
@@ -60,7 +61,7 @@ export default function (pi: ExtensionAPI) {
       attachImages: Type.Optional(Type.Integer({ minimum: 0, maximum: 4 })),
     }),
     async execute(_id, p, signal, _update, ctx) {
-      await authorize(p, ctx);
+      await authorize(p, signal, ctx);
       const out = output(p, "glitch"), args = [p.mode || "nav"];
       target(args, p); policy(args, p);
       for (const k of ["journey", "items", "repeat", "cpu", "paint", "viewport"]) flag(args, k, p[k as keyof typeof p]);
@@ -94,7 +95,7 @@ export default function (pi: ExtensionAPI) {
       observeMs: number("Observation window per action, default 1000ms", 5000),
     }),
     async execute(_id, p, signal, _update, ctx) {
-      await authorize(p, ctx);
+      await authorize(p, signal, ctx);
       const out = output(p, "scan"), args: string[] = [];
       target(args, p); policy(args, p); flag(args, "out", out); flag(args, "probe-clicks", p.probeClicks); flag(args, "viewport", p.viewport);
       for (const [k, v] of Object.entries({ "max-actions": p.maxActions, "max-states": p.maxStates, "max-pages": p.maxPages, "max-depth": p.maxDepth, seconds: p.seconds, "observe-ms": p.observeMs })) flag(args, k, v);
@@ -111,7 +112,7 @@ export default function (pi: ExtensionAPI) {
       baseline: optionalText("Create baseline in this new directory"), compare: optionalText("Existing baseline to compare against"),
     }),
     async execute(_id, p, signal, _update, ctx) {
-      await authorize(p, ctx);
+      await authorize(p, signal, ctx);
       const out = output(p, "journeys"), args: string[] = [];
       target(args, p); policy(args, p); flag(args, "journey", p.journey);
       flag(args, "baseline", p.baseline); flag(args, "compare", p.compare); flag(args, "out", out);
@@ -132,9 +133,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   async function doctor(install: boolean, signal: AbortSignal | undefined, ctx: any) {
+    signal?.throwIfAborted();
     if (install) {
       const r = await pi.exec(process.execPath, [path.join(path.dirname(require.resolve("playwright/package.json")), "cli.js"), "install", "chromium"], { cwd: PKG, signal, timeout: 180000 });
-      if (r.code) return result(r.stderr || r.stdout, false);
+      if (r.code !== 0 || r.killed || r.truncated) return result(r.stderr || r.stdout, false);
     }
     const r = await run("doctor.mjs", [], signal, ctx);
     return result(r.stdout + r.stderr, r.ok);

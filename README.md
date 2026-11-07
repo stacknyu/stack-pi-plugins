@@ -63,6 +63,16 @@ In your application's Git repository:
 
 Extensions run with your user permissions. pi-flow executes commands, creates worktrees and commits work; cleanup can remove task sessions and failed branches. pi-check runs project check commands and keeps local cache/state. Review the source and use trusted repositories. No credentials are distributed with these packages.
 
+## Native CLI and Pi Web compatibility
+
+All three plugins use Pi's standard extension API; Pi Web is not required. Web integration targets [pi-web 0.15.0](https://github.com/agegr/pi-web/tree/f130910abf662b506b2ef2f475fc21a2fe57badc) with Pi 1.5.0.
+
+- pi-flow keeps queue widgets session-local, reads Web results through session history, and waits for unsettled subagents before treating a worker as finished. Set `"runIn": "cli"` in `.pi-queue/config.json` to force native workers even while Web is running; `"auto"` still falls back to CLI when Web is unavailable.
+- pi-check uses asynchronous command execution in both hosts and does not poll invisible status widgets in print/JSON mode.
+- Glitch Lab approvals support cancellation in native and RPC/Web dialogs. Headless callers still supply explicit interaction/write authorization; browser requirements are unchanged.
+
+Regression coverage uses mocked Web HTTP responses and TUI/RPC contexts, real native package loading/RPC discovery, and a synthetic local browser target—not live model/provider acceptance. Web keeps its own navigation: if `/queue open` cannot switch a CLI session in place, it provides session-list/terminal instructions instead.
+
 ## Develop locally
 
 ```sh

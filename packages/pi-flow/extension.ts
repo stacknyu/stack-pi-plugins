@@ -191,30 +191,6 @@ function liveLines(cwd: string): string[] {
 	return [...lines, ...log];
 }
 
-const g = globalThis as { __flowWatch?: ReturnType<typeof setInterval> };
-
-function stopWatch(ctx?: any) {
-	if (g.__flowWatch) clearInterval(g.__flowWatch);
-	g.__flowWatch = undefined;
-	try {
-		ctx?.ui.setWidget("queue", undefined);
-	} catch {}
-}
-
-function startWatch(ctx: any) {
-	stopWatch();
-	const cwd = ctx.cwd;
-	const tick = () => {
-		try {
-			ctx.ui.setWidget("queue", liveLines(cwd));
-		} catch {
-			stopWatch();
-		}
-	};
-	tick();
-	g.__flowWatch = setInterval(tick, 4000);
-}
-
 /** Start the background runner. Returns an error text, or "" when it started (or already ran to the end). */
 async function startRunner(cwd: string, resume = false): Promise<string> {
 	await ensureDir(cwd);
@@ -433,7 +409,6 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 		const web = await piWeb(cwd);
 		if (web) await web.ui({ action: "set", ids: [sid], pinned: true }).catch(() => {});
 	}
-	if (ctx?.ui) startWatch(ctx);
 	return {
 		ok: true,
 		text: `Queued ${items.length} items for task ${slug} (up to ${parallel} in parallel, adaptive). Checks: ${checks.join(" · ")}.${warnings.length ? `\nWarnings: ${warnings.join(" ")}` : ""}\nThe live panel below shows progress; /task status for a summary.`,
@@ -472,6 +447,7 @@ async function cleanup(cwd: string, all: boolean, currentSession: string): Promi
 	for (const t of tasks) {
 		const ids = [...new Set([...(t.planningSessions ?? []), ...(fs[t.slug]?.planningSessions ?? [])])];
 		const files: Record<string, string> = fs[t.slug]?.planningFiles ?? {};
+		let pending = false;
 		for (const id of ids) {
 			if (!id) continue;
 			if (id === currentSession) {
@@ -481,12 +457,14 @@ async function cleanup(cwd: string, all: boolean, currentSession: string): Promi
 			}
 			let gone = false;
 			if (web) gone = await web.del([id]).then((r: any) => (r.deleted ?? []).includes(id) || (r.missing ?? []).includes(id), () => false);
-			if (!gone && files[id] && existsSync(files[id])) {
+			if (!web && files[id]) {
 				rmSync(files[id], { force: true });
 				gone = true;
 			}
 			if (gone) planned++;
+			else { pending = true; notes.push(`kept planning chat ${id}: deletion was not confirmed`); }
 		}
+		if (!pending) setFlowStatus(cwd, t.slug, { status: taskStatus(cwd, t), cleanedAt: new Date().toISOString() });
 	}
 	if (planned) notes.push(`deleted ${planned} planning chat(s)`);
 	if (keptCurrent) notes.push("kept this chat (you are in it); delete it from the sidebar or /resume list when you leave it");
@@ -507,7 +485,6 @@ async function cleanup(cwd: string, all: boolean, currentSession: string): Promi
 			notes.push(`removing ${wts.length} worktrees in the background (the next task reinstalls them)`);
 		}
 	}
-	for (const t of tasks) setFlowStatus(cwd, t.slug, { status: taskStatus(cwd, t), cleanedAt: new Date().toISOString() });
 	return notes.join("\n");
 }
 
@@ -603,7 +580,30 @@ export { cleanup, handoff, planPrompt, control, startRunner };
 // ---------- the extension ----------
 
 export default function (pi: ExtensionAPI) {
-	pi.on("session_shutdown", async () => stopWatch());
+	let watch: ReturnType<typeof setInterval> | undefined;
+	function stopWatch(ctx?: any) {
+		clearInterval(watch);
+		watch = undefined;
+		try {
+			ctx?.ui.setWidget("queue", undefined);
+		} catch {}
+	}
+	function startWatch(ctx: any) {
+		stopWatch();
+		if (!ctx.hasUI) return;
+		const cwd = ctx.cwd;
+		const tick = () => {
+			try {
+				ctx.ui.setWidget("queue", liveLines(cwd));
+			} catch {
+				stopWatch();
+			}
+		};
+		tick();
+		watch = setInterval(tick, 4000);
+		watch.unref?.();
+	}
+	pi.on("session_shutdown", async (_event, ctx) => stopWatch(ctx));
 
 	pi.registerTool({
 		name: "task_handoff",
@@ -616,6 +616,7 @@ export default function (pi: ExtensionAPI) {
 			const blocked = guard(ctx);
 			if (blocked) return blocked;
 			const r = await handoff(ctx.cwd, String(params.slug).trim(), ctx);
+			if (r.ok) startWatch(ctx);
 			return { content: [{ type: "text", text: r.text }], details: { ok: r.ok } };
 		},
 	} as any);
@@ -847,7 +848,8 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				stopWatch(ctx);
-				await ctx.switchSession(file);
+				const switched = await ctx.switchSession(file);
+				if (switched.cancelled) ctx.ui.notify(`queue: session switch cancelled or unsupported by this host. Open it from the session list, or run pi --session ${JSON.stringify(file)} in a terminal.`, "info");
 				return;
 			}
 			if (cmd === "problem") {

@@ -121,6 +121,84 @@ test("tool errors cannot reuse stale files and aborted calls do not execute", as
   assert.equal(called, 1);
 });
 
+for (const mode of ["tui", "rpc"]) for (const name of ["glitch_hunt", "ux_affordance_scan", "ux_journeys"]) {
+  test(`${name} approval in ${mode}: decline, abort and approve`, { timeout: 2000 }, async (t) => {
+    const home = fixture(t);
+    writeFileSync(path.join(home, "index.json"), JSON.stringify([{ dir: ".", ok: true }]));
+    writeFileSync(path.join(home, "summary.md"), "Approved run");
+    writeFileSync(path.join(home, "findings.json"), JSON.stringify({ findings: [] }));
+    for (const scenario of ["decline", "abort-before", "abort-waiting", "approve"]) {
+      await t.test(scenario, async () => {
+        const tools = new Map(), ac = new AbortController();
+        let prompts = 0, executions = 0;
+        extension({ registerTool: (tool) => tools.set(tool.name, tool), registerCommand() {}, exec: async (_command, args, options) => {
+          executions++;
+          assert.equal(options.signal, ac.signal);
+          assert.ok(args.includes("--interact"));
+          return { code: 0, stdout: "completed", stderr: "" };
+        } });
+        const ctx = { cwd: home, mode, hasUI: true, ui: { confirm: async (title, _message, options) => {
+          prompts++;
+          assert.equal(title, "Glitch Lab interaction approval");
+          assert.equal(options.signal, ac.signal);
+          if (scenario === "abort-waiting") return new Promise((resolve) => options.signal.addEventListener("abort", () => resolve(false), { once: true }));
+          return scenario === "approve";
+        } } };
+        if (scenario === "abort-before") ac.abort();
+        const pending = tools.get(name).execute("id", { interact: true, out: home }, ac.signal, undefined, ctx);
+        if (scenario === "abort-waiting") {
+          assert.equal(prompts, 1);
+          assert.equal(executions, 0);
+          ac.abort();
+        }
+        if (scenario === "approve") assert.equal((await pending).isError, false);
+        else await assert.rejects(pending, scenario === "abort-before" ? { name: "AbortError" } : /approval declined/);
+        assert.equal(prompts, scenario === "abort-before" ? 0 : 1);
+        assert.equal(executions, scenario === "approve" ? 1 : 0);
+      });
+    }
+  });
+}
+
+test("headless approval preserves explicit interaction and write flags", async () => {
+  const tools = new Map(); let executions = 0, lastArgs;
+  extension({ registerTool: (tool) => tools.set(tool.name, tool), registerCommand() {}, exec: async (_command, args) => {
+    executions++; lastArgs = args;
+    return { code: 1, stdout: "", stderr: "mock failure" };
+  } });
+  for (const mode of ["print", "json"]) for (const name of ["glitch_hunt", "ux_affordance_scan", "ux_journeys"]) {
+    const ctx = { cwd: root, mode, hasUI: false, ui: { confirm: () => assert.fail("headless must not prompt") } };
+    for (const p of [{}, { interact: true }, { interact: true, allowWrites: true }]) {
+      await tools.get(name).execute("id", p, undefined, undefined, ctx);
+      assert.equal(lastArgs.includes("--interact"), !!p.interact);
+      assert.equal(lastArgs.includes("--allow-writes"), !!p.allowWrites);
+    }
+    const before = executions;
+    await assert.rejects(tools.get(name).execute("id", { allowWrites: true }, undefined, undefined, ctx), /allowWrites requires interact=true/);
+    assert.equal(executions, before);
+  }
+});
+
+test("browser install doctor aborts before exec and rejects incomplete installs", async () => {
+  const tools = new Map(); let calls = 0, installResult;
+  const ac = new AbortController();
+  extension({ registerTool: (tool) => tools.set(tool.name, tool), registerCommand() {}, exec: async (_command, args, options) => {
+    calls++;
+    assert.equal(options.signal, ac.signal);
+    return args.includes("install") ? installResult : { code: 0, stdout: "doctor passed", stderr: "" };
+  } });
+  const doctor = () => tools.get("glitch_lab_doctor").execute("id", { install: true }, ac.signal, undefined, { cwd: root });
+  for (const status of [{ code: 1 }, { code: 0, killed: true }, { code: 0, truncated: true }, { code: 0 }]) {
+    calls = 0; installResult = { stdout: "install output", stderr: "", ...status };
+    const r = await doctor(), ok = status.code === 0 && !status.killed && !status.truncated;
+    assert.equal(r.isError, !ok);
+    assert.equal(calls, ok ? 2 : 1);
+  }
+  calls = 0; ac.abort();
+  await assert.rejects(doctor(), { name: "AbortError" });
+  assert.equal(calls, 0);
+});
+
 test("synthetic browser inventory, exploration, UAT, baseline and sensor evidence", { timeout: 180000 }, async (t) => {
   const home = fixture(t), target = await app(t);
   await t.test("observation inventories below-fold controls without clicks or writes", async () => {

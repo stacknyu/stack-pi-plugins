@@ -1,6 +1,6 @@
 {
   "name": "@stacknyu/pi-check",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "One shared, cached, speculative check runner per repo for every Pi session and worktree: Go, TypeScript/JavaScript and Python tests, type checks and linters run once per file content, pre-run while you edit, and throttled so parallel agents stop fighting for the CPU.",
   "type": "module",
   "license": "MIT",

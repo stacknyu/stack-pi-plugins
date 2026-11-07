@@ -45,7 +45,7 @@ export default function (pi: ExtensionAPI) {
 	let timer: any;
 	const watchStatus = (ctx: any) => {
 		clearInterval(timer);
-		if (!ctx?.hasUI && !ctx?.ui) return;
+		if (!ctx?.hasUI) return;
 		timer = setInterval(async () => {
 			try {
 				const r = roots(ctx.cwd);
@@ -199,9 +199,8 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (cmd === "init" || cmd === "log" || cmd === "projects") {
-					const { spawnSync } = await import("node:child_process");
-					const out = spawnSync(process.execPath, [CLI, cmd], { cwd, encoding: "utf8" });
-					ctx.ui.notify(`${out.stdout}${out.stderr}`.trim() || "(no output)", "info");
+					const out = await pi.exec(process.execPath, [CLI, cmd], { cwd });
+					ctx.ui.notify(`${out.stdout}${out.stderr}`.trim() || "(no output)", out.code !== 0 || out.killed || out.truncated ? "warning" : "info");
 					return;
 				}
 				ctx.ui.notify("Usage: /check [status] | run [all] | baseline | known [clear|remove <text>] | speculate [all] | cancel | reload | stop | restart | init | projects | log", "warning");

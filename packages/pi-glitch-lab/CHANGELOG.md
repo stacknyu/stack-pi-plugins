@@ -1,5 +1,11 @@
 # pi-glitch-lab changelog
 
+## 0.5.1
+
+- Cancel interaction approvals through the execution signal in native Pi and RPC/Pi Web dialogs; preserve explicit headless interaction/write authorization.
+- Reject pre-aborted, killed or truncated browser installation attempts instead of reporting incomplete installation as success.
+- Add native/RPC approval, headless authorization and browser-install cancellation regressions.
+
 ## 0.5.0
 
 - First independent `@stacknyu/pi-glitch-lab` npm release, with Pi-native manifest, host peers, release notes and MIT license.

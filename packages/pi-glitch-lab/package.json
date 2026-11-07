@@ -1,6 +1,6 @@
 {
   "name": "@stacknyu/pi-glitch-lab",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org/" },
   "repository": { "type": "git", "url": "git+https://github.com/stacknyu/stack-pi-plugins.git", "directory": "packages/pi-glitch-lab" },
   "homepage": "https://github.com/stacknyu/stack-pi-plugins/tree/main/packages/pi-glitch-lab#readme",

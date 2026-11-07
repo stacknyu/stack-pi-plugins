@@ -637,9 +637,32 @@ export function webClient(c) {
 	};
 	return {
 		available: () => call("GET", "/api/agent/running", undefined, 3000).then(() => true, () => false),
-		running: () => call("GET", "/api/agent/running", undefined, 15_000),
+		running: async (id) => {
+			const snap = await call("GET", "/api/agent/running", undefined, 15_000);
+			const active = [...(snap.runningSessionIds ?? []), ...(snap.subagentsActiveSessionIds ?? [])];
+			if (id && !active.includes(id) && active.length) {
+				const { sessions } = await call("GET", "/api/sessions?summary=1");
+				const family = new Set([id]);
+				for (let grew = true; grew;) {
+					grew = false;
+					for (const s of sessions) if (s.relation?.kind === "subagent" && family.has(s.relation.parentSessionId) && !family.has(s.id)) {
+						family.add(s.id); grew = true;
+					}
+				}
+				if (active.some((sid) => family.has(sid))) snap.subagentsActiveSessionIds = [...(snap.subagentsActiveSessionIds ?? []), id];
+			}
+			return snap;
+		},
 		create: (body) => call("POST", "/api/agent/new", body, 300_000),
 		send: (id, body) => call("POST", `/api/agent/${encodeURIComponent(id)}`, body, 120_000),
+		history: async (id) => {
+			let before = "";
+			while (true) {
+				const response = await call("GET", `/api/sessions/${encodeURIComponent(id)}${before ? "/context" : ""}?tree=summary&tail=1&deferMedia=1&deferThinking=1${before ? `&before=${encodeURIComponent(before)}` : ""}`);
+				if (response.context.messages.some((m) => m.role === "assistant") || !response.context.hasMore) return response;
+				before = response.context.oldestEntryId;
+			}
+		},
 		del: (ids) => call("POST", "/api/sessions/delete", { ids }, 60_000),
 		ui: (body) => call("POST", "/api/sessions/ui-state", body, 30_000),
 	};
@@ -704,6 +727,7 @@ async function webTurn(ctx, cwd, ref, name, prompt, minutes, onActivity = () => 
 	const deadline = Date.now() + minutes * 60_000;
 	const [provider, ...rest] = (c.model || "").split("/");
 	const modelId = rest.join("/");
+	let previousAssistantId;
 	try {
 		if (!ref.id) {
 			const r = await web.create({
@@ -717,6 +741,8 @@ async function webTurn(ctx, cwd, ref, name, prompt, minutes, onActivity = () => 
 			ctx.onWorker?.({ sessionId: ref.id, web: true });
 			await web.send(ref.id, { type: "set_session_name", name }).catch(() => {});
 		}
+		const { context } = await web.history(ref.id);
+		previousAssistantId = context.entryIds[context.messages.findLastIndex((m) => m.role === "assistant")];
 		await web.send(ref.id, { type: "prompt", message: prompt });
 	} catch (e) {
 		return { status: "error", reply: "", err: String(e?.message ?? e), code: -1, quiescent: false };
@@ -731,13 +757,13 @@ async function webTurn(ctx, cwd, ref, name, prompt, minutes, onActivity = () => 
 		await new Promise((r) => setTimeout(r, 3000));
 		let snap;
 		try {
-			snap = await web.running();
+			snap = await web.running(ref.id);
 		} catch {
 			if (!stopRequested() && Date.now() <= deadline) continue;
 			await web.send(ref.id, { type: "abort" }).catch(() => {});
 			return { status: "error", reply: "", err: "Pi Web unreachable; worker termination is unconfirmed", code: -1, quiescent: false };
 		}
-		const running = (snap.runningSessionIds ?? []).includes(ref.id);
+		const running = [...(snap.runningSessionIds ?? []), ...(snap.subagentsActiveSessionIds ?? [])].includes(ref.id);
 		const awaiting = (snap.awaitingInputSessionIds ?? []).includes(ref.id);
 		if (!running) {
 			if (++notRunning >= 2) break;
@@ -772,8 +798,8 @@ async function webTurn(ctx, cwd, ref, name, prompt, minutes, onActivity = () => 
 			let quiescent = false;
 			for (let i = 0; i < 20; i++) {
 				await new Promise((r) => setTimeout(r, 3000));
-				const s2 = await web.running().catch(() => null);
-				if (s2 && !(s2.runningSessionIds ?? []).includes(ref.id)) { quiescent = true; break; }
+				const s2 = await web.running(ref.id).catch(() => null);
+				if (s2 && ![...(s2.runningSessionIds ?? []), ...(s2.subagentsActiveSessionIds ?? [])].includes(ref.id)) { quiescent = true; break; }
 			}
 			if (!quiescent) return { status: "error", reply: "", err: "worker did not confirm termination", code: -1, quiescent: false };
 			if (why === "error") return { status, reply: "", err: "the agent waited for a person's answer for 2 minutes", code: -1 };
@@ -781,10 +807,11 @@ async function webTurn(ctx, cwd, ref, name, prompt, minutes, onActivity = () => 
 		}
 	}
 	try {
-		const response = await web.send(ref.id, { type: "get_messages" });
-		const last = response.data?.messages?.filter((m) => m.role === "assistant").at(-1);
-		if (!last) return { status: "error", reply: "", err: "Pi Web returned no assistant result", code: -1 };
-		const err = ["error", "aborted", "length"].includes(last.stopReason) ? last.errorMessage || `assistant stopped: ${last.stopReason}` : "";
+		const { context } = await web.history(ref.id);
+		const index = context.messages.findLastIndex((m) => m.role === "assistant");
+		const last = context.messages[index];
+		if (!last || context.entryIds[index] === previousAssistantId) return { status: "error", reply: "", err: "Pi Web returned no new assistant result", code: -1 };
+		const err = last.stopReason === "stop" ? "" : last.errorMessage || `assistant stopped: ${last.stopReason}`;
 		return { status: status === "ok" && err ? "error" : status, reply: textOf(last), err, code: err ? -1 : 0 };
 	} catch (e) { return { status: "error", reply: "", err: String(e), code: -1 }; }
 }
@@ -979,16 +1006,17 @@ export async function deleteSessions(ctx, ids, mode = "delete") {
 	const webIds = ids.filter((id) => sessions[id]?.web);
 	const cliIds = ids.filter((id) => sessions[id] && !sessions[id].web);
 	let n = 0;
-	if (webIds.length && ctx.web) {
+	for (let i = 0; ctx.web && i < webIds.length; i += 500) {
+		const batch = webIds.slice(i, i + 500);
 		try {
 			if (mode === "archive") {
-				await ctx.web.ui({ action: "set", ids: webIds, archived: true });
-				for (const id of webIds) sessions[id].archived = true;
-				n += webIds.length;
+				await ctx.web.ui({ action: "set", ids: batch, archived: true });
+				for (const id of batch) sessions[id].archived = true;
+				n += batch.length;
 			} else {
-				const r = await ctx.web.del(webIds);
+				const r = await ctx.web.del(batch);
 				for (const id of [...(r.deleted ?? []), ...(r.missing ?? [])]) if (sessions[id]) sessions[id].deleted = true;
-				n += (r.deleted ?? []).filter((id) => webIds.includes(id)).length;
+				n += (r.deleted ?? []).filter((id) => batch.includes(id)).length;
 			}
 		} catch (e) {
 			ctx.log(`CLEANUP failed: ${e?.message ?? e}`);

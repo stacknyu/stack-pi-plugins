@@ -28,6 +28,71 @@ function fixture(t, options = {}) {
 	return { root, b, config, git };
 }
 
+test("extension CLI commands await pi.exec in TUI/RPC; polling is UI-only and shutdown is instance-scoped", (t) => {
+	const { root } = fixture(t);
+	execFileSync(process.execPath, ["--experimental-test-module-mocks", "--input-type=module", "-e", `
+		import assert from "node:assert/strict";
+		import { mock } from "node:test";
+		const cli = ${JSON.stringify(cli)};
+		mock.module(${JSON.stringify(new URL("./lib/client.mjs", import.meta.url).href)}, { namedExports: {
+			CLI: cli, SHIM_DIR: "unused", installShims() {},
+			call: async () => ({}), connect: async () => ({ info: undefined }),
+		} });
+		const { default: extension } = await import(${JSON.stringify(new URL("./extension.ts", import.meta.url).href)});
+		const calls = [], notices = [], intervals = new Set();
+		let finish;
+		mock.method(globalThis, "setInterval", (_fn, ms) => {
+			assert.equal(ms, 4000);
+			const timer = { unref() {} }; intervals.add(timer); return timer;
+		});
+		mock.method(globalThis, "clearInterval", (timer) => intervals.delete(timer));
+		const make = () => {
+			const hooks = {}, commands = {};
+			extension({
+				on: (name, handler) => { hooks[name] = handler; }, registerTool() {},
+				registerCommand: (name, command) => { commands[name] = command; },
+				exec: (...args) => { calls.push(args); return new Promise((resolve) => { finish = resolve; }); },
+			});
+			return { hooks, commands };
+		};
+		const ctx = (mode) => ({ cwd: process.cwd(), mode, hasUI: mode === "tui" || mode === "rpc",
+			ui: { notify: (...args) => notices.push(args), setStatus() {} } });
+		const a = make(), b = make();
+		for (const mode of ["tui", "rpc"]) for (const cmd of ["init", "log", "projects"]) {
+			for (const [override, level] of [[{}, "info"], [{ code: 1 }, "warning"], [{ killed: true }, "warning"], [{ truncated: true }, "warning"], [{ stdout: "", stderr: "" }, "info"]]) {
+				calls.length = notices.length = 0;
+				let settled = false;
+				const pending = a.commands.check.handler(cmd, ctx(mode)).then(() => { settled = true; });
+				await new Promise(setImmediate);
+				assert.deepEqual(calls, [[process.execPath, [cli, cmd], { cwd: process.cwd() }]]);
+				assert.equal(settled, false);
+				assert.deepEqual(notices, []);
+				const result = { stdout: " stdout", stderr: "stderr ", code: 0, killed: false, truncated: false, ...override };
+				finish(result);
+				await pending;
+				assert.deepEqual(notices, [[result.stdout ? "stdoutstderr" : "(no output)", level]]);
+			}
+		}
+		for (const mode of ["json", "print"]) {
+			await a.hooks.session_start({}, ctx(mode));
+			assert.equal(intervals.size, 0, mode + " must not poll despite having a ui object");
+		}
+		const unrelated = setInterval(() => {}, 4000);
+		await a.hooks.session_start({}, ctx("tui"));
+		const ownA = [...intervals].find((timer) => timer !== unrelated);
+		await b.hooks.session_start({}, ctx("rpc"));
+		assert.equal(intervals.size, 3);
+		const ownB = [...intervals].find((timer) => timer !== unrelated && timer !== ownA);
+		await a.hooks.session_shutdown({});
+		assert.deepEqual(intervals, new Set([unrelated, ownB]));
+		await a.hooks.session_shutdown({});
+		assert.deepEqual(intervals, new Set([unrelated, ownB]));
+		await b.hooks.session_shutdown({});
+		assert.deepEqual(intervals, new Set([unrelated]));
+		clearInterval(unrelated);
+	`], { cwd: root, env: { ...process.env, PI_CODING_AGENT_DIR: join(root, "agent") }, encoding: "utf8", stdio: "pipe", timeout: 15000 });
+});
+
 test("automatic CPU budget is independent of agents and honors explicit ceilings", (t) => {
 	const { root, b } = fixture(t, { maxJobs: 0, cpuBudget: 8, fastLane: false });
 	assert.equal(loadConfig(root).maxJobs, 8);
