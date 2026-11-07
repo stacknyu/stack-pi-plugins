@@ -15,7 +15,7 @@ Requires Pi, Node.js **22.19+**, Git, and macOS or Linux. Tested against Pi 1.5.
 ```sh
 pi install npm:@stacknyu/pi-flow    # only task planning and queues
 pi install npm:@stacknyu/pi-check   # only shared checks
-pi install npm:@stacknyu/pi-glitch-lab # only browser UI/UX/UAT (new release pending publication)
+pi install npm:@stacknyu/pi-glitch-lab # only browser UI/UX/UAT
 ```
 
 Install any combination. No plugin depends on a sibling plugin. Restart Pi or `/reload` after installing. When both are loaded, pi-flow discovers pi-check automatically.
