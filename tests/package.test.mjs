@@ -5,13 +5,14 @@ import { mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const sdk = import.meta.resolve("@earendil-works/pi-coding-agent");
 const cli = fileURLToPath(new URL("./cli.js", sdk));
 const runner = new URL("../packages/pi-flow/runner.mjs", import.meta.url).href;
 
-for (const plugin of ["pi-flow", "pi-check"]) test(`${plugin} npm archive loads independently with its own version, skill and license`, { timeout: 60000 }, (t) => {
+for (const plugin of ["pi-flow", "pi-check", "pi-glitch-lab"]) test(`${plugin} npm archive loads independently with its own version, skill and license`, { timeout: 60000 }, (t) => {
 	const home = realpathSync(mkdtempSync(join(tmpdir(), `stack-${plugin}-pack-`)));
 	t.after(() => rmSync(home, { recursive: true, force: true }));
 	const agentDir = join(home, "agent"), npmRoot = join(agentDir, "npm");
@@ -19,9 +20,18 @@ for (const plugin of ["pi-flow", "pi-check"]) test(`${plugin} npm archive loads 
 	execFileSync("pnpm", ["--dir", join(root, "packages", plugin), "pack", "--pack-destination", home], { cwd: root, env, encoding: "utf8", stdio: "pipe", timeout: 30000 });
 	const archive = join(home, readdirSync(home).find((f) => f.endsWith(".tgz")));
 	const files = execFileSync("tar", ["-tzf", archive], { encoding: "utf8" }).trim().split("\n");
-	for (const file of ["package.json", "README.md", "LICENSE", "CHANGELOG.md", "extension.ts", `skills/${plugin}/SKILL.md`]) assert.ok(files.includes(`package/${file}`), file);
+	for (const file of ["package.json", "README.md", "LICENSE", "CHANGELOG.md", plugin === "pi-glitch-lab" ? "extensions/index.ts" : "extension.ts", `skills/${plugin === "pi-glitch-lab" ? "glitch-hunt" : plugin}/SKILL.md`]) assert.ok(files.includes(`package/${file}`), file);
 	assert.equal(files.some((f) => /(?:\.test\.mjs|node_modules|\.env|\.npmrc)/.test(f)), false);
-	execFileSync("npm", ["install", "--prefix", npmRoot, "--ignore-scripts", "--legacy-peer-deps", "--offline", "--no-audit", "--no-fund", archive], { cwd: home, env, encoding: "utf8", stdio: "pipe", timeout: 30000 });
+	const runtimeArchives = [];
+	if (plugin === "pi-glitch-lab") {
+		const require = createRequire(join(root, "packages", plugin, "package.json"));
+		for (const dependency of ["playwright", "playwright-core"]) {
+			const manifest = require.resolve(`${dependency}/package.json`);
+			const packed = JSON.parse(execFileSync("npm", ["pack", join(manifest, ".."), "--pack-destination", home, "--json", "--ignore-scripts"], { cwd: home, env, encoding: "utf8", stdio: "pipe", timeout: 30000 }));
+			runtimeArchives.push(join(home, packed[0].filename));
+		}
+	}
+	execFileSync("npm", ["install", "--prefix", npmRoot, "--ignore-scripts", "--legacy-peer-deps", "--offline", "--no-audit", "--no-fund", archive, ...runtimeArchives], { cwd: home, env, encoding: "utf8", stdio: "pipe", timeout: 30000 });
 	assert.deepEqual(readdirSync(join(npmRoot, "node_modules/@stacknyu")), [plugin]);
 	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: [`npm:@stacknyu/${plugin}`] }));
 	const installed = join(npmRoot, "node_modules/@stacknyu", plugin);
@@ -40,14 +50,19 @@ for (const plugin of ["pi-flow", "pi-check"]) test(`${plugin} npm archive loads 
 		console.log(JSON.stringify({ errors, commands: extensions.flatMap(e => [...e.commands.keys()]), tools: extensions.flatMap(e => [...e.tools.keys()]), skills: loader.getSkills().skills.map(s => s.name) }));
 	`], { cwd: home, env, encoding: "utf8", stdio: "pipe", timeout: 15000 }));
 	assert.deepEqual(result.errors, []);
-	assert.deepEqual(result.commands.sort(), plugin === "pi-flow" ? ["queue", "task"] : ["check"]);
-	assert.deepEqual(result.skills, [plugin]);
+	assert.deepEqual(result.commands.sort(), plugin === "pi-flow" ? ["queue", "task"] : plugin === "pi-check" ? ["check"] : ["glitch-lab-doctor"]);
+	assert.deepEqual(result.skills.sort(), plugin === "pi-glitch-lab" ? ["ai-agentic-usability-testing", "glitch-hunt"] : [plugin]);
 	assert.equal(result.tools.includes("check"), plugin === "pi-check");
 	if (plugin === "pi-check") {
 		assert.equal(JSON.parse(readFileSync(join(agentDir, "pi-check/cli.json"), "utf8")).version, pkg.version);
 		assert.match(execFileSync(process.execPath, [join(installed, "cli.mjs"), "--help"], { env, encoding: "utf8" }), /pi-check run/);
-	} else {
+	} else if (plugin === "pi-flow") {
 		for (const file of ["runner.mjs", "supervisor.mjs", "setup.mjs"]) assert.ok(files.includes(`package/${file}`));
+	} else {
+		assert.equal(pkg.dependencies.typebox, undefined);
+		assert.equal(pkg.peerDependencies.typebox, "*");
+		assert.deepEqual(result.tools.sort(), ["glitch_hunt", "glitch_lab_doctor", "ux_affordance_scan", "ux_journeys", "ux_report"]);
+		for (const file of ["lib.mjs", "interactions.mjs", "glitch_lab.mjs", "affordance_scan.mjs", "journey_runner.mjs"]) assert.ok(files.includes(`package/scripts/${file}`));
 	}
 });
 

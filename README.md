@@ -6,6 +6,7 @@ Independent plugins for the [Pi coding agent](https://github.com/earendil-works/
 | --- | --- | --- |
 | [@stacknyu/pi-flow](packages/pi-flow/README.md) | Plans large tasks and runs checked, committed work in fresh agent sessions | `/task`, `/queue` |
 | [@stacknyu/pi-check](packages/pi-check/README.md) | Shares and caches tests, type checks and lint across sessions and worktrees | `/check`, agent `check` tool |
+| [@stacknyu/pi-glitch-lab](packages/pi-glitch-lab/README.md) | Browser UI/UX inventory, authorized interaction coverage, visual glitches and scripted UAT | `ux_affordance_scan`, `ux_journeys`, `glitch_hunt`, `ux_report` |
 
 ## Install independently
 
@@ -14,9 +15,10 @@ Requires Pi, Node.js **22.19+**, Git, and macOS or Linux. Tested against Pi 1.5.
 ```sh
 pi install npm:@stacknyu/pi-flow    # only task planning and queues
 pi install npm:@stacknyu/pi-check   # only shared checks
+pi install npm:@stacknyu/pi-glitch-lab # only browser UI/UX/UAT (new release pending publication)
 ```
 
-Run either command, or both. Neither package depends on the other. Restart Pi or `/reload` after installing. When both are loaded, pi-flow discovers pi-check automatically.
+Install any combination. No plugin depends on a sibling plugin. Restart Pi or `/reload` after installing. When both are loaded, pi-flow discovers pi-check automatically.
 
 For project-only installation, add `-l` from that project and commit its `.pi/settings.json`; teammates must trust the project before it loads. A personal install is simplest for pi-flow's worker worktrees. To pin a release, append its exact version, for example `npm:@stacknyu/pi-flow@1.5.0`.
 
@@ -70,7 +72,7 @@ pnpm install --frozen-lockfile
 pnpm test
 ```
 
-Use pnpm 12.14.0 (the root `package.json` version). Tests use temporary repositories/profiles and fake workers, not model calls. They pack and independently load the actual npm archives, checking included runtime files and absence of the sibling plugin. There are no GitHub Actions workflows.
+Use pnpm 12.14.0 (the root `package.json` version). Tests use temporary repositories/profiles and fake workers, not model calls. They pack and independently load the actual npm archives, checking included runtime files and absence of sibling plugins. Glitch Lab browser regressions require Chromium or installed Google Chrome and use only an ephemeral synthetic loopback application. There are no GitHub Actions workflows.
 
 Remove the corresponding managed installation before using a local checkout:
 
@@ -97,7 +99,7 @@ git tag -a pi-flow/v1.5.0 -m '@stacknyu/pi-flow 1.5.0'
 git push origin main pi-flow/v1.5.0
 ```
 
-The root package stays private to prevent accidental npm publication of the bundle. Existing root `v0.x` tags identify historical Git collection releases; standalone releases use `pi-flow/v…` and `pi-check/v…`. Publishing is local and needs no CI service.
+The root package stays private to prevent accidental npm publication of the bundle. Existing root `v0.x` tags identify historical Git collection releases; standalone releases use `pi-flow/v…`, `pi-check/v…` and `pi-glitch-lab/v…`. Publishing is local and needs no CI service.
 
 ## License
 

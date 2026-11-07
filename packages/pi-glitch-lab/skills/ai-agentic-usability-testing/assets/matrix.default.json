@@ -1,0 +1,746 @@
+{
+  "_readme": "Default matrix: 4 personas (5 variants) as DIRECT platform users, no partner. Copy to .ux/matrix.json, set platform.url and logins, then explore the app once and replace the placeholder labels in journeys (e.g. 'Chat', 'New chat', 'Save to notes', placeholder 'Ask') with the real ones seen on screen. mustNotSee lists are starting points: replace with real agent/widget names of other verticals.",
+  "platform": {
+    "name": "YOUR PLATFORM NAME",
+    "url": "https://staging.your-platform.com",
+    "login": {
+      "url": "/login",
+      "fields": {
+        "input[type=email]": "env:UX_EMAIL",
+        "input[type=password]": "env:UX_PASSWORD"
+      },
+      "submit": "button[type=submit]",
+      "waitFor": "/"
+    }
+  },
+  "unsafeWords": [
+    "delete",
+    "remove",
+    "pay",
+    "purchase",
+    "buy",
+    "upgrade",
+    "subscribe",
+    "invite",
+    "share",
+    "publish",
+    "send email",
+    "logout",
+    "log out",
+    "sign out",
+    "deactivate",
+    "reset"
+  ],
+  "mask": [
+    "time",
+    "[datetime]",
+    ".timestamp",
+    "[data-streaming]",
+    "[aria-busy=true]"
+  ],
+  "personas": {
+    "indian-germany-student": {
+      "name": "Arjun, 22",
+      "vertical": "education",
+      "viewport": "android",
+      "network": "fast3g",
+      "locale": "en-IN",
+      "timezone": "Asia/Kolkata",
+      "mustNotSee": [
+        "Tax agent",
+        "Tax audit",
+        "Stock",
+        "NIFTY",
+        "SENSEX",
+        "Portfolio",
+        "Trading",
+        "SAT",
+        "Common App",
+        "undefined",
+        "NaN",
+        "[object Object]",
+        "null",
+        "Something went wrong",
+        "Error:"
+      ]
+    },
+    "us-ivy-applicant": {
+      "name": "Emily, 17",
+      "vertical": "education",
+      "viewport": "iphone",
+      "network": "fast3g",
+      "locale": "en-US",
+      "timezone": "America/Chicago",
+      "mustNotSee": [
+        "Tax agent",
+        "Tax audit",
+        "Stock",
+        "NIFTY",
+        "SENSEX",
+        "Portfolio",
+        "Trading",
+        "APS certificate",
+        "uni-assist",
+        "Blocked account",
+        "₹",
+        "undefined",
+        "NaN",
+        "[object Object]",
+        "null",
+        "Something went wrong",
+        "Error:"
+      ]
+    },
+    "us-finance-analyst": {
+      "name": "Mark, 40",
+      "vertical": "finance",
+      "viewport": "desktop",
+      "network": "fast",
+      "locale": "en-US",
+      "timezone": "America/New_York",
+      "mustNotSee": [
+        "Admission",
+        "Scholarship",
+        "SOP",
+        "NIFTY",
+        "SENSEX",
+        "₹",
+        "undefined",
+        "NaN",
+        "[object Object]",
+        "null",
+        "Something went wrong",
+        "Error:"
+      ]
+    },
+    "indian-market-analyst-young": {
+      "name": "Rahul, 32",
+      "vertical": "markets",
+      "viewport": "android",
+      "network": "fast3g",
+      "locale": "en-IN",
+      "timezone": "Asia/Kolkata",
+      "mustNotSee": [
+        "Admission",
+        "Scholarship",
+        "IRS",
+        "Tax audit",
+        "CP2000",
+        "undefined",
+        "NaN",
+        "[object Object]",
+        "null",
+        "Something went wrong",
+        "Error:"
+      ]
+    },
+    "indian-market-analyst-senior": {
+      "name": "Suresh, 61",
+      "vertical": "markets",
+      "viewport": "laptop-zoom125",
+      "network": "fast3g",
+      "locale": "en-IN",
+      "timezone": "Asia/Kolkata",
+      "mustNotSee": [
+        "Admission",
+        "Scholarship",
+        "IRS",
+        "Tax audit",
+        "CP2000",
+        "undefined",
+        "NaN",
+        "[object Object]",
+        "null",
+        "Something went wrong",
+        "Error:"
+      ]
+    }
+  },
+  "cells": [
+    {
+      "persona": "indian-germany-student",
+      "screens": [
+        "/",
+        "/dashboard",
+        "/chat",
+        "/notes",
+        "/research"
+      ],
+      "journeys": [
+        "explore-dashboard",
+        "arjun-checklist",
+        "arjun-costs"
+      ],
+      "login": {
+        "url": "/login",
+        "fields": {
+          "input[type=email]": "env:UX_EMAIL_INDIAN_GERMANY_STUDENT",
+          "input[type=password]": "env:UX_PASSWORD_INDIAN_GERMANY_STUDENT"
+        },
+        "submit": "button[type=submit]",
+        "waitFor": "/"
+      }
+    },
+    {
+      "persona": "us-ivy-applicant",
+      "screens": [
+        "/",
+        "/dashboard",
+        "/chat",
+        "/notes",
+        "/research"
+      ],
+      "journeys": [
+        "explore-dashboard",
+        "emily-plan",
+        "emily-essay"
+      ],
+      "login": {
+        "url": "/login",
+        "fields": {
+          "input[type=email]": "env:UX_EMAIL_US_IVY_APPLICANT",
+          "input[type=password]": "env:UX_PASSWORD_US_IVY_APPLICANT"
+        },
+        "submit": "button[type=submit]",
+        "waitFor": "/"
+      }
+    },
+    {
+      "persona": "us-finance-analyst",
+      "screens": [
+        "/",
+        "/dashboard",
+        "/chat",
+        "/notes",
+        "/research"
+      ],
+      "journeys": [
+        "explore-dashboard",
+        "mark-audit",
+        "mark-quarterly"
+      ],
+      "login": {
+        "url": "/login",
+        "fields": {
+          "input[type=email]": "env:UX_EMAIL_US_FINANCE_ANALYST",
+          "input[type=password]": "env:UX_PASSWORD_US_FINANCE_ANALYST"
+        },
+        "submit": "button[type=submit]",
+        "waitFor": "/"
+      }
+    },
+    {
+      "persona": "indian-market-analyst-young",
+      "screens": [
+        "/",
+        "/dashboard",
+        "/chat",
+        "/notes",
+        "/research"
+      ],
+      "journeys": [
+        "explore-dashboard",
+        "rahul-outlook",
+        "rahul-sector-note"
+      ],
+      "login": {
+        "url": "/login",
+        "fields": {
+          "input[type=email]": "env:UX_EMAIL_INDIAN_MARKET_ANALYST_YOUNG",
+          "input[type=password]": "env:UX_PASSWORD_INDIAN_MARKET_ANALYST_YOUNG"
+        },
+        "submit": "button[type=submit]",
+        "waitFor": "/"
+      }
+    },
+    {
+      "persona": "indian-market-analyst-senior",
+      "screens": [
+        "/",
+        "/dashboard",
+        "/chat",
+        "/notes",
+        "/research"
+      ],
+      "journeys": [
+        "explore-dashboard",
+        "suresh-overview",
+        "suresh-find-notes"
+      ],
+      "login": {
+        "url": "/login",
+        "fields": {
+          "input[type=email]": "env:UX_EMAIL_INDIAN_MARKET_ANALYST_SENIOR",
+          "input[type=password]": "env:UX_PASSWORD_INDIAN_MARKET_ANALYST_SENIOR"
+        },
+        "submit": "button[type=submit]",
+        "waitFor": "/"
+      }
+    }
+  ],
+  "journeys": {
+    "explore-dashboard": {
+      "title": "First look: land, look around, open each main area",
+      "steps": [
+        {
+          "goto": "/"
+        },
+        {
+          "expectNoText": "{{persona.mustNotSee}}"
+        },
+        {
+          "screenshot": "landing"
+        },
+        {
+          "click": "Chat",
+          "optional": true
+        },
+        {
+          "click": "Notes",
+          "optional": true
+        },
+        {
+          "click": "Research",
+          "optional": true
+        },
+        {
+          "click": "Dashboard",
+          "optional": true
+        },
+        {
+          "screenshot": "back-to-dashboard"
+        }
+      ]
+    },
+    "arjun-checklist": {
+      "title": "Get the Germany MS checklist and save it",
+      "steps": [
+        {
+          "goto": "/"
+        },
+        {
+          "expectNoText": "{{persona.mustNotSee}}",
+          "note": "replaced at runtime by the persona's mustNotSee list"
+        },
+        {
+          "click": "Chat",
+          "note": "replace with the real label/icon name of the chat entry point"
+        },
+        {
+          "click": "New chat",
+          "optional": true
+        },
+        {
+          "fill": {
+            "placeholder": "Ask",
+            "value": "What all documents and exams do I need for MS in Computer Science in Germany? I am in final year B.Tech with 7.8 CGPA."
+          }
+        },
+        {
+          "press": "Enter"
+        },
+        {
+          "measureResponse": {
+            "selector": "[data-role=assistant], .assistant-message, [data-message-author=assistant]",
+            "timeout": 90000
+          },
+          "note": "replace selector with the real assistant-message container"
+        },
+        {
+          "click": "Save to notes",
+          "note": "replace with the real save/add-to-notes control"
+        },
+        {
+          "waitForText": "Saved",
+          "optional": true
+        },
+        {
+          "click": "Notes"
+        },
+        {
+          "screenshot": "notes-after-save"
+        }
+      ]
+    },
+    "arjun-costs": {
+      "title": "Total cost in rupees",
+      "steps": [
+        {
+          "goto": "/"
+        },
+        {
+          "expectNoText": "{{persona.mustNotSee}}",
+          "note": "replaced at runtime by the persona's mustNotSee list"
+        },
+        {
+          "click": "Chat",
+          "note": "replace with the real label/icon name of the chat entry point"
+        },
+        {
+          "click": "New chat",
+          "optional": true
+        },
+        {
+          "fill": {
+            "placeholder": "Ask",
+            "value": "How much money do I need in total for MS in Germany, in rupees? Include blocked account and insurance."
+          }
+        },
+        {
+          "press": "Enter"
+        },
+        {
+          "measureResponse": {
+            "selector": "[data-role=assistant], .assistant-message, [data-message-author=assistant]",
+            "timeout": 90000
+          },
+          "note": "replace selector with the real assistant-message container"
+        }
+      ]
+    },
+    "emily-plan": {
+      "title": "Junior-year plan for MIT, saved",
+      "steps": [
+        {
+          "goto": "/"
+        },
+        {
+          "expectNoText": "{{persona.mustNotSee}}",
+          "note": "replaced at runtime by the persona's mustNotSee list"
+        },
+        {
+          "click": "Chat",
+          "note": "replace with the real label/icon name of the chat entry point"
+        },
+        {
+          "click": "New chat",
+          "optional": true
+        },
+        {
+          "fill": {
+            "placeholder": "Ask",
+            "value": "What do I need to get into MIT? Like what should I be doing junior year? Make me a month by month plan."
+          }
+        },
+        {
+          "press": "Enter"
+        },
+        {
+          "measureResponse": {
+            "selector": "[data-role=assistant], .assistant-message, [data-message-author=assistant]",
+            "timeout": 90000
+          },
+          "note": "replace selector with the real assistant-message container"
+        },
+        {
+          "click": "Save to notes",
+          "note": "replace with the real save/add-to-notes control"
+        },
+        {
+          "waitForText": "Saved",
+          "optional": true
+        },
+        {
+          "click": "Notes"
+        },
+        {
+          "screenshot": "notes-after-save"
+        }
+      ]
+    },
+    "emily-essay": {
+      "title": "Essay brainstorm",
+      "steps": [
+        {
+          "goto": "/"
+        },
+        {
+          "expectNoText": "{{persona.mustNotSee}}",
+          "note": "replaced at runtime by the persona's mustNotSee list"
+        },
+        {
+          "click": "Chat",
+          "note": "replace with the real label/icon name of the chat entry point"
+        },
+        {
+          "click": "New chat",
+          "optional": true
+        },
+        {
+          "fill": {
+            "placeholder": "Ask",
+            "value": "Help me brainstorm my Common App essay. I do robotics and tutor middle schoolers."
+          }
+        },
+        {
+          "press": "Enter"
+        },
+        {
+          "measureResponse": {
+            "selector": "[data-role=assistant], .assistant-message, [data-message-author=assistant]",
+            "timeout": 90000
+          },
+          "note": "replace selector with the real assistant-message container"
+        },
+        {
+          "click": "Save to notes",
+          "note": "replace with the real save/add-to-notes control"
+        },
+        {
+          "waitForText": "Saved",
+          "optional": true
+        },
+        {
+          "click": "Notes"
+        },
+        {
+          "screenshot": "notes-after-save"
+        }
+      ]
+    },
+    "mark-audit": {
+      "title": "Audit preparation checklist",
+      "steps": [
+        {
+          "goto": "/"
+        },
+        {
+          "expectNoText": "{{persona.mustNotSee}}",
+          "note": "replaced at runtime by the persona's mustNotSee list"
+        },
+        {
+          "click": "Chat",
+          "note": "replace with the real label/icon name of the chat entry point"
+        },
+        {
+          "click": "New chat",
+          "optional": true
+        },
+        {
+          "fill": {
+            "placeholder": "Ask",
+            "value": "I got a CP2000 notice last year. What documentation should I prepare in case of an audit? I have W-2 income, 1099-NEC consulting and a rental property."
+          }
+        },
+        {
+          "press": "Enter"
+        },
+        {
+          "measureResponse": {
+            "selector": "[data-role=assistant], .assistant-message, [data-message-author=assistant]",
+            "timeout": 90000
+          },
+          "note": "replace selector with the real assistant-message container"
+        },
+        {
+          "click": "Save to notes",
+          "note": "replace with the real save/add-to-notes control"
+        },
+        {
+          "waitForText": "Saved",
+          "optional": true
+        },
+        {
+          "click": "Notes"
+        },
+        {
+          "screenshot": "notes-after-save"
+        }
+      ]
+    },
+    "mark-quarterly": {
+      "title": "Quarterly estimated tax plan",
+      "steps": [
+        {
+          "goto": "/"
+        },
+        {
+          "expectNoText": "{{persona.mustNotSee}}",
+          "note": "replaced at runtime by the persona's mustNotSee list"
+        },
+        {
+          "click": "Chat",
+          "note": "replace with the real label/icon name of the chat entry point"
+        },
+        {
+          "click": "New chat",
+          "optional": true
+        },
+        {
+          "fill": {
+            "placeholder": "Ask",
+            "value": "Help me plan quarterly estimated taxes for about $60k of consulting income this year. Put it in a table."
+          }
+        },
+        {
+          "press": "Enter"
+        },
+        {
+          "measureResponse": {
+            "selector": "[data-role=assistant], .assistant-message, [data-message-author=assistant]",
+            "timeout": 90000
+          },
+          "note": "replace selector with the real assistant-message container"
+        }
+      ]
+    },
+    "rahul-outlook": {
+      "title": "Weekly index outlook",
+      "steps": [
+        {
+          "goto": "/"
+        },
+        {
+          "expectNoText": "{{persona.mustNotSee}}",
+          "note": "replaced at runtime by the persona's mustNotSee list"
+        },
+        {
+          "click": "Chat",
+          "note": "replace with the real label/icon name of the chat entry point"
+        },
+        {
+          "click": "New chat",
+          "optional": true
+        },
+        {
+          "fill": {
+            "placeholder": "Ask",
+            "value": "NIFTY and Bank NIFTY outlook for the coming week? Key levels?"
+          }
+        },
+        {
+          "press": "Enter"
+        },
+        {
+          "measureResponse": {
+            "selector": "[data-role=assistant], .assistant-message, [data-message-author=assistant]",
+            "timeout": 90000
+          },
+          "note": "replace selector with the real assistant-message container"
+        }
+      ]
+    },
+    "rahul-sector-note": {
+      "title": "Sector view saved as note",
+      "steps": [
+        {
+          "goto": "/"
+        },
+        {
+          "expectNoText": "{{persona.mustNotSee}}",
+          "note": "replaced at runtime by the persona's mustNotSee list"
+        },
+        {
+          "click": "Chat",
+          "note": "replace with the real label/icon name of the chat entry point"
+        },
+        {
+          "click": "New chat",
+          "optional": true
+        },
+        {
+          "fill": {
+            "placeholder": "Ask",
+            "value": "Should I book profits in IT stocks or hold? Give reasons and save-worthy summary."
+          }
+        },
+        {
+          "press": "Enter"
+        },
+        {
+          "measureResponse": {
+            "selector": "[data-role=assistant], .assistant-message, [data-message-author=assistant]",
+            "timeout": 90000
+          },
+          "note": "replace selector with the real assistant-message container"
+        },
+        {
+          "click": "Save to notes",
+          "note": "replace with the real save/add-to-notes control"
+        },
+        {
+          "waitForText": "Saved",
+          "optional": true
+        },
+        {
+          "click": "Notes"
+        },
+        {
+          "screenshot": "notes-after-save"
+        }
+      ]
+    },
+    "suresh-overview": {
+      "title": "Market overview for the month",
+      "steps": [
+        {
+          "goto": "/"
+        },
+        {
+          "expectNoText": "{{persona.mustNotSee}}",
+          "note": "replaced at runtime by the persona's mustNotSee list"
+        },
+        {
+          "click": "Chat",
+          "note": "replace with the real label/icon name of the chat entry point"
+        },
+        {
+          "click": "New chat",
+          "optional": true
+        },
+        {
+          "fill": {
+            "placeholder": "Ask",
+            "value": "Give me an overview of the market today and what to watch this month."
+          }
+        },
+        {
+          "press": "Enter"
+        },
+        {
+          "measureResponse": {
+            "selector": "[data-role=assistant], .assistant-message, [data-message-author=assistant]",
+            "timeout": 90000
+          },
+          "note": "replace selector with the real assistant-message container"
+        },
+        {
+          "click": "Save to notes",
+          "note": "replace with the real save/add-to-notes control"
+        },
+        {
+          "waitForText": "Saved",
+          "optional": true
+        },
+        {
+          "click": "Notes"
+        },
+        {
+          "screenshot": "notes-after-save"
+        }
+      ]
+    },
+    "suresh-find-notes": {
+      "title": "Find previous notes and chats",
+      "steps": [
+        {
+          "goto": "/"
+        },
+        {
+          "click": "Notes"
+        },
+        {
+          "screenshot": "notes"
+        },
+        {
+          "click": "History",
+          "optional": true,
+          "note": "replace with where past chats live"
+        },
+        {
+          "screenshot": "history"
+        }
+      ]
+    }
+  }
+}

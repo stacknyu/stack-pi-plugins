@@ -1,0 +1,73 @@
+{
+  "baseUrl": "https://staging.example-platform.com",
+  "unsafeWords": ["delete", "remove", "pay", "purchase", "buy", "subscribe", "send email", "invite", "share publicly", "logout", "log out", "sign out", "deactivate"],
+  "mask": ["[data-role=assistant-message]", "time", ".timestamp", ".avatar"],
+
+  "partners": {
+    "brightpath": { "name": "BrightPath Consultants", "vertical": "education", "url": "https://brightpath.example-platform.com" },
+    "globalmove": { "name": "GlobalMove Migration", "vertical": "migration", "url": "https://globalmove.example-platform.com" },
+    "ledgerwise": { "name": "LedgerWise Tax", "vertical": "finance", "url": "https://ledgerwise.example-platform.com" },
+    "meridian":   { "name": "Meridian Health", "vertical": "health", "url": "https://meridian.example-platform.com" }
+  },
+
+  "personas": {
+    "teen-applicant":    { "name": "Aarav, 15", "vertical": "education", "viewport": "mobile",  "network": "fast3g" },
+    "migrating-student": { "name": "Lina, 25",  "vertical": "migration", "viewport": "mobile",  "network": "slow3g", "locale": "en-GB" },
+    "finance-analyst":   { "name": "Rohan, 34", "vertical": "finance",   "viewport": "desktop", "network": "fast" },
+    "patient":           { "name": "Meera, 62", "vertical": "health",    "viewport": "tablet",  "network": "fast3g" }
+  },
+
+  "cells": [
+    {
+      "persona": "teen-applicant", "partner": "brightpath",
+      "login": { "url": "/login", "fields": { "input[name=email]": "teen.test@brightpath.test", "input[name=password]": "env:UX_PW_TEEN" }, "submit": "button[type=submit]", "waitFor": "/dashboard" },
+      "screens": ["/dashboard", "/chat", "/notes"],
+      "journeys": ["ask-and-save-note", "no-leaks-education"]
+    },
+    {
+      "persona": "patient", "partner": "meridian",
+      "login": { "url": "/login", "fields": { "input[name=email]": "patient.test@meridian.test", "input[name=password]": "env:UX_PW_PATIENT" }, "submit": "button[type=submit]", "waitFor": "/dashboard" },
+      "screens": ["/dashboard", "/chat"],
+      "journeys": ["start-health-chat"]
+    }
+  ],
+
+  "journeys": {
+    "ask-and-save-note": {
+      "title": "Ask about scholarships and save the answer as a note",
+      "steps": [
+        { "goto": "/dashboard" },
+        { "expectText": "{{partner.name}}" },
+        { "click": "Chat", "note": "persona would look for chat in bottom nav" },
+        { "fill": { "placeholder": "Ask", "value": "Which scholarships can I apply for in Canada?" } },
+        { "click": { "role": "button", "name": "Send" } },
+        { "measureResponse": { "selector": "[data-role=assistant-message]", "timeout": 60000 } },
+        { "click": "Save to notes" },
+        { "waitForText": "Saved" },
+        { "click": "Notes" },
+        { "expectText": "scholarship" }
+      ]
+    },
+    "no-leaks-education": {
+      "title": "Education persona sees no other partners or verticals",
+      "steps": [
+        { "goto": "/dashboard" },
+        { "expectNoText": ["GlobalMove", "LedgerWise", "Meridian", "Tax agent", "Health assistant", "undefined", "NaN", "[object Object]"] },
+        { "goto": "/chat" },
+        { "expectNoText": ["Tax agent", "Health assistant", "LedgerWise", "Meridian"] }
+      ]
+    },
+    "start-health-chat": {
+      "title": "Start a conversation about a health concern",
+      "steps": [
+        { "goto": "/dashboard" },
+        { "expectText": "{{partner.name}}" },
+        { "expectNoText": ["Tax agent", "Visa agent", "BrightPath", "LedgerWise"] },
+        { "click": "Ask a question" },
+        { "fill": { "placeholder": "Ask", "value": "I've had a mild headache for three days. What should I do?" } },
+        { "press": "Enter" },
+        { "measureResponse": { "selector": "[data-role=assistant-message]", "timeout": 60000 } }
+      ]
+    }
+  }
+}

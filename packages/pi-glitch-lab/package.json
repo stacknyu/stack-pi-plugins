@@ -1,0 +1,25 @@
+{
+  "name": "@stacknyu/pi-glitch-lab",
+  "version": "0.5.0",
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org/" },
+  "repository": { "type": "git", "url": "git+https://github.com/stacknyu/stack-pi-plugins.git", "directory": "packages/pi-glitch-lab" },
+  "homepage": "https://github.com/stacknyu/stack-pi-plugins/tree/main/packages/pi-glitch-lab#readme",
+  "bugs": { "url": "https://github.com/stacknyu/stack-pi-plugins/issues" },
+  "description": "Visual QA for Pi agents: finds flicker, remounting components, self-refreshing UI, layout jumps, fake/hidden buttons and persona gating problems in running web apps, with frame, React, DOM, network and paint-flashing sensors.",
+  "type": "module",
+  "keywords": ["pi-package", "qa", "ux", "usability", "visual-regression", "flicker", "react", "playwright"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions/index.ts"],
+    "skills": ["./skills"]
+  },
+  "files": ["extensions", "scripts", "skills", "examples", "README.md", "CHANGELOG.md"],
+  "dependencies": {
+    "playwright": "1.63.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "engines": { "node": ">=22.19.0" }
+}

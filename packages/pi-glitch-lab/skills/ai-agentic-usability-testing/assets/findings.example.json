@@ -1,0 +1,56 @@
+{
+  "title": "Usability, glitch & reliability audit — direct users, 5 personas",
+  "subtitle": "Staging build · Arjun, Emily, Mark, Rahul, Suresh · no partner",
+  "summary": "Most confusion comes from three patterns: status chips that look like buttons, icon-only chat actions with no labels, and AI replies that show nothing for 2–4 seconds. On the health partner, a Tax agent from the finance vertical is visible to patients.",
+  "scorecard": [
+    {
+      "cell": "indian-germany-student@direct",
+      "journey": "Get the Germany MS checklist and save it",
+      "result": "friction",
+      "issues": [
+        "UX-002",
+        "UX-014"
+      ]
+    },
+    {
+      "cell": "us-finance-analyst@direct",
+      "journey": "First look: explore features",
+      "result": "friction",
+      "issues": [
+        "UX-005"
+      ]
+    }
+  ],
+  "patterns": [
+    {
+      "title": "Status chips look like buttons",
+      "findings": [
+        "UX-002",
+        "UX-007",
+        "UX-011"
+      ],
+      "description": "Filled, rounded chips (Scholarships, Pending, Verified) have the same look as primary buttons. Teens on mobile tap them repeatedly.",
+      "recommendation": "Give non-interactive chips a flat, outline-free, low-saturation style and never the primary brand color. Reserve filled brand color for actions only, in the design system."
+    }
+  ],
+  "findings": [
+    {
+      "id": "UX-014",
+      "title": "Sidebar blinks every time a page opens",
+      "category": "Visual glitch",
+      "severity": "S2",
+      "cells": [
+        "indian-germany-student@direct",
+        "indian-market-analyst-senior@direct"
+      ],
+      "screen": "/notes, /research, /dashboard",
+      "personaVoice": "Every time I open something the menu on the left disappears for a moment. Is it reloading? Did I lose something?",
+      "observation": "The left sidebar disappears for ~120 ms and reappears on every navigation (remount).",
+      "evidence": "glitch images at ~1.2 s after load on 3 screens; DOM remount of nav#sidebar",
+      "recommendation": "Keep the sidebar persistent across page changes; only the main content area should update.",
+      "screenshots": [
+        "indian-germany-student__direct/glitches/load_notes_glitch_01.png"
+      ]
+    }
+  ]
+}

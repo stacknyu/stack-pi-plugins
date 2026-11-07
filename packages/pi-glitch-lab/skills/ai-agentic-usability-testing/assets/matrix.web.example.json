@@ -1,0 +1,32 @@
+{
+  "_readme": "Replace the target, selectors and expected outcomes with approved test-environment values. Run observation first. Browser actions need interact=true; login/fill/save need allowWrites=true as well. No server-data rollback is provided.",
+  "platform": { "name": "Test application", "url": "http://localhost:3000" },
+  "mask": ["input[type=password]", "[data-private]"],
+  "personas": { "tester": { "name": "Test user", "viewport": "desktop" } },
+  "cells": [{ "persona": "tester", "screens": ["/dashboard"], "journeys": ["navigation", "profile-persistence"] }],
+  "journeys": {
+    "navigation": {
+      "title": "Open a menu and verify navigation",
+      "steps": [
+        { "goto": "/dashboard" },
+        { "expectVisible": { "role": "heading", "name": "Dashboard" } },
+        { "click": { "role": "button", "name": "Account" } },
+        { "expectVisible": { "role": "menuitem", "name": "Profile" } },
+        { "click": { "role": "menuitem", "name": "Profile" } },
+        { "expectURL": "/profile" },
+        { "expectVisible": { "label": "Display name" } }
+      ]
+    },
+    "profile-persistence": {
+      "title": "Save an approved test profile and verify persistence",
+      "steps": [
+        { "goto": "/profile" },
+        { "fill": { "label": "Display name", "value": "QA test user" } },
+        { "click": { "role": "button", "name": "Save" } },
+        { "expectText": "Profile saved" },
+        { "reload": true },
+        { "expectValue": { "label": "Display name", "value": "QA test user" } }
+      ]
+    }
+  }
+}
