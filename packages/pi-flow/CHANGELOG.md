@@ -1,5 +1,11 @@
 # pi-flow changelog
 
+## 1.5.2
+
+- Add optional fresh-context plan-review guidance: one read-only reviewer paraphrases consequential plans and reports up to three evidence-backed gaps before handoff.
+- Honor review opt-outs and explicit review requirements; report unavailable or failed delegation honestly and keep dispositions in the existing plan without automatic repeat rounds.
+- Document native Pi/Pi Web host limits and add prompt-contract regressions. Queue execution, worker backend settings and enforced handoff gates remain unchanged.
+
 ## 1.5.1
 
 - Support Pi Web 0.15.0 session-history results, including compaction, fresh-answer validation and nested subagent completion/abort checks; preserve native CLI workers.

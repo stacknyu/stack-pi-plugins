@@ -50,6 +50,8 @@ Reload Pi. This installs only pi-flow. pi-check is optional: install it separate
 
 **3. Answer its questions.** It asks them all here in one message, each with a recommended answer. Reply in plain words. It records the answers and updates the plan.
 
+Before handoff, the planner can use one fresh read-only reviewer for consequential plans or when you request a plan review. Routine changes skip it, and "skip plan review" opts out. Findings stay in the existing plan; missing reviewer support is reported honestly. This is guidance, not a new enforced gate; see [plan review and host limits](skills/pi-flow/references/guide.md#optional-fresh-context-plan-review).
+
 **4. It hands off by itself.** The planning agent calls `task_handoff`, which refuses until the plan is sound:
 - every question is answered
 - every item has an id, a "Done when" and `[areas: …]`

@@ -43,6 +43,14 @@ Large work (hours) fails in one long agent session: context fills up, the agent 
 5. **Automatic supervision.** Once the baseline passes, a detached supervisor creates a chat-only manager. Healthy 60-second ticks make no model calls. Bounded recovery and human-only blockers are defined in manager.md. `/task manage` and `/queue …` remain available for manual intervention.
 6. **Clean up.** Finished item sessions are removed when the run ends. `/task cleanup` removes failed items' sessions and the planning chat. `--all` also removes worktrees and `queue-failed/*` branches.
 
+## Optional fresh-context plan review
+
+Before handoff, the planner is instructed to use one fresh read-only reviewer for consequential plans (cross-component contracts, permissions, billing, migrations, destructive changes or architectural uncertainty), or when you ask. Routine localized work skips it; you can say "skip plan review". No new command is needed.
+
+The reviewer gets the written plan and selected code references, not the planning conversation. It first paraphrases the intended change and current behavior, then reports at most three consequential gaps with paths and rationale. No file edits, check runs, queue controls, extra agents, style nits or speculative features. The planner verifies findings, updates the existing plan, and asks you about any new decisions or safety trade-offs. A short status/disposition summary stays in `rules.md`; no extra report hierarchy or automatic repeat rounds.
+
+This is planner guidance, not an enforced `task_handoff` gate or a correctness guarantee. Both native Pi and Pi Web need an available fresh-context subagent tool to perform it; pi-flow does not install one. Missing or failed delegation is recorded as "not run" and reported to you, never passed off as an independent review. If you explicitly require a completed review before execution, the planner must ask before proceeding without it. Fresh conversation context does not imply exclusion of host instructions or filesystem sandboxing. Scope, size, checks and code review remain unchanged.
+
 ## Terminal app versus Pi Web
 
 Everything works in the plain terminal app. Pi Web is optional and found automatically.

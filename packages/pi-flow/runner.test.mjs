@@ -58,6 +58,22 @@ test("planner gets actual model capabilities, cost and upfront selection instruc
 	assert.match(prompt, /separate pi-check budget/);
 });
 
+test("planner requests bounded, optional fresh-context review before handoff", async (t) => {
+	const { planPrompt } = await import("./extension.ts");
+	const prompt = planPrompt(fixture(t), "sample", "change the billing contract");
+	const start = prompt.indexOf("## 4. Optional fresh-context plan review"), end = prompt.indexOf("## 5. Hand off");
+	assert.ok(start > prompt.indexOf("## 3. Ask") && end > start);
+	const review = prompt.slice(start, end);
+	for (const instruction of [
+		"Skip routine localized changes", "honor an explicit request to skip review", "one fresh read-only reviewer",
+		"not this conversation", "first paraphrase", "at most three consequential", "paths and concrete rationale",
+		'If unavailable or the reviewer fails, record "not run"', "Never present a same-conversation self-review as independent",
+		"not a handoff gate", "put proceeding without it in questions.md and ask; never bypass that requirement", "do not claim instruction-file or filesystem isolation", "not to edit files, run checks, commit, control the queue or spawn more agents",
+		"contest with evidence", "Put new user decisions in questions.md and ask before handoff", "do not silently accept a safety trade-off",
+		".tasks/sample/rules.md", "not a separate report hierarchy", "Do not start repeat review rounds unless the user asks", "Zero findings is acceptable, not proof of correctness",
+	]) assert.ok(review.includes(instruction), instruction);
+});
+
 test("handoff rejects unavailable models and unsupported effort before checks/commit", async (t) => {
 	const { handoff } = await import("./extension.ts");
 	const root = fixture(t), dir = join(root, ".tasks", "sample");

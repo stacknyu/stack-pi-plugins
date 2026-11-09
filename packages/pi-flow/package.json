@@ -1,6 +1,6 @@
 {
   "name": "@stacknyu/pi-flow",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "description": "Plan a large task, answer its questions, and let a queue of fresh Pi sessions build it \u2014 with verified checks, adaptive parallelism and session cleanup.",
   "type": "module",
   "license": "MIT",

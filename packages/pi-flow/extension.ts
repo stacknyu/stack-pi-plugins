@@ -265,7 +265,15 @@ The pi-flow skill's references/items.md explains the item format, tags and how t
 ## 3. Ask
 If questions.md has open questions, ask them all here in one message, numbered, each with your recommended answer, and wait. Then record each answer in questions.md ("- [x] Q1: … — Answer: …") and update the brief, maps and items to match. Do not hand off while a question is open.
 
-## 4. Hand off
+## 4. Optional fresh-context plan review
+- Use one review pass for cross-component contracts, permissions, billing, migrations, destructive changes or significant architectural uncertainty, or when the user asks. Skip routine localized changes and honor an explicit request to skip review.
+- Check for an available fresh-context subagent tool; do not assume a particular host or tool name. If unavailable or the reviewer fails, record "not run" and the reason in ${W}/rules.md and tell the user. Never present a same-conversation self-review as independent. Review availability alone is not a handoff gate. If the user explicitly requires a completed review before execution, put proceeding without it in questions.md and ask; never bypass that requirement.
+- Give one fresh read-only reviewer the files in ${W}/ and explicitly selected code references, not this conversation or a summary defending your design. Instruct it not to edit files, run checks, commit, control the queue or spawn more agents. Use read-only tool restrictions where the host supports them; do not claim instruction-file or filesystem isolation.
+- Ask it to first paraphrase the intended change and current behavior as described by the plan, then report at most three consequential missing requirements, contradictions, untested failure cases or simpler reuse opportunities. Require plan/code paths and concrete rationale; ignore style nits, speculative hardening and new features. Zero findings is acceptable, not proof of correctness.
+- Compare the paraphrase with the user's actual intent. Verify findings against the code and agreed requirements; fix valid gaps, contest with evidence or record an accepted risk. Put new user decisions in questions.md and ask before handoff; do not silently accept a safety trade-off. Only you update the existing planning files.
+- Keep a short review/disposition summary in ${W}/rules.md, not a separate report hierarchy. Do not start repeat review rounds unless the user asks. Review never replaces the scope/size/check gates or code review.
+
+## 5. Hand off
 When every file is written (in an earlier step, not in the same batch of tool calls), call the task_handoff tool on its own with slug "${slug}". It validates the plan, runs the checks once, commits ${W}/ and starts the queue. If it reports problems, fix them and call it again. Then tell the user in two lines what was queued.
 
 ## items.md format — one line per item
