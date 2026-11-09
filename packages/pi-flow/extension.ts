@@ -201,7 +201,7 @@ async function startRunner(cwd: string, resume = false): Promise<string> {
 	const logFile = join(cwd, DIR, "log.md");
 	const before = readText(logFile).length;
 	const out = openSync(join(cwd, DIR, "runner.out"), "a");
-	const child = spawn(LOGIN_SHELL, ["-lc", 'exec node "$0" "$1"', RUNNER, cwd], { cwd, detached: true, stdio: ["ignore", out, out] });
+	const child = spawn(LOGIN_SHELL, ["-lc", 'exec node "$0" "$@"', RUNNER, cwd, ...(resume ? ["--resume"] : [])], { cwd, detached: true, stdio: ["ignore", out, out] });
 	child.on("error", () => {});
 	child.unref();
 	closeSync(out);
@@ -258,7 +258,9 @@ The pi-flow skill's references/items.md explains the item format, tags and how t
   "allowedPaths": [the folders/files items may change, as narrow as the task allows; include docs folders if AGENTS.md requires doc updates],
   "checks": [commands that must pass after every item: prefer the verified ones above, covering every package the task touches; each must pass on the current code${checkBroker({}) ? `. pi-check is installed: the single entry "pi-check" runs the tests, type checks and lint each item affects in every Go/TypeScript/Python project and ignores failures that already exist on the base branch; prefer ["pi-check"] plus any check it cannot cover (custom scripts)` : ""}],
   "parallel": <how many agent items may run at once, judged from independence and the user's preference; expensive checks have a separate pi-check budget>,
-  "model": <optional default exact provider/id from the catalog>, "thinking": <optional supported default level>
+  "model": <optional default exact provider/id from the catalog>, "thinking": <optional supported default level>,
+  "recovery": {"maxAttempts": 2, "maxRepairs": 4, "maxRestarts": 2}
+- Agree recovery authority upfront in rules.md/questions.md: retries per failed item, total narrowly scoped repair items, and clean runner restarts. The recommended recovery budget above needs no further approval during execution; set individual budgets to 0 to prohibit them. Handoff accepts maximums of 5 attempts, 20 repair items and 5 restarts. Repairs inherit the failed item's paths, checks, model and limits; no new goals, credentials, destructive recovery or safety bypass. Resolve required environment access and decisions before launch. Unrepairable work is recorded as failed while independent work continues.
 - Choose [model: provider/id] and [thinking: level] for each item during planning. Use the least costly model/effort you judge sufficient, not automatically the cheapest: routine localized edits may need less; cross-cutting design, authority/security, migrations and final verification need stronger reasoning. Honor the user's model preferences. Record a short rationale per class of items in rules.md. Do not claim an objectively perfect model or infer speed from price. With no catalog, inherit defaults rather than guess.
 - Decide size-escalation/splitting policy upfront in rules.md; automatic increases never override explicit repository/task prohibitions. Resolve approval questions now, not during unattended work.
 
@@ -333,6 +335,10 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 	for (const f of ["brief.md", "rules.md", "questions.md"]) if (!existsSync(join(cwd, W, f))) problems.push(`${W}/${f} is missing.`);
 	const allowed: string[] = Array.isArray(task.allowedPaths) ? task.allowedPaths.filter((p: any) => typeof p === "string" && p.trim()) : [];
 	if (allowed.length === 0) problems.push(`task.json has no "allowedPaths".`);
+	if (task.recovery !== undefined) {
+		const caps = { maxAttempts: 5, maxRepairs: 20, maxRestarts: 5 };
+		if (!task.recovery || typeof task.recovery !== "object" || Array.isArray(task.recovery) || Object.keys(task.recovery).some((k) => !(k in caps)) || Object.entries(caps).some(([k, cap]) => !Number.isInteger(task.recovery[k]) || task.recovery[k] < 0 || task.recovery[k] > cap)) problems.push("task.json recovery must specify maxAttempts (0–5), maxRepairs (0–20), maxRestarts (0–5).");
+	}
 	const outside = (items as any[]).filter((i) => i.areas?.length && !i.areas.every((a: string) => allowed.some((p) => areasOverlap([a], [p]) && a.startsWith(p.split("*")[0].replace(/\/+$/, "")))));
 	if (outside.length) warnings.push(`${outside.length} item(s) list areas outside allowedPaths (${outside.slice(0, 4).map((i) => i.id).join(", ")}); their changes there will be rejected.`);
 	if (problems.length) return { ok: false, text: `Not handed off yet. Fix these and call task_handoff again:\n- ${problems.join("\n- ")}` };
@@ -402,6 +408,7 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 		checks,
 		model: defaults.model,
 		thinking: defaults.thinking,
+		recovery: task.recovery, // authority belongs to this plan, never inherited from the previous task
 		parallel,
 		worktrees: parallel > 1 ? true : existing.worktrees ?? DEFAULTS.worktrees,
 		setup: info?.install ?? existing.setup ?? "",
@@ -419,7 +426,7 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 	}
 	return {
 		ok: true,
-		text: `Queued ${items.length} items for task ${slug} (up to ${parallel} in parallel, adaptive). Checks: ${checks.join(" · ")}.${warnings.length ? `\nWarnings: ${warnings.join(" ")}` : ""}\nThe live panel below shows progress; /task status for a summary.`,
+		text: `Queued ${items.length} items for task ${slug} (up to ${parallel} coding and ${parallel} verifying in worktree mode). Checks: ${checks.join(" · ")}.${warnings.length ? `\nWarnings: ${warnings.join(" ")}` : ""}\nThe live panel below shows progress; /task status for a summary.`,
 	};
 }
 

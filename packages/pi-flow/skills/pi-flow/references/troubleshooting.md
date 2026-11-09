@@ -18,9 +18,9 @@ The checks fail on today's code, so every item would fail. `/queue problem` show
 
 **A check fails with "no changes were made".** Only in old plans without `[check]`. Tag verification items `[check]` and they pass when nothing needs changing.
 
-**Parked items run one at a time at the end.** Parked items (after a conflict or a deferral) wait for quiet so they don't conflict again. To speed up: `unpark`, or `next <ids>`.
+**Parked items run one at a time.** Disjoint parked items now run concurrently. Check `[areas]` overlap and real dependencies; `unpark` or `next <ids>` raises priority but never bypasses those constraints. Old running processes need to finish before upgrading.
 
-**The run stopped with "5 failures in a row".** That's the safety stop. The automatic manager may diagnose it and propose bounded retries within the approved task; unresolved blockers or exhausted budgets remain stopped. Read the reasons, address the cause, then explicitly `retry` and `start`. Manual stops do not count as real failures.
+**The run stopped with "5 failures in a row".** Existing configs may explicitly retain `stopAfterFailuresInARow: 5`. New defaults use 0: an isolated failure no longer stops unrelated work. Choose 0 before the next launch to disable the global halt, or keep a positive count as a deliberate safety limit. The automatic manager may recover within the approved budgets; manual stops are never overridden.
 
 **You continued a failed item by hand and another item clashed with it.** When an item fails, its worktree goes to the next item. Don't keep working in a failed item's session; `retry` it, or raise its limits through the queue.
 

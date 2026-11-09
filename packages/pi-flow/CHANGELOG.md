@@ -1,5 +1,13 @@
 # pi-flow changelog
 
+## 1.6.0
+
+- Separate bounded coding and verification capacity in worktree mode so independent implementation continues during checks; retain verified dependency gates and worktree/area ownership. Direct-repo mode stays serial.
+- Run disjoint parked work concurrently, stop shrinking global width after a local conflict, and disable the global consecutive-failure halt by default (explicit positive limits remain supported).
+- Wake the automatic manager on live failure/lifecycle events, retain incidents during reviews, and use a 60-second watchdog fallback without healthy model calls. Recovery keeps persistent budgets and respects manual stop/pause and uncertain worker ownership.
+- Add upfront, task-specific recovery authority for targeted repair items. Repairs inherit the failed item's checks, model and limits and are restricted to its areas; legacy plans retain retry/restart-only authority.
+- Add actual-runner overlap, phase-bound, conflict, blocker, quarantine and supervised-recovery regressions. No per-item reviewer or new runtime dependency.
+
 ## 1.5.2
 
 - Add optional fresh-context plan-review guidance: one read-only reviewer paraphrases consequential plans and reports up to three evidence-backed gaps before handoff.

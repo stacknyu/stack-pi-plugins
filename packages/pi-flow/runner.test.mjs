@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULTS, parseQueue, itemConfig, piTurn, webTurn, applyControl, checksText, checkLine, dependencyGraph, orderQueue, areasOverlap, webClient, deleteSessions } from "./runner.mjs";
+import { DEFAULTS, parseQueue, itemConfig, piTurn, webTurn, applyControl, checksText, checkLine, dependencyGraph, orderQueue, areasOverlap, webClient, deleteSessions, main, loadJson, saveJson, notifyRunner, allItems, validateRecovery } from "./runner.mjs";
 
 const item = (tags = "") => parseQueue(`- [ ] A01 — Edit one file. Done when: tested. [areas: src/a] ${tags}`)[0];
 const model = { provider: "example", id: "small", reasoning: false, cost: { input: 1, output: 2 } };
@@ -56,6 +57,8 @@ test("planner gets actual model capabilities, cost and upfront selection instruc
 	assert.match(prompt, /Choose \[model: provider\/id\] and \[thinking: level\] for each item during planning/);
 	assert.match(prompt, /rules.md/);
 	assert.match(prompt, /separate pi-check budget/);
+	assert.match(prompt, /Agree recovery authority upfront/);
+	assert.match(prompt, /set individual budgets to 0 to prohibit them/);
 });
 
 test("planner requests bounded, optional fresh-context review before handoff", async (t) => {
@@ -86,6 +89,15 @@ test("handoff rejects unavailable models and unsupported effort before checks/co
 		const result = await handoff(root, "sample", ctx);
 		assert.equal(result.ok, false);
 		assert.match(result.text, error);
+		assert.doesNotMatch(result.text, /checks fail/);
+	}
+	writeFileSync(join(dir, "items.md"), `- [ ] ${item().line}`);
+	for (const invalid of [{ maxAttempts: 6 }, { maxRepairs: -1 }, { maxRestarts: 1.5 }, { unexpected: 1 }]) {
+		const recovery = { maxAttempts: 2, maxRepairs: 4, maxRestarts: 2, ...invalid };
+		writeFileSync(join(dir, "task.json"), JSON.stringify({ allowedPaths: ["src/"], checks: ["must-not-run"], model: "example/small", thinking: "off", recovery }));
+		const result = await handoff(root, "sample", ctx);
+		assert.equal(result.ok, false);
+		assert.match(result.text, /recovery/i);
 		assert.doesNotMatch(result.text, /checks fail/);
 	}
 });
@@ -263,4 +275,319 @@ test("CLI errors do not pass and a completed provider retry clears an earlier er
 		const result = await piTurn({ repo: root, c: DEFAULTS, pi: fake, env: process.env, stopRequested: () => false, manager: true }, root, "test", "manager", "hello", 1);
 		assert.equal(result.status, recovery ? "ok" : "error");
 	}
+});
+
+test("automatic repairs inherit the parent contract and reopen dependent work only after repair completion", () => {
+	const queue = "- [ ] A01 — Build feature. Done when: works. [areas: src/a] [model: example/small] [thinking: off] [files=2 lines=30 min=10]\n- [ ] B01 — Use feature. Done when: works. [areas: src/b] [after: A01]";
+	const items = allItems(queue, {}), parent = items[0];
+	const state = { done: {}, failed: { [parent.key]: "checks failed", [items[1].key]: "depends on A01, which failed" } };
+	const c = { ...DEFAULTS, allowedPaths: ["src"], checks: ["baseline"], itemChecks: { A01: ["focused"] }, recovery: { maxAttempts: 2, maxRepairs: 4, maxRestarts: 2 } };
+	const proposal = { action: "repair", ids: ["A01"], reason: "Fix the reported parser assertion", lines: ["Fix parser. Done when: focused assertion passes. [areas: src/a/parser.ts]"] };
+	const action = validateRecovery(proposal, state, items, {}, c);
+	applyControl(state, items, action);
+	const [repair, original, dependent] = allItems(queue, state);
+	assert.equal(repair.id, "A01-repair1");
+	assert.deepEqual(original.after, [repair.id]);
+	assert.deepEqual(dependent.after, ["A01"]);
+	assert.deepEqual(state.failed, {});
+	const selected = itemConfig(c, repair);
+	assert.deepEqual(selected.checks, ["baseline", "focused"]);
+	assert.deepEqual(selected.allowedPaths, ["src/a/parser.ts"]);
+	assert.equal(selected.model, "example/small");
+	assert.equal(selected.thinking, "off");
+	assert.equal(selected.maxNetLines, 30);
+	assert.equal(selected.maxFilesGrowing, 2);
+	assert.equal(selected.itemMinutes, 10);
+	assert.doesNotThrow(() => dependencyGraph([repair, original, dependent]));
+	state.failed[repair.key] = "checks failed";
+	assert.throws(() => validateRecovery({ ...proposal, ids: [repair.id] }, state, [repair, original, dependent], {}, c), /authority/);
+});
+
+test("automatic recovery rejects unapproved repairs, scope escape, overrides, ownership and exhausted budgets", () => {
+	const items = [item()], parent = items[0];
+	const state = { failed: { [parent.key]: "check failed" } };
+	const c = { ...DEFAULTS, allowedPaths: ["src"], recovery: { maxAttempts: 2, maxRepairs: 4, maxRestarts: 2 } };
+	const proposal = { action: "repair", ids: [parent.id], reason: "Repair assertion", lines: ["Fix parser. Done when: assertion passes. [areas: src/a/parser.ts]"] };
+	assert.throws(() => validateRecovery(proposal, state, items, {}, { ...c, recovery: undefined }), /authority/);
+	assert.throws(() => validateRecovery(proposal, state, items, { repairs: 4 }, c), /budget/);
+	assert.throws(() => validateRecovery(proposal, { failed: { [parent.key]: "depends on A01-repair1, which failed" } }, items, {}, c), /prerequisite/);
+	assert.throws(() => validateRecovery(proposal, state, items, { attempts: { A01: 2 } }, c), /budget/);
+	for (const line of [
+		"Fix unrelated. Done when: passes. [areas: src/b]",
+		"Escape. Done when: passes. [areas: src/a/../../private]",
+		"Widen. Done when: passes. [areas: src/a/*]",
+		"Change model. Done when: passes. [areas: src/a] [model: example/large]",
+		"Change budget. Done when: passes. [areas: src/a] [big]",
+		"Cycle. Done when: passes. [areas: src/a] [after: A01]",
+		"No acceptance. [areas: src/a]",
+		"Two lines. Done when: passes. [areas: src/a]\n- [ ] B01 injected",
+	]) assert.throws(() => validateRecovery({ ...proposal, lines: [line] }, state, items, {}, c), line);
+	assert.throws(() => validateRecovery(proposal, state, items, {}, { ...c, allowedPaths: ["other"] }), /scope/);
+	for (const running of [{ 0: { id: "A01" } }, { 0: { key: parent.key, quarantined: true } }, { 0: {} }]) assert.throws(() => validateRecovery(proposal, { ...state, running }, items, {}, c), /owns/);
+	assert.doesNotThrow(() => validateRecovery(proposal, { ...state, running: { 0: { id: "B01" } } }, items, {}, c));
+	for (const failure of ["BLOCKED: missing credentials", "outside allowed scope", "runner error: uncertain worker", "permission denied"]) assert.throws(() => validateRecovery(proposal, { failed: { [parent.key]: failure } }, items, {}, c), /human attention/);
+});
+
+test("retry reopens transitive scheduler dependency failures without clearing independent real failures", () => {
+	const items = parseQueue("- [ ] A01 root\n- [ ] B01 child [after: A01]\n- [ ] C01 leaf [after: B01]\n- [ ] D01 independent");
+	const state = { done: {}, failed: Object.fromEntries(items.map((i, n) => [i.key, ["check failed", "depends on A01, which failed", "depends on B01, which failed", "check failed"][n]])) };
+	applyControl(state, items, { action: "retry", ids: ["A01"], by: "auto" });
+	assert.deepEqual(state.failed, { [items[3].key]: "check failed" });
+});
+
+// Exercise the real scheduler, worktrees, commits, checks and integration. Barriers live outside
+// the repository so they cannot affect scope or cleanliness. No model or broker is required.
+function schedulerFixture(t, specs, config = {}, seed = {}) {
+	const home = realpathSync(mkdtempSync(join(tmpdir(), "pi-flow-schedule-"))), repo = join(home, "repo");
+	mkdirSync(repo);
+	const git = (...args) => execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: "pipe" });
+	git("init", "-b", "main"); git("config", "user.name", "Test"); git("config", "user.email", "test@example.invalid");
+	mkdirSync(join(repo, ".pi-queue"));
+	mkdirSync(join(repo, ".tasks", "sample"), { recursive: true });
+	mkdirSync(join(repo, "out"));
+	writeFileSync(join(repo, "out", "shared.txt"), "initial\n");
+	writeFileSync(join(repo, ".gitignore"), ".pi-queue/\n");
+	const items = parseQueue(specs.map((s) => `- [ ] ${s.id} — ${s.id}. Done when: verified. [areas: ${s.area || `out/${s.id}.txt`}] ${s.check ? "[check]" : ""} ${s.after ? `[after: ${s.after}]` : ""}`).join("\n"));
+	writeFileSync(join(repo, ".tasks/sample/items.md"), items.map((i) => `- [ ] ${i.line}`).join("\n"));
+	const common = `const fs=require('fs'),path=require('path'),home=${JSON.stringify(home)},specs=${JSON.stringify(specs)};
+const file=(name)=>path.join(home,name), read=(name)=>fs.existsSync(file(name))?fs.readFileSync(file(name),'utf8'):'';
+const count=(key)=>{const n=Number(read(key)||0)+1;fs.writeFileSync(file(key),String(n));return n;};
+const event=(kind,id,n,phase)=>fs.appendFileSync(file('events'),JSON.stringify({kind,id,n,phase})+'\\n');
+async function barrier(key,hold){const until=Date.now()+20000;while(hold&&!fs.existsSync(file(key))&&!fs.existsSync(file('release-all'))){if(Date.now()>until)throw Error('barrier timed out: '+key);await new Promise(r=>setTimeout(r,10));}}
+`;
+	const worker = join(home, "worker.cjs"), check = join(home, "check.cjs");
+	writeFileSync(worker, `#!/usr/bin/env node\n${common}
+(async()=>{const id=process.argv[process.argv.indexOf('-n')+1].match(/queue (\\S+):/)[1],s=specs.find(s=>s.id===id),n=count('worker-'+id),phase=s.check&&n===1?'verification':'coding';
+fs.writeFileSync(file(path.basename(process.cwd())+'.owner'),id);event('start',id,n,phase);
+if(s.requires&&!fs.existsSync(s.requires))throw Error('dependency not integrated: '+s.requires);
+if(n>1&&s.requiresAfterFirst&&!fs.existsSync(s.requiresAfterFirst))throw Error('deferred work retried before integration');
+if(!s.check&&/Before you stop, run:|Run the checks, then reply DONE/.test(process.argv.at(-1)))throw Error('mandatory verification leaked into coding prompt');
+await barrier('worker-'+id+'-'+n,s.holdWorker===true||(s.holdWorker||[]).includes(n));
+const reply=(s.replies||[])[n-1]||'DONE';
+if(!s.check&&!s.noChange&&!/BLOCKED|ERROR/.test(reply)){fs.mkdirSync('out',{recursive:true});fs.writeFileSync(s.path||'out/'+id+'.txt',id+' turn '+n+'\\n');}
+event('end',id,n,phase);console.log(JSON.stringify({type:'message_end',message:{role:'assistant',stopReason:reply==='ERROR'?'error':'stop',content:[{type:'text',text:reply}]}}));
+})().catch(e=>{console.error(e);process.exitCode=1});\n`, { mode: 0o755 });
+	writeFileSync(check, `${common}
+(async()=>{const id=read(path.basename(process.cwd())+'.owner');if(!id)return;
+const s=specs.find(s=>s.id===id),n=count('check-'+id);event('start',id,n,'check');
+await barrier('check-'+id+'-'+n,s.holdCheck===true||(s.holdCheck||[]).includes(n));
+event('end',id,n,'check');if((s.failChecks||[]).includes(n))process.exitCode=1;
+})().catch(e=>{console.error(e);process.exitCode=1});\n`);
+	const c = { ...DEFAULTS, queue: ".tasks/sample/items.md", task: "sample", allowedPaths: ["out"], checks: [`"${process.execPath}" "${check}"`], checkBroker: false, piCommand: worker, runIn: "cli", parallel: 2, setup: "", autoSplit: false, deferBlocked: true, fixRounds: 0, deleteSessions: false, ...config };
+	saveJson(join(repo, ".pi-queue/config.json"), c);
+	if (Object.keys(seed).length) saveJson(join(repo, ".pi-queue/state.json"), Object.fromEntries(Object.entries(seed).map(([key, ids]) => [key, Object.fromEntries(items.filter((i) => ids.includes(i.id)).map((i) => [i.key, true]))])));
+	git("add", "."); git("commit", "-m", "fixture");
+	let running;
+	const release = (key = "release-all") => writeFileSync(join(home, key), "");
+	const events = () => (existsSync(join(home, "events")) ? readFileSync(join(home, "events"), "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : []);
+	const state = () => loadJson(join(repo, ".pi-queue/state.json"), {});
+	const seen = (id, phase, n = 1) => events().some((e) => e.kind === "start" && e.id === id && e.phase === phase && e.n === n);
+	const wait = async (predicate) => {
+		const until = Date.now() + 15000;
+		while (!predicate()) {
+			if (Date.now() > until) assert.fail(`scheduler barrier timed out\n${JSON.stringify(state())}\n${JSON.stringify(events())}`);
+			await new Promise((r) => setTimeout(r, 10));
+		}
+	};
+	t.after(async () => {
+		release();
+		if (running) { writeFileSync(join(repo, ".pi-queue/STOP"), ""); await running; }
+		rmSync(home, { recursive: true, force: true });
+	});
+	return { repo, items, git, state, events, seen, wait, release, start: () => running = main(repo) };
+}
+
+function assertPhaseBounds(events, parallel) {
+	const active = { coding: 0, verification: 0 };
+	for (const e of events) {
+		const phase = e.phase === "check" ? "verification" : e.phase;
+		active[phase] += e.kind === "start" ? 1 : -1;
+		assert.ok(active[phase] >= 0 && active[phase] <= parallel, `${phase} exceeded ${parallel}: ${JSON.stringify(e)}`);
+	}
+	assert.deepEqual(active, { coding: 0, verification: 0 });
+}
+
+test("runner overlaps fresh coding with verification, retaining areas and verified dependency gates", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [
+		{ id: "A01", holdCheck: [1] }, { id: "B01", holdCheck: [1] },
+		{ id: "C01", holdWorker: true }, { id: "D01", holdWorker: true },
+		{ id: "E01", after: "A01", requires: "out/A01.txt" }, { id: "F01", area: "out/A01.txt" },
+	]);
+	const done = f.start();
+	await f.wait(() => f.seen("A01", "check") && f.seen("B01", "check") && f.seen("C01", "coding") && f.seen("D01", "coding"));
+	assert.equal(f.seen("E01", "coding"), false);
+	assert.equal(f.seen("F01", "coding"), false);
+	assert.equal(Object.keys(f.state().done).length, 0);
+	assert.equal(Object.keys(f.state().running).length, 4);
+	f.release(); await done;
+	assert.equal(Object.keys(f.state().done).length, 6);
+	assertPhaseBounds(f.events(), 2);
+	assert.equal(f.git("status", "--porcelain"), "");
+});
+
+test("check items have independent bounded verification capacity and repo-only mode stays serialized", { timeout: 30000 }, async (t) => {
+	for (const worktrees of [true, false]) {
+		const f = schedulerFixture(t, [{ id: "V01", check: true, holdWorker: true }, { id: "V02", check: true }, { id: "A01", holdWorker: true }], { parallel: 1, worktrees });
+		const done = f.start();
+		await f.wait(() => f.seen("V01", "verification"));
+		if (worktrees) await f.wait(() => f.seen("A01", "coding"));
+		assert.equal(f.seen("V02", "verification"), false);
+		if (!worktrees) assert.equal(f.seen("A01", "coding"), false);
+		f.release(); await done;
+		assert.equal(Object.keys(f.state().done).length, 3);
+		assertPhaseBounds(f.events(), 1);
+		if (!worktrees) {
+			let active = 0;
+			for (const e of f.events()) { active += e.kind === "start" ? 1 : -1; assert.ok(active <= 1); }
+		}
+	}
+});
+
+test("fixes release verification before reacquiring coding; waiting checks cannot deadlock", { timeout: 30000 }, async (t) => {
+	for (const check of [false, true]) {
+		const f = schedulerFixture(t, [{ id: "A01", check, holdCheck: [1], failChecks: [1] }, { id: "B01", holdWorker: [1] }], { parallel: 1, fixRounds: 1 });
+		const done = f.start();
+		await f.wait(() => f.seen("A01", "check") && f.seen("B01", "coding"));
+		f.release("check-A01-1");
+		await f.wait(() => Object.values(f.state().running).some((r) => r.id === "A01" && r.phase === "waiting-coding"));
+		assert.equal(f.seen("A01", "coding", 2), false);
+		f.release(); await done;
+		assert.equal(Object.keys(f.state().done).length, 2);
+		assert.equal(f.seen("A01", "coding", 2), true);
+		assertPhaseBounds(f.events(), 1);
+	}
+});
+
+test("disjoint parked items overlap while blocked and failed dependencies leave safe work runnable", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [
+		{ id: "A01", replies: ["BLOCKED: unavailable", "BLOCKED: unavailable"] },
+		{ id: "B01", after: "A01" }, { id: "C01" },
+		{ id: "P01", holdWorker: true }, { id: "P02", holdWorker: true },
+	], {}, { retried: ["P01", "P02"] });
+	const done = f.start();
+	await f.wait(() => f.seen("P01", "coding") && f.seen("P02", "coding"));
+	assert.equal(f.seen("C01", "coding"), true, "fresh work has priority over parked work");
+	f.release(); await done;
+	assert.equal(Object.keys(f.state().done).length, 3);
+	assert.equal(Object.keys(f.state().failed).length, 2);
+	assert.equal(f.seen("B01", "coding"), false);
+	assertPhaseBounds(f.events(), 2);
+});
+
+test("deferred retry waits for first-pass work, without waiting on its own dependents", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [
+		{ id: "A01", replies: ["BLOCKED: waiting for B01", "DONE"], requiresAfterFirst: "out/B01.txt" },
+		{ id: "B01", holdWorker: true }, { id: "C01", after: "A01" },
+	]);
+	const done = f.start();
+	await f.wait(() => f.seen("B01", "coding") && Object.keys(f.state().deferred ?? {}).length === 1);
+	assert.equal(f.seen("A01", "coding", 2), false);
+	f.release(); await done;
+	assert.equal(Object.keys(f.state().done).length, 3);
+	assert.equal(Object.keys(f.state().failed).length, 0);
+});
+
+test("a verified repair may fully satisfy its parent without a fabricated extra edit", { timeout: 30000 }, async (t) => {
+	for (const repaired of [false, true]) {
+		const f = schedulerFixture(t, [{ id: "A01", noChange: true, requires: "out/A01.txt" }]);
+		writeFileSync(join(f.repo, "out/A01.txt"), "already implemented\n");
+		f.git("add", "out"); f.git("commit", "-m", "verified repair");
+		if (repaired) {
+			const line = "- [ ] A01-repair1 — Repair. Done when: correct. [areas: out/A01.txt]", repair = parseQueue(line)[0];
+			saveJson(join(f.repo, ".pi-queue/state.json"), { done: { [repair.key]: "verified" }, fixes: { [f.items[0].key]: [line] }, waitFor: { [f.items[0].key]: [repair.id] } });
+		}
+		await f.start();
+		assert.equal(!!f.state().done[f.items[0].key], repaired);
+		assert.equal(f.seen("A01", "check"), repaired, "no-op acceptance still runs all checks");
+		if (!repaired) assert.match(f.state().failed[f.items[0].key], /no changes/);
+	}
+});
+
+test("raised coding limits still leave mandatory checks to the verification phase", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "A01", replies: ["NEEDS: 2 files, 200 lines", "DONE"] }]);
+	await f.start();
+	assert.equal(Object.keys(f.state().done).length, 1);
+	assert.equal(f.seen("A01", "coding", 2), true);
+	assert.equal(f.events().filter((e) => e.kind === "start" && e.phase === "check").length, 1);
+});
+
+test("conflict redo reacquires coding without shrinking width or blocking independent work", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [
+		{ id: "A01", path: "out/shared.txt", holdCheck: [1] },
+		{ id: "B01", path: "out/shared.txt", holdWorker: [1] }, { id: "C01", holdWorker: [1] },
+	]);
+	const done = f.start();
+	await f.wait(() => f.seen("A01", "check") && f.seen("B01", "coding") && f.seen("C01", "coding"));
+	f.release("check-A01-1");
+	await f.wait(() => Object.keys(f.state().done).length === 1);
+	f.release("worker-B01-1");
+	await f.wait(() => f.seen("B01", "coding", 2));
+	assert.equal(f.state().width, 2);
+	assert.equal(Object.values(f.state().running).some((r) => r.id === "C01"), true);
+	f.release(); await done;
+	assert.equal(Object.keys(f.state().done).length, 3);
+	assert.match(f.git("branch", "--list", "queue-failed/*"), /redo/);
+	assertPhaseBounds(f.events(), 2);
+});
+
+test("default failures isolate safe work; explicit finite limit halts fresh dispatch", { timeout: 30000 }, async (t) => {
+	for (const limit of [0, 1]) {
+		const failures = Array.from({ length: 6 }, (_, i) => ({ id: `A0${i + 1}`, replies: ["ERROR"] }));
+		const f = schedulerFixture(t, [...failures, { id: "B01" }], { parallel: 1, worktrees: false, ...(limit ? { stopAfterFailuresInARow: limit } : {}) });
+		await f.start();
+		assert.equal(f.seen("B01", "coding"), limit === 0);
+		assert.equal(Object.keys(f.state().failed).length, limit || 6);
+	}
+});
+
+test("stop cancels capacity waiters without integrating or counting failures", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "A01", holdCheck: [1], failChecks: [1] }, { id: "B01", holdWorker: [1] }, { id: "C01" }], { parallel: 1, fixRounds: 1 });
+	const done = f.start();
+	await f.wait(() => f.seen("A01", "check") && f.seen("B01", "coding"));
+	f.release("check-A01-1");
+	await f.wait(() => Object.values(f.state().running).some((r) => r.phase === "waiting-coding"));
+	writeFileSync(join(f.repo, ".pi-queue/STOP"), "");
+	f.release(); await done;
+	assert.equal(f.seen("A01", "coding", 2), false);
+	assert.equal(f.seen("C01", "coding"), false);
+	assert.equal(Object.keys(f.state().done).length, 0);
+	assert.equal(Object.keys(f.state().running).length, 0);
+	assert.equal(f.state().failureStreak, 0);
+	assert.match(f.git("branch", "--list", "queue-failed/*"), /A01/);
+});
+
+test("quarantine retains ownership and capacity while disjoint deferred work finishes", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "A01" }, { id: "B01", area: "out/A01.txt" }, { id: "C01" }], {}, { deferred: ["C01"] });
+	saveJson(join(f.repo, ".tasks/sample/task.json"), { itemChecks: { B01: [], C01: [] } });
+	f.git("add", ".tasks"); f.git("commit", "-m", "missing A01 check selection");
+	await f.start();
+	assert.equal(Object.values(f.state().running).filter((r) => r.quarantined).length, 1);
+	assert.equal(f.seen("B01", "coding"), false);
+	assert.equal(f.seen("C01", "coding"), true);
+	assert.equal(Object.keys(f.state().done).length, 1);
+	assert.match(f.state().phase, /quarantined/);
+});
+
+test("quarantined coding capacity cannot strand a check waiting to fix", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "A01" }, { id: "V01", check: true, failChecks: [1] }], { parallel: 1, fixRounds: 1 });
+	saveJson(join(f.repo, ".tasks/sample/task.json"), { itemChecks: { V01: [] } });
+	f.git("add", ".tasks"); f.git("commit", "-m", "quarantine fixture");
+	await f.start();
+	assert.equal(f.seen("V01", "verification"), true);
+	assert.equal(f.seen("V01", "coding", 2), false);
+	assert.equal(Object.values(f.state().running).filter((r) => r.quarantined).length, 2);
+	assert.ok(Object.values(f.state().failed).some((reason) => /coding capacity quarantined/.test(reason)));
+});
+
+test("runner IPC remains best-effort when disconnected or the channel fails", (t) => {
+	const connected = Object.getOwnPropertyDescriptor(process, "connected"), send = Object.getOwnPropertyDescriptor(process, "send");
+	t.after(() => { for (const [key, descriptor] of [["connected", connected], ["send", send]]) { if (descriptor) Object.defineProperty(process, key, descriptor); else delete process[key]; } });
+	Object.defineProperty(process, "connected", { configurable: true, value: true });
+	Object.defineProperty(process, "send", { configurable: true, value: () => { throw Error("closed"); } });
+	assert.doesNotThrow(() => notifyRunner("failure"));
+	Object.defineProperty(process, "send", { configurable: true, value: (_message, callback) => callback(Error("closed asynchronously")) });
+	assert.doesNotThrow(() => notifyRunner("completion"));
+	Object.defineProperty(process, "connected", { configurable: true, value: false });
+	Object.defineProperty(process, "send", { configurable: true, value: () => assert.fail("disconnected send") });
+	notifyRunner("quarantine");
 });

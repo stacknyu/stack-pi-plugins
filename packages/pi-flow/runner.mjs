@@ -10,7 +10,7 @@ import { spawn, execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, appendFileSync, rmSync, cpSync, openSync, closeSync, renameSync, lstatSync, readlinkSync, realpathSync, symlinkSync } from "node:fs";
 import { join, isAbsolute, basename, dirname, posix } from "node:path";
 import { homedir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export const DIR = ".pi-queue";
 
@@ -21,10 +21,10 @@ export const DEFAULTS = {
 	checks: [], // commands that must pass after every item (verified by /task setup and the handoff)
 	readFirst: "AGENTS.md",
 
-	// Parallelism. Each running item gets its own git worktree under .pi-queue/worktrees.
-	// The runner adapts the width between parallelMin and parallel: one step down after a conflict,
-	// one step up after 3 clean passes in a row. Items whose [areas: …] overlap never run at the same time,
-	// and an item waits for the items named in its [after: …] tag.
+	// Coding and verification each have independent capacity, bounded by parallel.
+	// Up to 2 * parallel worktrees retain ownership through verification/integration.
+	// Conflicts never narrow global capacity. Overlapping [areas] and unverified [after]
+	// prerequisites still prevent dispatch; worktrees:false serializes the whole pipeline.
 	worktrees: true,
 	parallel: 4,
 	parallelMin: 1,
@@ -54,7 +54,7 @@ export const DEFAULTS = {
 	recheck: true, // a passed [check] item runs again when an item it covers ([areas] overlap or [after]) changes later
 	fixRounds: 1,
 	checkMinutes: 15,
-	stopAfterFailuresInARow: 5,
+	stopAfterFailuresInARow: 0, // disabled by default; positive finite values opt into a global safety halt
 
 	// Sessions
 	model: "", // empty: Pi's default model; or "provider/model-id"
@@ -93,6 +93,12 @@ export function cleanEnv() {
 	return env;
 }
 export const git = (cwd, ...args) => run(cwd, "git", args);
+// IPC is a wake-up hint, never the source of truth. A supervisor may disconnect at any time.
+export function notifyRunner(type, detail = {}) {
+	try {
+		if (process.connected && typeof process.send === "function") process.send({ ...detail, type }, () => {});
+	} catch {}
+}
 export const firstLine = (s) => String(s ?? "").split("\n")[0];
 export const tail = (s, n) => String(s ?? "").split("\n").slice(-n).join("\n");
 
@@ -100,7 +106,7 @@ export const tail = (s, n) => String(s ?? "").split("\n").slice(-n).join("\n");
 export function allItems(queueText, state) {
 	const out = [];
 	const push = (it) => {
-		for (const line of state.fixes?.[it.key] ?? []) out.push(...parseQueue(line).map((f) => ({ ...f, child: true, fix: true })));
+		for (const line of state.fixes?.[it.key] ?? []) out.push(...parseQueue(line).map((f) => ({ ...f, child: true, fix: true, ...(f.id.startsWith(`${it.id}-repair`) ? { repairParent: it, after: it.after } : {}) })));
 		const wait = state.waitFor?.[it.key];
 		out.push(wait ? { ...it, after: [...new Set([...(it.after ?? []), ...wait])] } : it);
 	};
@@ -114,6 +120,50 @@ export function allItems(queueText, state) {
 	return out;
 }
 
+export function approvedTask(repo, c) {
+	if (!c.task || basename(c.task) !== c.task || [".", ".."].includes(c.task)) return undefined;
+	const folder = join(repo, ".tasks", c.task);
+	const task = loadJson(join(folder, "task.json"), {});
+	const files = ["task.json", "brief.md", "rules.md", "questions.md", "items.md"];
+	if (task.status !== "queued" || !task.queuedAt || files.some((f) => !existsSync(join(folder, f)))) return undefined;
+	const text = (file) => { try { return readFileSync(join(folder, file), "utf8"); } catch { return ""; } };
+	if (/^\s*-\s\[\s\]/m.test(text("questions.md"))) return undefined;
+	if (JSON.stringify(task.allowedPaths) !== JSON.stringify(c.allowedPaths) || JSON.stringify(task.checks) !== JSON.stringify(c.checks)) return undefined;
+	if (c.queue !== `.tasks/${c.task}/items.md`) return undefined;
+	if ((task.recovery !== undefined || c.recovery !== undefined) && JSON.stringify(task.recovery) !== JSON.stringify(c.recovery)) return undefined;
+	return createHash("sha256").update(JSON.stringify([files.map(text), c])).digest("hex");
+}
+
+/** Bound automatic work to a failed target and its startup-approved authority. */
+export function validateRecovery(proposal, state, items, manager = {}, c = {}) {
+	if (!["retry", "repair"].includes(proposal?.action) || !Array.isArray(proposal.ids) || !proposal.ids.length || typeof proposal.reason !== "string" || !proposal.reason.trim()) throw new Error("invalid recovery proposal");
+	const ids = [...new Set(proposal.ids)];
+	for (const id of ids) {
+		const item = items.find((i) => i.id === id), failure = item && state.failed?.[item.key];
+		if (!failure || state.done?.[item.key] || (manager.attempts?.[id] ?? 0) >= (c.recovery?.maxAttempts ?? 2)) throw new Error(`${id}: not failed or recovery budget exhausted`);
+		if (Object.values(state.running ?? {}).some((r) => !r || (!r.id && !r.key) || r.key === item.key || r.id === id)) throw new Error(`${id}: worker still owns the item`);
+		if (/^depends on \S+, which (failed|is unknown)$/.test(failure)) throw new Error(`${id}: recover the failed prerequisite instead`);
+		if (/BLOCKED|credentials?|missing contract|decision|outside.*(scope|allowed)|runner error|not authorized|permission denied/i.test(failure)) throw new Error(`${id}: needs human attention, not automatic recovery`);
+	}
+	const action = { action: proposal.action, ids, reason: proposal.reason.slice(0, 3000) };
+	if (proposal.action === "retry") return action;
+	const parent = items.find((i) => i.id === ids[0]);
+	if (!c.recovery || ids.length !== 1 || parent.child || parent.added || !Array.isArray(proposal.lines) || !proposal.lines.length || proposal.lines.length > 3 || (manager.repairs ?? 0) + proposal.lines.length > c.recovery.maxRepairs) throw new Error("repair authority or budget exceeded");
+	const start = (state.fixes?.[parent.key] ?? []).length;
+	const lines = proposal.lines.map((raw, index) => {
+		if (typeof raw !== "string" || /[\r\n]/.test(raw) || raw.length > 3000) throw new Error("repair must be one bounded work line");
+		const body = raw.trim().replace(/^-\s\[\s\]\s*/, "").replace(/^[A-Z]+\d+[A-Za-z0-9-]*\s*[—:-]\s*/, "");
+		if (!/Done when:\s*\S/i.test(body) || /\[(?!areas?:)[^\]]*\]/i.test(body)) throw new Error("repair requires Done when and areas only; session, limits and dependencies are inherited");
+		const line = `- [ ] ${parent.id}-repair${start + index + 1} — ${body}`;
+		const repair = parseQueue(line)[0];
+		if (!repair.areas.length || repair.areas.some((a) => /[*?\[\]{}]/.test(a) || !pathAllowed(a, parent.areas ?? []) || !pathAllowed(a, c.allowedPaths ?? []))) throw new Error("repair areas exceed the original item/task scope");
+		return line;
+	});
+	const repairs = lines.flatMap((line) => parseQueue(line).map((i) => ({ ...i, after: parent.after })));
+	dependencyGraph([...items.map((i) => i === parent ? { ...i, after: [...(i.after ?? []), ...repairs.map((r) => r.id)] } : i), ...repairs]);
+	return { ...action, lines };
+}
+
 /** Changes asked for by you or the manager. Applied by the runner between items, or directly when it is not running. */
 export function applyControl(state, items, ctl) {
 	const pick = (ids) => {
@@ -121,7 +171,13 @@ export function applyControl(state, items, ctl) {
 		return items.filter((i) => want.length === 0 || want.some((w) => i.id === w || (ctl.by !== "auto" && i.id.startsWith(w))));
 	};
 	const changed = [];
-	if (ctl.action === "retry") {
+	if (ctl.action === "repair") {
+		const parent = items.find((i) => i.id === ctl.ids[0]);
+		state.fixes = { ...(state.fixes ?? {}), [parent.key]: [...(state.fixes?.[parent.key] ?? []), ...ctl.lines] };
+		state.waitFor = { ...(state.waitFor ?? {}), [parent.key]: [...(state.waitFor?.[parent.key] ?? []), ...ctl.lines.flatMap((l) => parseQueue(l).map((i) => i.id))] };
+		delete state.failed[parent.key];
+		changed.push(parent.id);
+	} else if (ctl.action === "retry") {
 		for (const i of pick(ctl.ids)) {
 			if (state.failed[i.key] || state.retried?.[i.key] || state.deferred?.[i.key]) changed.push(i.id);
 			delete state.failed[i.key];
@@ -157,6 +213,15 @@ export function applyControl(state, items, ctl) {
 		state.added = [...(state.added ?? []), ...lines];
 		changed.push(...lines.flatMap((l) => parseQueue(l).map((i) => i.id)));
 	}
+	// Reopen only scheduler-generated dependency failures; real worker failures keep their evidence.
+	for (let reopened = true; changed.length && reopened;) {
+		reopened = false;
+		for (const i of items) {
+			const dependency = state.failed[i.key]?.match(/^depends on (\S+), which failed$/)?.[1];
+			const parents = dependency && items.filter((p) => p.id === dependency || (p.child && p.id.startsWith(dependency) && /^[a-z]$/.test(p.id.slice(dependency.length))));
+			if (parents?.length && parents.every((p) => !state.failed[p.key])) { delete state.failed[i.key]; reopened = true; }
+		}
+	}
 	return changed;
 }
 
@@ -185,6 +250,7 @@ export function areasOverlap(a, b) {
 
 /** Per-item limits and session selection; omitted tags inherit the queue defaults. */
 export function itemConfig(c, item) {
+	if (item.repairParent) return { ...itemConfig(c, item.repairParent), allowedPaths: item.areas };
 	const out = { ...c };
 	if (c.itemChecks) {
 		const checks = c.itemChecks[item.id] ?? c.itemChecks[item.id.match(/^([A-Z]+\d+)[a-z]$/)?.[1]];
@@ -438,7 +504,7 @@ Rules (the script enforces the first two and throws away the whole change if bro
 - Do only this item. Do not fix other items, unrelated warnings or style.
 - You may use subagents to read, search and research. Only you edit files.
 - Do not ask the user questions. Do not commit. Do not touch git history or branches.
-- Before you stop, run: ${checksText(c)}${checkBroker(c) && !c.itemChecks ? "\n- While you work, run tests, type checks and lint with the `check` tool: it runs only what your change affects and reuses results other items already have. Failures it marks pre-existing also fail on the base branch: leave them." : ""}
+- Write focused regression coverage. The runner executes the configured checks after you stop, in separate verification capacity; do not run the mandatory suite in this coding turn. Use only a narrowly targeted diagnostic when needed to make the fix.${item.repaired ? "\n- Earlier verified repairs may already satisfy this item. Inspect them against the original Done when; if complete, report DONE without inventing another edit." : ""}
 - If the item clearly needs more than these size limits, do not start editing: reply with exactly one line NEEDS: <files> files, <lines> lines (your honest estimate). The limits are then raised for you.
 - If it cannot be done for any other reason (a missing contract, a decision nobody made, scope), undo your edits and reply with exactly one line: BLOCKED: <reason>
 - When finished, reply: DONE, then each changed file with one sentence.`;
@@ -478,13 +544,13 @@ async function bypassAsked(ctx, ref) {
 function raisePrompt(c, reason) {
 	return `The size limits for this item are now raised to ${c.maxFilesGrowing} files gaining lines and ${c.maxNetLines} net added lines. Previous stop: ${reason}
 
-Do the item now within the raised limits. Keep any edits that are already right. Same other rules: only ${c.allowedPaths.join(", ")}, no questions, no commits. Run the checks, then reply DONE. If it still cannot be done, reply with one line: BLOCKED: <reason>`;
+Do the item now within the raised limits. Keep any edits that are already right. Same other rules: only ${c.allowedPaths.join(", ")}, no questions, no commits. Reply DONE when edits are ready; the runner executes the configured checks in verification capacity. If it still cannot be done, reply with one line: BLOCKED: <reason>`;
 }
 
 function redoPrompt(c, reason) {
 	return `Other items were merged into the branch while you worked, and your change no longer fits (${firstLine(reason)}). The worktree has been reset to the latest code.
 
-Do this item again on top of it. Reuse your earlier approach, but first look at what changed in the files you touched. Same rules and limits: only ${c.allowedPaths.join(", ")}, at most ${c.maxNetLines} net added lines, at most ${c.maxFilesGrowing} files gaining lines, no questions, no commits. Run the checks, then reply DONE. If it cannot be done, reply with one line: BLOCKED: <reason>`;
+Do this item again on top of it. Reuse your earlier approach, but first look at what changed in the files you touched. Same rules and limits: only ${c.allowedPaths.join(", ")}, at most ${c.maxNetLines} net added lines, at most ${c.maxFilesGrowing} files gaining lines, no questions, no commits. Reply DONE when edits are ready; the runner executes the configured checks in verification capacity. If it cannot be done, reply with one line: BLOCKED: <reason>`;
 }
 
 function checkPrompt(c, item) {
@@ -920,7 +986,7 @@ async function judge(c, cwd, base, reply, item = {}) {
 	const blocked = reply.match(/^\s*BLOCKED:\s*(.+)$/m);
 	if (blocked) return `agent: BLOCKED: ${blocked[1].slice(0, 300)}`;
 	const m = await measure(cwd, base, c.allowedPaths);
-	if (m.files.length === 0) return item.check ? runChecks(c, cwd) : "no changes were made";
+	if (m.files.length === 0) return item.check || item.repaired ? runChecks(c, cwd) : "no changes were made";
 	if (m.outside.length) return `files outside ${c.allowedPaths.join(", ")}: ${m.outside.slice(0, 8).join(", ")}`;
 	if (m.net > c.maxNetLines) return `${m.net} net added lines (limit ${c.maxNetLines})`;
 	if (m.growing > c.maxFilesGrowing) return `${m.growing} files gain lines (limit ${c.maxFilesGrowing})`;
@@ -1040,6 +1106,7 @@ export async function deleteSessions(ctx, ids, mode = "delete") {
 
 async function workItem(ctx, slot, wt, item) {
 	const { repo, state, save, log, lock, branch } = ctx;
+	item = { ...item, repaired: (state.fixes?.[item.key] ?? []).some((line) => parseQueue(line).some((fix) => fix.id.startsWith(`${item.id}-repair`) && state.done[fix.key])) };
 	const itemChecks = loadJson(join(repo, ".tasks", ctx.c.task, "task.json"), {}).itemChecks;
 	let c = itemConfig({ ...ctx.c, itemChecks }, item); // keep worker, judge and rebase checks identical
 	const started = Date.now();
@@ -1052,7 +1119,8 @@ async function workItem(ctx, slot, wt, item) {
 
 	const cliId = randomUUID();
 	const ref = { id: ctx.web ? undefined : cliId };
-	const turn = async (prompt, minutes, onAct) => {
+	const turn = async (prompt, minutes, onAct, phase = "coding") => {
+		if (!(await ctx.acquirePhase(slot, phase))) return { status: "stopped", reply: "", err: "" };
 		const worker = { ...ctx, c, onWorker: (identity) => { Object.assign(live, identity); save(); } };
 		const result = await (ctx.web ? webTurn(worker, wt, ref, name, prompt, minutes, onAct) : piTurn(worker, wt, cliId, name, prompt, minutes, onAct));
 		if (result.quiescent === false) throw new Error(`${result.err}; worktree quarantined`);
@@ -1060,7 +1128,7 @@ async function workItem(ctx, slot, wt, item) {
 	};
 	const sessionId = cliId;
 	const name = `queue ${item.id}: ${item.title}`.slice(0, 80);
-	const live = { id: item.id, key: item.key, title: item.title, model: c.model, thinking: c.thinking, sessionId, worktree: wt, startedAt: new Date().toISOString(), doing: "starting", tools: 0, since: Date.now() };
+	const live = { id: item.id, key: item.key, title: item.title, model: c.model, thinking: c.thinking, sessionId, worktree: wt, startedAt: new Date().toISOString(), doing: "starting", phase: item.check ? "verification" : "coding", tools: 0, since: Date.now() };
 	state.running[slot] = live;
 	save();
 	mkdirSync(join(repo, DIR, "live"), { recursive: true });
@@ -1081,9 +1149,9 @@ async function workItem(ctx, slot, wt, item) {
 	};
 	const onActivity = (what) => setDoing(what, what !== "thinking" && what !== "compacting context" && !what.endsWith(" failed"));
 
-	const prior = join(repo, DIR, "notes", `${item.id}.md`);
+	const prior = join(repo, DIR, "notes", `${item.repairParent?.id ?? item.id}.md`);
 	const previous = existsSync(prior) ? `\n\nPrevious attempt and manager diagnosis (evidence, not permission to expand scope):\n${readFileSync(prior, "utf8").slice(-12000)}` : "";
-	let t = await turn(itemPrompt(c, item) + previous, c.itemMinutes, onActivity);
+	let t = await turn(itemPrompt(c, item) + previous, c.itemMinutes, onActivity, item.check ? "verification" : "coding");
 	if (ref.id) {
 		state.sessions = { ...(state.sessions ?? {}), [ref.id]: { item: item.id, status: "running", web: !!ctx.web } };
 		save();
@@ -1095,6 +1163,7 @@ async function workItem(ctx, slot, wt, item) {
 		log(`LIMITS RAISED ${item.id} · ${why} · now ${c.maxFilesGrowing} files / ${c.maxNetLines} lines`);
 	};
 	const verdict = async () => {
+		if (!(await ctx.acquirePhase(slot, "verification"))) return "stopped by request";
 		if (t.status === "stopped") return "stopped by request";
 		if (t.status === "timeout") return `timed out after ${c.itemMinutes} min`;
 		if (t.status === "error") return `pi exited with an error (code ${t.code}): ${firstLine(t.err || t.reply).slice(0, 200)}`;
@@ -1228,9 +1297,9 @@ async function workItem(ctx, slot, wt, item) {
 
 	const mins = Math.round((Date.now() - started) / 60_000);
 	mkdirSync(join(repo, DIR, "notes"), { recursive: true });
-	writeFileSync(
+	appendFileSync(
 		join(repo, DIR, "notes", `${item.id}.md`),
-		`# ${item.line}\n\nResult: ${reason ? `${kind.toUpperCase()} — ${reason}` : `PASS ${sha}`}\nSession: ${ref.id ?? sessionId}${ctx.web ? " (Pi Web)" : ""}\nWorktree: ${wt}\n\n## Agent's last reply\n\n${t.reply}\n${t.err ? `\n## stderr\n\n${t.err.slice(-4000)}\n` : ""}`,
+		`\n\n# ${item.line}\n\nResult: ${reason ? `${kind.toUpperCase()} — ${reason}` : `PASS ${sha}`}\nSession: ${ref.id ?? sessionId}${ctx.web ? " (Pi Web)" : ""}\nWorktree: ${wt}\n\n## Agent's last reply\n\n${t.reply}\n${t.err ? `\n## stderr\n\n${t.err.slice(-4000)}\n` : ""}`,
 	);
 
 	let kept = "";
@@ -1286,6 +1355,7 @@ async function workItem(ctx, slot, wt, item) {
 		if (!reason && ctx.c.deleteSessions === "pass") await deleteSessions(ctx, [ref.id]);
 	}
 	save();
+	notifyRunner(!reason ? "completion" : ["deferred", "conflict", "gaps", "split"].includes(kind) ? "deferred" : "failure", { id: item.id, kind, runId: state.runId });
 	return { pass: !reason, kind, redone, stopped: reason === "stopped by request" };
 }
 
@@ -1340,7 +1410,7 @@ export async function main(repo) {
 		else log(`Pi Web not usable (${found.reason}); items run as background pi instead`);
 	}
 	const parallel = c.worktrees ? Math.max(1, Math.floor(c.parallel) || 1) : 1;
-	log(`START · branch ${branch} · ${c.worktrees ? `up to ${parallel} parallel (worktrees${c.adaptive !== false ? ", adaptive" : ""})` : "one at a time in your repo folder"} · ${c.model || "default model"} @ ${c.thinking || "default"} · ${ctx.web ? `items run as Pi Web sessions (${c.piWebUrl})` : `items run as background pi (${ctx.pi})`}`);
+	log(`START · branch ${branch} · ${c.worktrees ? `up to ${parallel} coding + ${parallel} verification (worktrees)` : "one at a time in your repo folder"} · ${c.model || "default model"} @ ${c.thinking || "default"} · ${ctx.web ? `items run as Pi Web sessions (${c.piWebUrl})` : `items run as background pi (${ctx.pi})`}`);
 
 	// worktrees are made when a slot is first used; w0 now, for the baseline check
 	let maxW = c.worktrees ? Math.max(1, Math.floor(c.parallel) || 1) : 1;
@@ -1372,7 +1442,7 @@ export async function main(repo) {
 
 	state.startedAt = Date.now();
 	save();
-	process.send?.({ type: "ready" });
+	notifyRunner("ready", { runId: state.runId });
 	const inFlight = new Map(); // key -> item
 	const nextItem = () => {
 		let items = [];
@@ -1391,9 +1461,10 @@ export async function main(repo) {
 			return "unknown"; // a typo or an id from elsewhere: ignored
 		};
 		const open = items.filter((i) => !finished(i) && !inFlight.has(i.key));
-		const parked = (i) => state.retried[i.key] || state.deferred?.[i.key];
-		const eligible = new Set(open.filter((i) => !parked(i) || inFlight.size === 0).map((i) => i.key));
+		const eligible = new Set(open.map((i) => i.key));
 		const ordered = orderQueue(items, state).filter((i) => eligible.has(i.key));
+		const parked = (i) => state.retried[i.key] || state.deferred?.[i.key];
+		let firstPassPending = [...inFlight.values()].some((i) => !i.quarantined && !parked(i));
 		for (const i of ordered) {
 			let wait = false;
 			for (const d of i.after ?? []) {
@@ -1402,6 +1473,7 @@ export async function main(repo) {
 					state.failed[i.key] = `depends on ${d}, which ${st === "unknown" ? "is unknown" : "failed"}`;
 					log(`FAIL ${i.id} · depends on ${d}, which failed · not started`);
 					save();
+					notifyRunner("failure", { id: i.id, runId: state.runId });
 					wait = true;
 					break;
 				}
@@ -1409,7 +1481,10 @@ export async function main(repo) {
 				if (st === "wildcard" && (items.some((o) => o !== i && !finished(o) && !(o.after ?? []).includes("*")) || inFlight.size)) wait = true;
 			}
 			if (wait) continue;
-			if (i.areas?.length && [...inFlight.values()].some((r) => r.areas?.length && areasOverlap(i.areas, r.areas))) continue;
+			if ([...inFlight.values()].some((r) => (r.quarantined && (!r.areas?.length || !i.areas?.length)) || (i.areas?.length && r.areas?.length && areasOverlap(i.areas, r.areas)))) continue;
+			if (!parked(i)) firstPassPending = true;
+			if (state.deferred?.[i.key] && firstPassPending) continue;
+			if (!hasCapacity(i.check ? "verification" : "coding")) continue;
 			return i;
 		}
 		return undefined;
@@ -1438,15 +1513,21 @@ export async function main(repo) {
 		})();
 		for (const ctl of list) {
 			if (ctl.task !== c.task) { log("CONTROL ignored: stale task"); continue; }
-			if (ctl.by === "auto" && (stopRequested() || pauseRequested() || ctl.action !== "retry" || !ctl.ids?.length || !ctl.ids.every((id) => items.some((i) => i.id === id && state.failed[i.key] === ctl.failures?.[id])))) continue;
+			if (ctl.by === "auto") {
+				if (stopRequested() || pauseRequested() || readConfig(repo).manager === false || !ctl.approval || ctl.approval !== approvedTask(repo, readConfig(repo)) || !ctl.ids?.length || !ctl.ids.every((id) => items.some((i) => i.id === id && state.failed[i.key] === ctl.failures?.[id]))) continue;
+				try {
+					// Budgets were reserved by the supervisor; repeat scope/ownership validation on live state.
+					Object.assign(ctl, validateRecovery(ctl, state, allItems(readFileSync(queuePath, "utf8"), state), {}, c));
+				} catch (e) { log(`CONTROL rejected: ${e.message}`); continue; }
+			}
 			if (ctl?.action === "parallel") {
 				const n = Math.max(1, Math.floor(Number(ctl.value)) || 1);
 				if (!c.worktrees) {
 					log("CONTROL parallel ignored: this run works in the repo folder (worktrees: false)");
 					continue;
 				}
-				while (slots < n) free.push(slots++);
-				maxW = n; // your number is the ceiling; adaptive narrowing still applies below it
+				while (slots < 2 * n) free.push(slots++);
+				maxW = n; // both phase ceilings follow the configured parallelism
 				setWidth(n, "asked by you");
 				try {
 					const cf = join(repo, DIR, "config.json");
@@ -1455,7 +1536,7 @@ export async function main(repo) {
 				continue;
 			}
 			const changed = applyControl(state, items, ctl ?? {});
-			if (changed.length && ["retry", "rerun", "recheck", "next"].includes(ctl.action)) { failsInARow = 0; state.failureStreak = 0; halted = ""; }
+			if (changed.length && ["retry", "repair", "rerun", "recheck", "next"].includes(ctl.action)) { failsInARow = 0; state.failureStreak = 0; halted = ""; }
 			log(`CONTROL ${ctl?.action} ${(ctl?.ids ?? []).join(",") || (ctl?.action === "add" ? "" : "all")} · ${changed.length ? changed.join(", ") : "nothing matched"}${ctl?.by ? ` · by ${ctl.by}` : ""}`);
 		}
 		state.controlReceipts = [...(state.controlReceipts ?? []), ...files].slice(-1000);
@@ -1481,10 +1562,48 @@ export async function main(repo) {
 
 	let failsInARow = state.failureStreak ?? 0;
 	let cleanStreak = 0;
-	let halted = failsInARow >= c.stopAfterFailuresInARow ? `${failsInARow} failures in a row` : "";
-	const free = Array.from({ length: maxW }, (_, i) => i);
-	let slots = maxW; // worktree slots created so far
+	const failureLimit = Number(c.stopAfterFailuresInARow);
+	const safetyHalt = () => Number.isFinite(failureLimit) && failureLimit > 0 && failsInARow >= failureLimit;
+	let halted = safetyHalt() ? `${failsInARow} failures in a row` : "";
+	const slotLimit = () => c.worktrees ? 2 * maxW : 1;
+	const free = Array.from({ length: slotLimit() }, (_, i) => i);
+	let slots = free.length;
 	const running = new Map();
+	const phases = new Map(), waiters = [];
+	let wakeScheduler;
+	const phaseLimit = (phase) => phase === "coding" ? width : maxW;
+	const hasCapacity = (phase) => [...phases.values()].filter((p) => p === phase).length < phaseLimit(phase);
+	const pumpPhases = () => {
+		for (let i = 0; i < waiters.length;) {
+			const { slot, phase, resolve, reject } = waiters[i];
+			if (stopRequested()) { waiters.splice(i, 1); resolve(false); continue; }
+			// An uncertain worker cannot release its permit. Preserve waiting work instead
+			// of hanging forever when that phase's entire capacity is quarantined.
+			if ([...phases].filter(([s, p]) => p === phase && state.running[s]?.quarantined).length >= phaseLimit(phase)) {
+				waiters.splice(i, 1);
+				reject(new Error(`${phase} capacity quarantined; waiting work preserved`));
+				continue;
+			}
+			if (!hasCapacity(phase)) { i++; continue; }
+			waiters.splice(i, 1);
+			phases.set(slot, phase);
+			state.running[slot].phase = phase;
+			save();
+			resolve(true);
+		}
+	};
+	ctx.acquirePhase = async (slot, phase) => {
+		if (stopRequested()) return false;
+		if (phases.get(slot) === phase) return true;
+		// Never wait while holding the other resource: fixes/redos cannot deadlock checks.
+		phases.delete(slot);
+		state.running[slot].phase = `waiting-${phase}`;
+		save();
+		const acquired = new Promise((resolve, reject) => waiters.push({ slot, phase, resolve, reject }));
+		pumpPhases();
+		wakeScheduler?.(null);
+		return acquired;
+	};
 	const setWidth = (w, why) => {
 		if (w === width) return;
 		log(`WIDTH ${width} → ${w} · ${why}`);
@@ -1495,15 +1614,18 @@ export async function main(repo) {
 	try {
 	while (true) {
 		readControl();
-		while (!halted && running.size < width && free.length && !stopRequested() && !pauseRequested()) {
+		pumpPhases();
+		while (!halted && free.length && !stopRequested() && !pauseRequested()) {
 			free.sort((a, b) => a - b);
-			if (free[0] >= maxW) break; // slots above a lowered ceiling stay idle
+			if (free[0] >= slotLimit()) break; // slots above a lowered ceiling stay idle
 			const item = nextItem();
 			if (!item) break;
 			free.sort((a, b) => a - b);
 			const slot = free.shift();
 			inFlight.set(item.key, item);
-			state.running[slot] = { id: item.id, key: item.key, doing: "preparing worktree", startedAt: new Date().toISOString() };
+			const phase = item.check ? "verification" : "coding";
+			phases.set(slot, phase); // reserve capacity before asynchronous worktree preparation
+			state.running[slot] = { id: item.id, key: item.key, phase, doing: "preparing worktree", startedAt: new Date().toISOString() };
 			save();
 			const p = (async () => {
 				if (!wts[slot]) {
@@ -1514,7 +1636,9 @@ export async function main(repo) {
 				.catch((e) => {
 					state.failed[item.key] = `runner error: ${e?.message ?? e}`;
 					state.running[slot] = { ...(state.running[slot] ?? {}), id: item.id, key: item.key, worktree: wts[slot], quarantined: true };
+					item.quarantined = true;
 					save();
+					notifyRunner("quarantine", { id: item.id, runId: state.runId });
 					log(`ERROR ${item.id} · ${e?.message ?? e} · slot quarantined; work preserved`);
 					return { pass: false, kind: "fail" };
 				})
@@ -1523,18 +1647,23 @@ export async function main(repo) {
 		}
 		if (running.size === 0) {
 			readControl();
-			if (!halted && !stopRequested() && !pauseRequested() && free.some((slot) => slot < maxW) && nextItem()) continue; // the manager queued more work
+			if (!halted && !stopRequested() && !pauseRequested() && free.some((slot) => slot < slotLimit()) && nextItem()) continue; // the manager queued more work
 			break;
 		}
 		// wake every few seconds to apply control requests while items run
 		let wake;
-		const done = await Promise.race([...running.values(), new Promise((res) => { wake = setTimeout(() => res(null), 5000); })]);
+		const done = await Promise.race([...running.values(), new Promise((res) => { wakeScheduler = res; wake = setTimeout(() => res(null), 5000); })]);
+		wakeScheduler = undefined;
 		clearTimeout(wake);
 		if (!done) continue;
 		const { r, slot, item } = done;
 		running.delete(slot);
-		if (!state.running[slot]?.quarantined) free.push(slot);
-		inFlight.delete(item.key);
+		if (!state.running[slot]?.quarantined) {
+			free.push(slot);
+			phases.delete(slot);
+			inFlight.delete(item.key);
+		}
+		pumpPhases();
 		if (r.pass) {
 			failsInARow = 0;
 			recheckAfter(item);
@@ -1542,15 +1671,12 @@ export async function main(repo) {
 		state.failureStreak = failsInARow;
 		save();
 		if (c.adaptive !== false && c.worktrees) {
-			if (r.redone || r.kind === "conflict") {
-				cleanStreak = 0;
-				setWidth(Math.max(minW, width - 1), `${item.id} conflicted with other work`);
-			} else if (r.pass && ++cleanStreak >= 3) {
+			if (r.pass && ++cleanStreak >= 3) {
 				cleanStreak = 0;
 				setWidth(Math.min(maxW, width + 1), "3 clean passes in a row");
 			}
 		}
-		if (!halted && failsInARow >= c.stopAfterFailuresInARow) {
+		if (!halted && safetyHalt()) {
 			halted = `${failsInARow} failures in a row`;
 			log(`STOPPING: ${halted} (running items finish first)`);
 		}
@@ -1559,12 +1685,14 @@ export async function main(repo) {
 	}
 	} catch (e) {
 		onSignal();
+		pumpPhases();
 		await Promise.all(running.values());
 		throw e;
 	}
 	if (pauseRequested() && !halted) halted = "paused after running items finished";
 	state.phase = halted || (Object.keys(state.running).length ? "blocked: quarantined workers" : "finished");
 	save();
+	notifyRunner("completion", { runId: state.runId, phase: state.phase });
 	const left = allItems(readFileSync(queuePath, "utf8"), state).filter((i) => !state.done[i.key] && !state.failed[i.key]).length;
 	log(`END · passed ${Object.keys(state.done).length} · failed ${Object.keys(state.failed).length} · still open ${left}${halted ? ` · ${halted}` : ""}`);
 	if (c.deleteSessions && c.deleteSessions !== "pass" && !halted) {

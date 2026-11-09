@@ -35,7 +35,7 @@ An item passes only if:
 - it stays within its size limits: net added lines (`maxNetLines`, 150) and files gaining lines (`maxFilesGrowing`, 5)
 - every check command passes
 
-If a check fails, the agent gets `fixRounds` (1) chances in the same session. Failed work is kept on `queue-failed/<id>`.
+Coding workers write focused regressions but leave mandatory configured suites to the runner's verification phase. If a check fails, the agent gets `fixRounds` (1) chances in the same session. Failed work is kept on `queue-failed/<id>`. A parent whose automatic repairs already completed its change may pass without another edit, after inspecting its acceptance criteria and passing the same checks.
 
 ## Sizes adjust themselves
 
@@ -48,11 +48,12 @@ If a check fails, the agent gets `fixRounds` (1) chances in the same session. Fa
 
 - **Deferred:** an item that says `BLOCKED` while other work is still pending is retried after that work. This catches the most common case, a prerequisite that hasn't run yet. A second BLOCKED with nothing left that could help is a failure for you (a missing decision, contract or environment).
 - **Conflict:** an item whose change no longer fits the moved branch is redone at once on the latest code, in the same session (`REDO`). If it conflicts again it is parked and retried at the end.
-- **Parked items** (conflicts, deferred) run only when nothing else is running, one at a time. `unpark` or `next` lets them run normally (see manager.md).
+- **Parked items** (conflicts, deferred) keep lower priority, but disjoint ready items can run together. Deferred retries first wait for runnable first-pass work to finish, without waiting on their own blocked dependents. Areas and dependencies still apply; `unpark` or `next` raises their priority (see manager.md).
+- **Capacity:** up to `parallel` coding workers and `parallel` verifying/integrating items in worktree mode. A worker returning from checks to fix code reacquires coding capacity. Dependencies and area locks stay held until completion; direct-repo mode remains serial. A conflict does not reduce global concurrency.
 
 ## [check] items
 
-- Verify instead of build. Give them `[after: <items they verify>]`.
+- Verify instead of build. Give them `[after: <items they verify>]`. Their sessions use verification capacity, leaving coding capacity available for independent implementation.
 - Pass **without changes** when everything holds. The log reads `PASS V01 · checked, nothing to change`.
 - May fix tests, fixtures and docs inside the allowed paths.
 - Report production gaps as lines: `GAP: <what is wrong and what to change>. Done when: … [areas: …]`. The queue adds fix items `V01-fix1…` before the check and checks again after them, up to `gapRounds` (2) rounds.

@@ -28,7 +28,7 @@ Large work (hours) fails in one long agent session: context fills up, the agent 
    | `rules.md` | task-specific rules |
    | `questions.md` | decisions only you can make |
    | `items.md` | the work list (see items.md) |
-   | `task.json` | `allowedPaths`, `checks`, suggested `parallel` |
+   | `task.json` | `allowedPaths`, `checks`, suggested `parallel`, upfront `recovery` budgets |
 
 2. **Questions.** It asks them all in one message, each with a recommended answer. Reply in plain words.
 3. **Handoff.** The planner calls `task_handoff`. It refuses until:
@@ -39,8 +39,8 @@ Large work (hours) fails in one long agent session: context fills up, the agent 
    - the tree is clean apart from the plan
 
    Then it commits `.tasks/<slug>/` and starts the queue. In Pi Web it pins this chat as the control room.
-4. **The queue runs.** Up to `parallel` items at once, each in its own git worktree (`.pi-queue/worktrees/wN`) and its own fresh session. Each passing item is rebased onto the branch and fast-forwarded: one commit `ID: title`.
-5. **Automatic supervision.** Once the baseline passes, a detached supervisor creates a chat-only manager. Healthy 60-second ticks make no model calls. Bounded recovery and human-only blockers are defined in manager.md. `/task manage` and `/queue …` remain available for manual intervention.
+4. **The queue runs.** Up to `parallel` coding items plus `parallel` verifying/integrating items, each retaining its own git worktree (`.pi-queue/worktrees/wN`) and fresh session. Independent coding overlaps checks; dependents wait for verified completion. Direct-repo mode remains serial. Each passing item is rebased onto the branch and fast-forwarded: one commit `ID: title`.
+5. **Automatic supervision.** A detached supervisor responds to failure events while other work runs, with a 60-second watchdog fallback and no healthy model calls. A chat-only manager proposes targeted retries/repairs under the upfront budgets; it does not repeatedly ask permission for approved recovery. Bounded recovery and human-only blockers are defined in manager.md. `/task manage` and `/queue …` remain available for manual intervention.
 6. **Clean up.** Finished item sessions are removed when the run ends. `/task cleanup` removes failed items' sessions and the planning chat. `--all` also removes worktrees and `queue-failed/*` branches.
 
 ## Optional fresh-context plan review

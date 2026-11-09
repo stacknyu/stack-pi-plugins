@@ -46,7 +46,7 @@ Reload Pi. This installs only pi-flow. pi-check is optional: install it separate
 | `rules.md` | task-specific rules for every item |
 | `questions.md` | decisions only you can make |
 | `items.md` | the work list |
-| `task.json` | allowed paths, checks, suggested parallelism |
+| `task.json` | allowed paths, checks, parallelism and approved recovery budgets |
 
 **3. Answer its questions.** It asks them all here in one message, each with a recommended answer. Reply in plain words. It records the answers and updates the plan.
 
@@ -71,7 +71,7 @@ Then it commits `.tasks/<slug>/` and starts the queue. The live panel appears un
 
 ## The manager
 
-An approved queue automatically gets a dedicated manager after its baseline passes. A detached supervisor checks health every 60 seconds without model calls; on a terminal failure the chat-only manager can propose bounded retries of existing items. Scope, checks, manual pause/stop and worker ownership remain enforced by code. It does not invent new work or reset uncertain worktrees. See [manager policy and limits](skills/pi-flow/references/manager.md).
+A detached supervisor watches runner events immediately, with a 60-second watchdog fallback. Failures can reach the chat-only manager while unrelated workers keep running; healthy activity makes no model calls. With upfront recovery authority, it can retry failed work or dispatch targeted repair items inside the failed item's paths, checks, model and limits. Budgets persist across restarts. It never resets uncertain worktrees or bypasses manual pause/stop, missing credentials or decisions. See [manager policy and limits](skills/pi-flow/references/manager.md).
 
 `/task manage` still makes any chat a separate **manual** manager (pinned in Pi Web), acting only on what you ask. Ask it things like:
 - "what is wrong?": it reads the failures together and tells you the real cause (e.g. "these 6 checks failed because P03 had not run yet")
@@ -112,10 +112,11 @@ It steers a running queue through an inbox the runner reads between items, so no
   - An item that says `BLOCKED` while other work is still pending (usually a prerequisite that has not run yet) is **deferred** and tried again after that work (`DEFERRED` in the log). Only a second BLOCKED, with nothing left that could help, makes it fail. A real decision or missing environment still ends up as a failure for you.
   - A passed `[check]` runs again automatically (`RECHECK`) when an item it covers (overlapping areas, or named in its `[after: …]`) changes later.
 - **Dependency scheduling:** reject cycles and duplicate dependency/area tags. Prefer ready prerequisites on the longest remaining chain, preserve explicit `next` order, and fill slots with disjoint ready work. File order only breaks ties; do not serialize independent items with unnecessary `[after]` tags.
-- **Adaptive parallelism:** the queue runs up to `parallel` items at once. A conflict narrows it by one, and 3 clean passes in a row widen it by one, between `parallelMin` and `parallel`. A conflicting item is first redone in the same session on the latest code. Only if that fails too is it retried at the end.
+- **Separate coding and verification capacity:** worktree mode allows up to `parallel` coding workers plus `parallel` items checking or integrating. Independent coding continues while checks run; dependencies wait for verified integration, and area/worktree ownership remains exclusive. `[check]` workers use verification capacity. Direct-repo mode stays serial. This can use more memory/worktrees than older releases; pi-check still bounds check-command CPU usage.
+- **Local conflict recovery:** a conflicting item is redone on the latest code, then parked if necessary. It no longer reduces everyone's concurrency. Disjoint parked items can run together under the same dependency/area rules; there is no per-item reviewer.
 - **Safety:**
   - checks run once on the unchanged code before anything starts
-  - the run stops after 5 real failures in a row
+  - failures isolate their dependency chains by default; an explicit positive `stopAfterFailuresInARow` still enables a global safety stop
   - `BLOCKED: <reason>` (a missing decision or contract) is never forced: those items wait for you
 - **Clean environment:** setup and checks run without the npm/pnpm variables leaked from Pi Web's own process.
 
@@ -126,7 +127,7 @@ When [pi-check](https://github.com/stacknyu/stack-pi-plugins/tree/main/packages/
 - Every check command goes through pi-check's shared broker. `go test` / `go vet` run per package and are cached by file content. Other commands run once per identical set of files, and every worktree shares the results. Heavy runs are throttled, so parallel items stop fighting for the CPU.
 - Go test failures that also fail on the base branch are "pre-existing": they no longer block items or the baseline.
 - Before starting a worktree worker, pi-flow exposes the discovered pi-check installation through an ignored directory symlink at `.pi/extensions/pi-flow-check`. Project-local installations therefore provide the `check` tool and `/check` immediately, without reinstalling packages or copying settings/secrets. Pi deduplicates the same physical extension when it is also installed globally. This does not copy other plugins or skills.
-- Item agents are told to use the `check` tool. It runs only what their change affects, and they see which failures are theirs.
+- Coding workers write focused regressions and leave mandatory suites to the runner's verification phase. The runner returns failures for targeted fixes; `[check]` workers can run verification commands in their own capacity.
 - `"checks": ["pi-check"]` is the native form. One entry runs the tests, type checks and lint the item affects in every Go/TypeScript/Python project, and ignores pre-existing failures in all of them. The planner suggests it when pi-check is installed.
 - `"checkBroker": false` in `.pi-queue/config.json` disables this integration and removes the managed link when preparing a reused worktree. Independently installed global plugins remain enabled; existing sessions need restarting to change their loaded tools.
 
@@ -136,10 +137,12 @@ Your own edits are kept across tasks. Useful ones:
 
 | Setting | Default | |
 |---|---|---|
-| `parallel` / `parallelMin` | from the plan / 1 | width range |
-| `adaptive` | true | change the width on conflicts and clean streaks |
+| `parallel` | from the plan | ceiling for each of coding and verification in worktree mode |
+| `parallelStart` / `parallelMin`, `adaptive` | 0 / 1, true | optional lower starting width; clean passes ramp up, conflicts never narrow the whole queue |
 | `model`, `thinking` | Pi default, high | default model for item sessions and the isolated manager |
 | `manager` | true | automatic bounded supervision after approved handoff; false disables it |
+| `recovery` | plan-specific | approved `maxAttempts`, `maxRepairs`, `maxRestarts`; recommended 2/4/2, legacy plans cannot add repairs |
+| `stopAfterFailuresInARow` | 0 | no global failure halt; set a positive count to opt in |
 | `itemMinutes` | 40 | time limit per item (raised levels give more) |
 | `maxNetLines`, `maxFilesGrowing` | 150, 5 | starting size limits |
 | `escalate` | 15/600 → 40/1500 → 200/5000 | size levels |
