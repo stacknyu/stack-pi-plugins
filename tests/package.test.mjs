@@ -25,8 +25,9 @@ for (const plugin of ["pi-flow", "pi-check", "pi-glitch-lab"]) test(`${plugin} n
 	const runtimeArchives = [];
 	if (plugin === "pi-glitch-lab") {
 		const require = createRequire(join(root, "packages", plugin, "package.json"));
+		const fromPlaywright = createRequire(require.resolve("playwright/package.json")); // playwright-core is playwright's dependency, not ours
 		for (const dependency of ["playwright", "playwright-core"]) {
-			const manifest = require.resolve(`${dependency}/package.json`);
+			const manifest = (dependency === "playwright" ? require : fromPlaywright).resolve(`${dependency}/package.json`);
 			const packed = JSON.parse(execFileSync("npm", ["pack", join(manifest, ".."), "--pack-destination", home, "--json", "--ignore-scripts"], { cwd: home, env, encoding: "utf8", stdio: "pipe", timeout: 30000 }));
 			runtimeArchives.push(join(home, packed[0].filename));
 		}

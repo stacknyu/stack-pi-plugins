@@ -1,6 +1,6 @@
 {
   "name": "@stacknyu/stack-pi-plugins",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "description": "Stacknyu's Pi plugins: task planning and queues with pi-flow, shared verification with pi-check.",
   "license": "MIT",

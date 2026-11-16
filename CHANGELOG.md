@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.2
+
+- pi-flow 1.8.2 / pi-check 1.2.1: fixes from the independent review (safe recovery, Web liveness, no truncated splits, reserved growth, config carry-over, retry correctness). Test fixes: a leaking `fetch` mock in `runner.test.mjs`, and `tests/package.test.mjs` resolves `playwright-core` through `playwright`.
+
 ## 0.4.1
 
 - pi-flow 1.8.1: fixes items passing as DONE after dropping work to fit a size cap (no squeeze-to-fit fix round, lockfiles excluded from size, DONE confirmation, escape-hatch lint, config reset at handoff, checks always run).

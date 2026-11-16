@@ -1,5 +1,18 @@
 # pi-flow changelog
 
+## 1.8.2
+
+Fixes from an independent review of 1.8.0/1.8.1.
+
+- **Recovery never resets unsaved work.** Interrupted or leftover work is committed (or stash-snapshotted), the `queue-failed/…` branch is created and checked to point at it, and only then is the worktree reset. Any failed step leaves the worktree untouched and the slot reserved.
+- **An unreachable Pi Web is not proof a worker stopped.** A Web worker counts as stopped only when its own server refuses connections (the worker's Pi Web URL is now recorded). A timeout, a wrong port or no recorded URL keeps the slot reserved.
+- **A split is never cut short.** If the agent's decomposition has more parts than `splitMax` / the growth budget allow, the item fails as "needs you" instead of keeping the first parts (which would complete the parent without the rest). The split prompt states the real maximum.
+- **Growth budget holds under parallel workers.** Split and gap-fix capacity is reserved per item before the agent turn and released once the items are recorded (or on a crash).
+- **Handoff keeps `manager: false` and a custom `setup`.** A setup you wrote wins over the detected install.
+- **Tiers that only set thinking** are validated against the task's model, not the planning chat's.
+- `report.md` and `decisions.md` are archived with the previous run.
+- `retry`, `limits` and `skip` (and `answer`) start a stopped queue; `next`, `unpark`, `recheck`, `rerun` no longer do, and nothing starts over a PAUSE/STOP (this was also the double-start race in `supervisor.test.mjs`).
+
 ## 1.8.1
 
 Fixes the "false DONE" failure: an item that kept the old implementation because of a size cap passed and was reported as done.

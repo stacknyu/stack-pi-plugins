@@ -1048,7 +1048,7 @@ async function webTurn(ctx, cwd, ref, name, prompt, minutes, onActivity = () => 
 				...(c.thinking ? { thinkingLevel: c.thinking } : {}),
 			});
 			ref.id = r.sessionId;
-			ctx.onWorker?.({ sessionId: ref.id, web: true });
+			ctx.onWorker?.({ sessionId: ref.id, web: true, webUrl: c.piWebUrl || ctx.c?.piWebUrl });
 			await web.send(ref.id, { type: "set_session_name", name }).catch(() => {});
 		}
 		const { context } = await web.history(ref.id);
@@ -1266,15 +1266,9 @@ async function prepareWorktree(ctx, slot) {
 		// leftovers from an interrupted run: keep them on a branch instead of refusing to start
 		if (c.autoReconcile === false) throw new Error(`worktree ${wt} has unpreserved changes or commits; refusing to reset it`);
 		await git(wt, "rebase", "--abort");
-		if (dirty) {
-			await git(wt, "add", "-A");
-			const committed = await git(wt, "commit", "--no-verify", "-m", `queue LEFTOVER w${slot}`);
-			if (committed.code !== 0) throw new Error(`worktree ${wt} has changes that could not be preserved: ${tail(committed.out, 3)}`);
-		}
-		const name = `queue-failed/w${slot}-leftover-${Date.now()}`;
-		const made = await git(repo, "branch", name, (await git(wt, "rev-parse", "HEAD")).out.trim());
-		if (made.code !== 0) throw new Error(`worktree ${wt} has changes that could not be preserved: ${tail(made.out, 3)}`);
-		log(`RECONCILED w${slot} · leftover changes kept on ${name}`);
+		const kept = await preserveWork(repo, wt, `queue-failed/w${slot}-leftover-${Date.now()}`, `queue LEFTOVER w${slot}`, dirty);
+		if (kept.error) throw new Error(`worktree ${wt} has changes that could not be preserved: ${kept.error}`);
+		log(`RECONCILED w${slot} · leftover changes kept on ${kept.name}`);
 	}
 	const checkout = await git(wt, "checkout", "--detach", tip);
 	if (checkout.code !== 0) throw new Error(checkout.out);
@@ -1513,7 +1507,12 @@ async function workItem(ctx, slot, wt, item) {
 	let splitLines = [];
 	let fixLines = [];
 	const sessionTags = `${c.model ? ` [model: ${c.model}]` : ""}${c.thinking ? ` [thinking: ${c.thinking}]` : ""}`;
-	const growthLeft = () => growthBudget(ctx.c, ctx.plannedCount?.() ?? 0) - growthUsed(state);
+	// Growth is reserved before any asynchronous work, so parallel workers cannot spend the same budget twice.
+	// Keyed by item, so a crashed item never leaks its reservation into the rest of the run.
+	ctx.growthReserved ??= new Map();
+	const growthLeft = () => growthBudget(ctx.c, ctx.plannedCount?.() ?? 0) - growthUsed(state) - [...ctx.growthReserved.values()].reduce((a, b) => a + b, 0);
+	const reserve = (n) => ctx.growthReserved.set(item.key, (ctx.growthReserved.get(item.key) ?? 0) + n);
+	const release = () => ctx.growthReserved.delete(item.key);
 	// a check found production gaps: queue fix items before it and check again after them
 	if (reason?.startsWith("agent: GAPS") && item.check) {
 		const round = (state.gapRound?.[item.key] ?? 0) + 1;
@@ -1521,6 +1520,7 @@ async function workItem(ctx, slot, wt, item) {
 		const room = Math.min(Math.max(1, Math.floor(c.maxGapItems ?? 3)), growthLeft());
 		if (c.autoFix !== false && round <= (c.gapRounds ?? 2) && room > 0) {
 			const base0 = (state.fixes?.[item.key] ?? []).length;
+			reserve(room);
 			fixLines = mergeGaps(gaps, room).map((g, i) => `- [ ] ${item.id}-fix${base0 + i + 1} — ${g}${sessionTags}`);
 			kind = "gaps";
 			state.gapRound = { ...(state.gapRound ?? {}), [item.key]: round };
@@ -1552,17 +1552,20 @@ async function workItem(ctx, slot, wt, item) {
 	// Split only what is genuinely too big after the last size level. BLOCKED items are never split:
 	// splitting a blocked item multiplies the same blocker.
 	if (kind === "fail" && reason && c.autoSplit !== false && !item.child && t.status === "ok" && !ctx.stopRequested() && isSizeStop(reason) && !reason.startsWith("agent: BLOCKED") && !SCOPE_REASON.test(reason)) {
-		if (growthLeft() < 1) reason = `needs you: too big for one session and the queue's growth budget is used up (${growthUsed(state)} derived items) · ${firstLine(reason)}`;
+		const allowed = Math.min(c.splitMax ?? 4, growthLeft() + 1); // parts beyond the first count as growth
+		if (allowed < 2) reason = `needs you: too big for one session and the queue's growth budget is used up (${growthUsed(state)} derived items) · ${firstLine(reason)}`;
 		else {
+			reserve(allowed - 1);
 			setDoing("asking the agent to split this item");
 			save();
-			const st = await turn(splitPrompt(c, item, reason), 15, onActivity);
+			const st = await turn(splitPrompt({ ...c, splitMax: allowed }, item, reason), 15, onActivity);
 			const texts = String(st.reply)
 				.split("\n")
 				.map((l) => l.match(/^\s*ITEM:\s*(.+?)\s*$/)?.[1])
-				.filter(Boolean)
-				.slice(0, Math.min(c.splitMax ?? 4, growthLeft() + 1));
-			if (st.status === "ok" && texts.length >= 2) {
+				.filter(Boolean);
+			// Never keep only some of the parts: the parent counts as done when its parts are, so a dropped part is dropped work.
+			if (st.status === "ok" && texts.length > allowed) reason = `needs you: too big for one session; the agent needs ${texts.length} parts but at most ${allowed} fit (splitMax / growth budget) · ${firstLine(reason)}`;
+			else if (st.status === "ok" && texts.length >= 2) {
 				const kid = (n) => `${item.id}${String.fromCharCode(96 + n)}`;
 				splitLines = texts.map(
 					(txt, i) =>
@@ -1713,17 +1716,55 @@ async function workItem(ctx, slot, wt, item) {
 		if (!reason && ctx.c.deleteSessions === "pass") await deleteSessions(ctx, [ref.id]);
 	}
 	save();
+	release(); // recorded in state.splits / state.fixes by now, or not added at all
 	notifyRunner(!reason ? "completion" : ["deferred", "conflict", "gaps", "split", "waiting"].includes(kind) ? "deferred" : "failure", { id: item.id, kind, runId: state.runId });
 	return { pass: !reason, kind, redone, stopped: reason === "stopped by request" };
 }
 
 // ---------- interrupted workers ----------
 
+/** True only when nothing listens at the URL any more (the server process is gone), not on timeouts or HTTP errors. */
+export async function connectionRefused(url) {
+	try {
+		await fetch(`${String(url).replace(/\/$/, "")}/api/agent/running`, { signal: AbortSignal.timeout(3000) });
+		return false;
+	} catch (e) {
+		return /ECONNREFUSED/.test(`${e?.cause?.code ?? ""} ${e?.cause?.message ?? ""} ${e?.code ?? ""}`);
+	}
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Workers left in state.running by a crash, sleep or a Pi Web restart: stop them if they still run, keep whatever
  *  they changed on a queue-failed/<id>-interrupted-* branch, reset their worktree and queue the item again.
  *  Returns what could not be resolved safely (those slots are left untouched). */
+/** Commit (or stash-snapshot) everything in a worktree onto a new branch, and check the branch really holds it. */
+export async function preserveWork(repo, wt, name, message, dirty) {
+	const step = async (label, r) => (r.code === 0 ? undefined : `${label}: ${firstLine(r.out) || `exit ${r.code}`}`);
+	let sha;
+	if (dirty) {
+		const add = await git(wt, "add", "-A");
+		let err = await step("git add", add);
+		if (err) return { error: err };
+		if (wt === repo) {
+			const st = await git(wt, "stash", "create", message);
+			if (st.code !== 0 || !st.out.trim()) return { error: `git stash create: ${firstLine(st.out) || "no snapshot made"}` };
+			sha = st.out.trim();
+		} else {
+			err = await step("git commit", await git(wt, "commit", "--no-verify", "-m", message));
+			if (err) return { error: err };
+			sha = (await git(wt, "rev-parse", "HEAD")).out.trim();
+			// the commit must hold the whole working tree, or the reset below would lose the rest
+			if (!(await treeIsClean(wt))) return { error: "changes remained after the commit" };
+		}
+	} else sha = (await git(wt, "rev-parse", "HEAD")).out.trim();
+	if (!/^[0-9a-f]{7,64}$/.test(sha ?? "")) return { error: "no commit to keep" };
+	const err = await step("git branch", await git(repo, "branch", name, sha));
+	if (err) return { error: err };
+	if ((await git(repo, "rev-parse", `refs/heads/${name}`)).out.trim() !== sha) return { error: `branch ${name} does not point at the saved work` };
+	return { name, sha };
+}
+
 export async function reconcileInterrupted({ repo, c, state, save, log, branch }) {
 	const unresolved = [];
 	let web, webKnown = false;
@@ -1750,6 +1791,9 @@ export async function reconcileInterrupted({ repo, c, state, save, log, branch }
 		if (!alive && r?.web && r.sessionId) {
 			const w = await webClientFor();
 			if (w === "unknown") alive = true;
+			// No Pi Web answers. Only a refused connection on the URL the worker ran on proves its server (and with it the
+			// session) is gone; a timeout, a wrong port or no recorded URL proves nothing, so the slot stays reserved.
+			else if (!w) alive = !(r.webUrl && (await connectionRefused(r.webUrl)));
 			else if (w) {
 				const active = async () => {
 					const snap = await w.running(r.sessionId);
@@ -1777,17 +1821,10 @@ export async function reconcileInterrupted({ repo, c, state, save, log, branch }
 			const head = (await git(wt, "rev-parse", "HEAD")).out.trim();
 			const ahead = wt !== repo && head && head !== tip && (await git(wt, "merge-base", "--is-ancestor", head, tip)).code !== 0;
 			if (dirty || ahead) {
-				let sha = head;
-				await git(wt, "add", "-A");
-				if (wt === repo) sha = (await git(wt, "stash", "create", `queue INTERRUPTED ${id}`)).out.trim() || head;
-				else if (dirty) {
-					await git(wt, "commit", "--no-verify", "-m", `queue INTERRUPTED ${id}`);
-					sha = (await git(wt, "rev-parse", "HEAD")).out.trim();
-				}
-				const name = `queue-failed/${String(id).replace(/[^A-Za-z0-9._-]/g, "-")}-interrupted-${Date.now()}`;
-				const made = await git(repo, "branch", name, sha);
-				if (made.code !== 0) { unresolved.push(`${id}: could not keep its work (${firstLine(made.out)})`); continue; }
-				kept = ` · work kept on ${name}`;
+				// Preserve first, verify, and only then reset. Any failed step leaves the worktree untouched.
+				const kept0 = await preserveWork(repo, wt, `queue-failed/${String(id).replace(/[^A-Za-z0-9._-]/g, "-")}-interrupted-${Date.now()}`, `queue INTERRUPTED ${id}`, dirty);
+				if (kept0.error) { unresolved.push(`${id}: could not keep its work (${kept0.error}); worktree left untouched`); continue; }
+				kept = ` · work kept on ${kept0.name}`;
 			}
 			if (wt === repo) await git(wt, "reset", "--hard", "HEAD");
 			else await git(wt, "checkout", "--detach", "--force", tip);
@@ -2098,6 +2135,7 @@ export async function main(repo) {
 				return workItem(ctx, slot, wts[slot], item);
 			})()
 				.catch(async (e) => {
+					ctx.growthReserved?.delete(item.key);
 					state.failed[item.key] = `runner error: ${e?.message ?? e}`;
 					state.running[slot] = { ...(state.running[slot] ?? {}), id: item.id, key: item.key, worktree: wts[slot], quarantined: true };
 					save();

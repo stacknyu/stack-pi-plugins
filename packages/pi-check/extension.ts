@@ -168,7 +168,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (cmd === "flaky") {
-					const st: any = await call(cwd, "/status");
+					const st: any = await call(cwd, "/flaky", {});
 					ctx.ui.notify(`${(st.flaky ?? []).map((f: any) => `${f.count}×  ${f.title}`).join("\n") || "(none)"}\n${(st.flaky ?? []).length} flaky test(s): failed once, passed when run again`, "info");
 					return;
 				}

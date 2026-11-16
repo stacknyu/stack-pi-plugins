@@ -349,7 +349,8 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 		if (!task.tiers || typeof task.tiers !== "object" || Array.isArray(task.tiers)) problems.push('task.json "tiers" must be an object of named presets.');
 		else for (const [name, tier] of Object.entries(task.tiers) as any[]) {
 			if (!/^[a-z][a-z0-9-]*$/.test(name) || !tier || typeof tier !== "object" || Object.keys(tier).some((k) => !TIER_KEYS.includes(k))) { problems.push(`tier "${name}": use a lowercase name and only ${TIER_KEYS.join(", ")}.`); continue; }
-			const model = tier.model ? available.find((m: any) => `${m.provider}/${m.id}` === tier.model) : ctx?.model;
+			const effective = tier.model || task.model || readConfig(cwd).model;
+			const model = effective ? available.find((m: any) => `${m.provider}/${m.id}` === effective) : ctx?.model;
 			if (tier.model && !model) problems.push(`tier "${name}": model ${tier.model} is not available/authenticated.`);
 			if (tier.thinking && model && !getSupportedThinkingLevels(model).includes(tier.thinking)) problems.push(`tier "${name}": ${tier.thinking} is not supported by ${model.provider}/${model.id}.`);
 			tiers[name] = tier;
@@ -435,7 +436,7 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 	if (prev) {
 		const dest = join(cwd, DIR, "archive", `${readConfig(cwd).task || "previous"}-${new Date().toISOString().replace(/\D/g, "").slice(0, 12)}`);
 		mkdirSync(dest, { recursive: true });
-		for (const f of ["state.json", "log.md", "notes", "live", "problem.txt", "manager.json", "control"]) {
+		for (const f of ["state.json", "log.md", "notes", "live", "problem.txt", "manager.json", "control", "report.md", "decisions.md"]) {
 			if (existsSync(join(cwd, DIR, f))) renameSync(join(cwd, DIR, f), join(dest, f));
 		}
 	}
@@ -459,7 +460,7 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 		recovery: task.recovery, // authority belongs to this plan, never inherited from the previous task
 		parallel,
 		worktrees: parallel > 1 ? true : existing.worktrees ?? DEFAULTS.worktrees,
-		setup: info?.install ?? existing.setup ?? "",
+		setup: existing.setup || info?.install || "", // a setup you wrote yourself wins over the detected install
 		readFirst: `AGENTS.md, ${W}/brief.md, ${W}/rules.md, the answers in ${W}/questions.md, and the parts of ${W}/map/*.md and ${W}/inventory.md this item refers to`,
 	};
 	writeFileSync(join(cwd, DIR, "config.json"), `${JSON.stringify(config, null, 2)}\n`);
@@ -478,7 +479,7 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 	};
 }
 
-const CARRIED = ["parallel", "parallelMin", "piWebUrl", "runIn", "piCommand", "copyFromRepo", "checkBroker", "deleteSessions", "keepAwake", "managerIn", "managerModel", "managerThinking", "checkMinutes", "generatedPaths", "worktrees"];
+const CARRIED = ["manager", "setup", "parallel", "parallelMin", "piWebUrl", "runIn", "piCommand", "copyFromRepo", "checkBroker", "deleteSessions", "keepAwake", "managerIn", "managerModel", "managerThinking", "checkMinutes", "generatedPaths", "worktrees"];
 /** The operational settings a new plan keeps from the previous queue config; everything else is reset. */
 export function carriedConfig(previous: any): any {
 	return Object.fromEntries(Object.entries(previous ?? {}).filter(([k]) => CARRIED.includes(k)));
@@ -640,7 +641,9 @@ async function control(cwd: string, ctl: any): Promise<string> {
 	enqueueControl(cwd, { ...ctl, task: cfg.task, by: "user" });
 	if (runnerPid(cwd)) return `${ctl.action} queued; the runner applies it within seconds.`;
 	// asking for work to run again means: run it. No second command needed.
-	if (cfg.queue && ["retry", "recheck", "rerun", "unpark", "next", "add", "limits", "skip"].includes(ctl.action) && !runnerPid(cwd, "supervisor")) {
+	// Only actions that ask for failed work to run again start the queue, and never over your pause/stop.
+	const held = existsSync(join(cwd, DIR, "PAUSE")) || existsSync(join(cwd, DIR, "STOP"));
+	if (cfg.queue && !held && ["retry", "limits", "skip"].includes(ctl.action) && !runnerPid(cwd, "supervisor")) {
 		const err = await startRunner(cwd, true);
 		return err ? `${ctl.action} queued, but the queue did not start:\n${err}` : `${ctl.action} queued and the queue started.`;
 	}

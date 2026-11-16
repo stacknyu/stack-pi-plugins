@@ -107,7 +107,7 @@ async function main() {
 			return 0;
 		}
 		case "flaky": {
-			const s = await call(cwd, "/status");
+			const s = await call(cwd, "/flaky", {});
 			for (const f of s.flaky ?? []) process.stdout.write(`${String(f.count).padStart(3)}×  ${f.title}  (last ${new Date(f.last).toISOString().slice(0, 16).replace("T", " ")})\n`);
 			process.stdout.write(`${(s.flaky ?? []).length} flaky test(s) seen: they failed once and passed when run again\n`);
 			return 0;

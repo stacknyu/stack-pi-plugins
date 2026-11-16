@@ -195,6 +195,7 @@ test("Pi Web HTTP contract reads fresh results and waits for subagents, includin
 		if (["descendants", "grandchildren"].includes(scenario)) assert.equal(polls, 4);
 		if (scenario === "grandchildren") assert.equal(catalogReads, 2);
 		if (scenario.startsWith("abort-")) { assert.equal(aborted, true); assert.equal(result.quiescent, false); }
+		globalThis.fetch.mock.restore(); // stacked mocks on one method do not unwind to the real fetch at test end
 	}
 });
 
@@ -620,17 +621,19 @@ test("a BLOCKED item is never split; only a size stop splits, into at most split
 	assert.match(Object.values(blocked.state().failed)[0], /BLOCKED/);
 	assert.equal(blocked.events().filter((e) => e.kind === "start" && e.id === "A01").length, 1, "no split prompt was sent");
 
-	const six = Array.from({ length: 6 }, (_, i) => `ITEM: Part ${i + 1}. Done when: part ${i + 1} exists. [areas: out/A01${"abcdef"[i]}.txt]`).join("\n");
-	for (const [growthMax, parts] of [[0, 4], [1, 2]]) {
+	const parts = (n) => Array.from({ length: n }, (_, i) => `ITEM: Part ${i + 1}. Done when: part ${i + 1} exists. [areas: out/A01${"abcdef"[i]}.txt]`).join("\n");
+	// [growthMax, parts the agent proposes, parts kept] — a decomposition larger than what fits is refused whole, never cut short
+	for (const [growthMax, proposed, kept] of [[0, 4, 4], [0, 6, 0], [1, 2, 2], [1, 4, 0]]) {
 		const kids = ["a", "b", "c", "d"].map((x) => ({ id: `A01${x}` }));
-		const f = schedulerFixture(t, [{ id: "A01", replies: ["NEEDS: 500 files, 99999 lines", six] }, ...kids], { autoSplit: true, growthMax });
+		const f = schedulerFixture(t, [{ id: "A01", replies: ["NEEDS: 500 files, 99999 lines", parts(proposed)] }, ...kids], { autoSplit: true, growthMax });
 		writeFileSync(join(f.repo, ".tasks/sample/items.md"), `- [ ] ${f.items[0].line}\n`);
 		f.git("add", ".tasks"); f.git("commit", "-m", "only the parent is planned");
 		await f.start();
-		const state = f.state();
-		assert.equal(Object.values(state.splits)[0].length, parts, `growthMax ${growthMax}`);
-		assert.equal(Object.keys(state.done).length, parts);
-		assert.equal(Object.keys(state.failed).length, 0);
+		const state = f.state(), label = `growthMax ${growthMax}, ${proposed} proposed`;
+		assert.equal(Object.values(state.splits ?? {})[0]?.length ?? 0, kept, label);
+		assert.equal(Object.keys(state.done).length, kept, label);
+		if (!kept) assert.match(Object.values(state.failed)[0], new RegExp(`needs ${proposed} parts but at most ${growthMax ? 2 : 4} fit`), label);
+		if (!kept) assert.match(f.prompt("A01", 2), new RegExp(`2 to ${growthMax ? 2 : 4}, never more`), label);
 	}
 });
 
@@ -810,6 +813,50 @@ test("plan lint rejects a Done when with an escape hatch; handoff does not inher
 	assert.equal(lint.findings.length, 1);
 	assert.match(lint.findings[0], /^Y01: its "Done when" passes without the change/);
 	const { carriedConfig } = await import("./extension.ts");
-	const kept = carriedConfig({ escalate: [], autoSplit: false, fixRounds: 0, maxNetLines: 10, parallel: 3, piWebUrl: "http://x", runIn: "cli" });
-	assert.deepEqual(kept, { parallel: 3, piWebUrl: "http://x", runIn: "cli" });
+	const kept = carriedConfig({ escalate: [], autoSplit: false, fixRounds: 0, maxNetLines: 10, parallel: 3, piWebUrl: "http://x", runIn: "cli", manager: false, setup: "make deps" });
+	assert.deepEqual(kept, { parallel: 3, piWebUrl: "http://x", runIn: "cli", manager: false, setup: "make deps" });
+});
+
+// ---------- 1.8.2: independent audit findings ----------
+
+test("recovery never resets a worktree whose work could not be preserved", { timeout: 30000 }, async (t) => {
+	const { reconcileInterrupted, preserveWork } = await import("./runner.mjs");
+	const f = schedulerFixture(t, [{ id: "A01" }]);
+	const wt = join(f.repo, ".pi-queue/worktrees/w0");
+	f.git("worktree", "add", "--detach", wt, "main");
+	writeFileSync(join(wt, "out/half.txt"), "unsaved work\n");
+	const lock = execFileSync("git", ["rev-parse", "--git-path", "index.lock"], { cwd: wt, encoding: "utf8" }).trim();
+	writeFileSync(lock.startsWith("/") ? lock : join(wt, lock), ""); // every index write fails: add and commit cannot succeed
+	const state = { running: { 0: { id: "A01", key: f.items[0].key, worktree: wt } }, failed: {} };
+	const left = await reconcileInterrupted({ repo: f.repo, c: DEFAULTS, state, save: () => {}, log: () => {}, branch: "main" });
+	assert.equal(left.length, 1);
+	assert.match(left[0], /could not keep its work \(git add/);
+	assert.equal(readFileSync(join(wt, "out/half.txt"), "utf8"), "unsaved work\n", "nothing was reset");
+	assert.ok(state.running[0], "the slot stays reserved");
+	assert.equal(f.git("branch", "--list", "queue-failed/*").trim(), "");
+	rmSync(lock.startsWith("/") ? lock : join(wt, lock));
+	const ok = await preserveWork(f.repo, wt, "queue-failed/kept", "keep", true);
+	assert.equal(ok.name, "queue-failed/kept");
+	assert.match(f.git("show", "queue-failed/kept:out/half.txt"), /unsaved work/);
+});
+
+test("a Pi Web worker counts as stopped only when its server refuses connections", { timeout: 60000 }, async (t) => {
+	const { reconcileInterrupted } = await import("./runner.mjs");
+	const http = await import("node:http"), net = await import("node:net");
+	const hanging = http.createServer(() => {}); // accepts, never answers
+	await new Promise((r) => hanging.listen(0, "127.0.0.1", r));
+	const closed = net.createServer(); await new Promise((r) => closed.listen(0, "127.0.0.1", r));
+	const closedPort = closed.address().port; await new Promise((r) => closed.close(r));
+	t.after(() => hanging.close());
+	const agentDir = mkdtempSync(join(tmpdir(), "pi-flow-agent-")), before = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	t.after(() => { if (before === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = before; rmSync(agentDir, { recursive: true, force: true }); });
+	const f = schedulerFixture(t, [{ id: "A01" }]);
+	const c = { ...DEFAULTS, piWebUrl: `http://127.0.0.1:${closedPort}`, worktrees: false };
+	for (const [webUrl, reclaimed] of [[`http://127.0.0.1:${closedPort}`, true], [`http://127.0.0.1:${hanging.address().port}`, false], [undefined, false]]) {
+		const state = { running: { 0: { id: "A01", key: f.items[0].key, worktree: f.repo, web: true, sessionId: "s1", ...(webUrl ? { webUrl } : {}) } }, failed: {} };
+		const left = await reconcileInterrupted({ repo: f.repo, c, state, save: () => {}, log: () => {}, branch: "main" });
+		assert.equal(left.length === 0, reclaimed, String(webUrl));
+		assert.equal(!state.running[0], reclaimed, String(webUrl));
+	}
 });

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, realpathSync, existsSync, symlinkSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, realpathSync, existsSync, symlinkSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -458,4 +458,36 @@ test("measured durations choose the lane; an explicit lane still wins", (t) => {
 	b.durations[slow.uid] = 500;
 	assert.equal(b.laneOf(slow), "fast");
 	assert.ok(["fast", "heavy"].includes(before));
+});
+
+test("a retry keeps every failure it sees, and a retry that gives no verdict is an error, never a pass", { timeout: 120000 }, async (t) => {
+	const { root, b, git } = fixture(t, { languages: { go: false, ts: false, python: true } });
+	const mark = join(root, ".pi-check", "retry-mark");
+	mkdirSync(join(root, "tests"), { recursive: true });
+	writeFileSync(join(root, "pyproject.toml"), "[project]\nname = \"x\"\nversion = \"0\"\n");
+	// first run: A fails. Retry: A passes, B (which passed the first time) fails.
+	const counter = (name) => `n = int(open(M + "${'${name}'}").read()) + 1 if os.path.exists(M + "${'${name}'}") else 1\n    open(M + "${'${name}'}", "w").write(str(n))\n`;
+	writeFileSync(join(root, "tests/test_flip.py"), `import os\nM = ${JSON.stringify(mark)}\ndef test_a():\n    ${counter("a")}    assert n > 1, "fails on the first run only"\ndef test_b():\n    ${counter("b")}    assert n < 2, "fails on the retry only"\n`);
+	git("add", "."); git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "py");
+	const r = await b.run({ root, scope: "all", kinds: ["test"], strict: true }); // on the base checkout every failure is pre-existing; strict counts them
+	assert.equal(r.ok, false, r.text);
+	assert.match(r.text, /✗ tests\/test_flip\.py::test_b/);
+	assert.match(r.text, /flaky, passed when run again.*test_a/);
+	// a different retry policy is a different result
+	const rc = b.root(b.main).rc, [item] = b.plan(rc, { scope: "all", kinds: ["test"] });
+	b.config.flakyRetries = 0;
+	assert.notEqual(b.keyOf(rc, item.project, item.kind, item.unit), item.key);
+});
+
+test("a Go test that times out on its retry is an error and is not cached", { timeout: 120000 }, async (t) => {
+	const { root, b, git } = fixture(t, { languages: { go: true, ts: false, python: false }, projects: { ".": { vet: false, test: { timeout: "3s" } } } });
+	const mark = join(root, ".pi-check", "timeout-mark");
+	writeFileSync(join(root, "go.mod"), "module example.test/slow\n\ngo 1.22\n");
+	writeFileSync(join(root, "slow_test.go"), `package slow\n\nimport (\n\t"os"\n\t"testing"\n\t"time"\n)\n\nfunc TestSlow(t *testing.T) {\n\tif _, err := os.Stat(${JSON.stringify(mark)}); err != nil {\n\t\tos.WriteFile(${JSON.stringify(mark)}, nil, 0o644)\n\t\tt.Fatal("first run fails")\n\t}\n\ttime.Sleep(10 * time.Second)\n}\n`);
+	git("add", "."); git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "go");
+	const r = await b.run({ root, scope: "all", kinds: ["test"] });
+	assert.equal(r.ok, false, r.text);
+	assert.equal(r.errors, 1, r.text);
+	const rc = b.root(b.main).rc, [item] = b.plan(rc, { scope: "all", kinds: ["test"] });
+	assert.equal(b.cacheGet(item.key), undefined, "an error is never cached");
 });

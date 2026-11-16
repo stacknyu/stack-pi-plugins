@@ -182,7 +182,8 @@ export class Broker {
 		const a = ADAPTERS[project.lang];
 		const opts = kindOptions(rc.config, project.dir, kind) || {};
 		if (env) opts.env = { ...env, ...opts.env };
-		return sha(JSON.stringify([4, process.platform, process.arch, process.version, project.lang, a.version, project.dir, kind, unit.target, a.argsKey(opts, project), a.executionKey?.(rc, project, opts), extra, rc.digest(unit.inputs)]));
+		const policy = kind === "test" ? { flakyRetries: this.config.flakyRetries } : {}; // a pass after a retry is not a pass without one
+		return sha(JSON.stringify([4, process.platform, process.arch, process.version, project.lang, a.version, project.dir, kind, unit.target, a.argsKey(opts, project), a.executionKey?.(rc, project, opts), extra, policy, rc.digest(unit.inputs)]));
 	}
 
 	/** Units a request covers, with their current keys. */
@@ -463,7 +464,7 @@ export class Broker {
 			for (const t of this.pending) {
 				if (batch.length >= max) break;
 				if (t === first || t.exec) continue;
-				if (t.root === first.root && t.project.id === first.project.id && t.kind === first.kind && t.extra === first.extra && t.speculative === first.speculative) batch.push(t);
+				if (t.root === first.root && t.project.id === first.project.id && t.kind === first.kind && t.extra === first.extra && t.speculative === first.speculative && this.laneOf(t) === this.laneOf(first)) batch.push(t);
 			}
 		}
 		this.pending = this.pending.filter((t) => !batch.includes(t));
@@ -614,15 +615,22 @@ export class Broker {
 			if (job.ac.signal.aborted) { again.push(...batch); break; }
 			for (const { t, first } of batch) {
 				const r2 = second.results.get(t.unit.target);
-				const stillIds = new Set((r2?.failures ?? []).map((f) => f.id));
-				const still = r2?.status === "pass" ? [] : r2?.status === "fail" ? first.failures.filter((f) => stillIds.has(f.id)) : first.failures;
-				const cured = first.failures.filter((f) => !still.includes(f));
-				const sameAgain = r2?.status === "fail" && !still.length ? r2.failures : still; // a different test failed the second time: report that
+				const ms = Math.round(((first.seconds ?? 0) + (r2?.seconds ?? 0)) * 1000) || per;
+				const earlier = first.flaky ?? []; // tests already cured in an earlier round stay reported
+				// The retry did not produce a verdict (timeout, crash, killed, no result): that is an error, never a cacheable failure or pass.
+				if (!r2 || !["pass", "fail"].includes(r2.status)) {
+					finalize(t, { ...first, status: "error", failures: [...first.failures, ...(r2?.failures ?? [{ id: `${t.uid}:[retry]`, title: `${t.unit.label}: the retry run gave no result`, output: "" }])], flaky: earlier }, ms);
+					continue;
+				}
+				// Every failure of the retry run counts (also tests that passed the first time); first-run failures absent now were flaky.
+				const now = r2.status === "fail" ? r2.failures : [];
+				const nowIds = new Set(now.map((f) => f.id));
+				const cured = first.failures.filter((f) => !nowIds.has(f.id));
 				for (const f of cured) this.flaky[f.id] = { count: (this.flaky[f.id]?.count ?? 0) + 1, last: Date.now(), title: f.title, uid: t.uid };
 				if (cured.length) { this.stats.flaky = (this.stats.flaky ?? 0) + cured.length; this.flakyDirty = true; }
-				const ms = Math.round(((first.seconds ?? 0) + (r2?.seconds ?? 0)) * 1000) || per;
-				const merged = sameAgain.length ? { ...first, failures: sameAgain, flaky: cured.map((f) => ({ id: f.id, title: f.title })) } : { ...first, status: "pass", failures: [], flaky: cured.map((f) => ({ id: f.id, title: f.title })), note: `${cured.length} test(s) failed once and passed when run again (flaky)` };
-				if (sameAgain.length && round + 1 < this.config.flakyRetries && retryable(merged)) again.push({ t, first: merged });
+				const flaky = [...earlier, ...cured.map((f) => ({ id: f.id, title: f.title }))];
+				const merged = now.length ? { ...r2, status: "fail", failures: now, flaky } : { ...r2, status: "pass", failures: [], flaky, note: `${flaky.length} test(s) failed once and passed when run again (flaky)` };
+				if (now.length && round + 1 < this.config.flakyRetries && retryable(merged)) again.push({ t, first: merged });
 				else finalize(t, merged, ms);
 			}
 		}
@@ -876,9 +884,9 @@ export class Broker {
 				g.new.push({ title: `${it.unit.label}: inputs changed during execution; result is not current`, stale: true });
 				continue;
 			}
+			for (const f of res?.flaky ?? []) g.flaky.push(f); // also on a unit that still fails for another reason
 			if (res.status === "pass") {
 				g.pass++;
-				for (const f of res.flaky ?? []) g.flaky.push(f);
 				for (const [, kn] of Object.entries(this.known.ids)) if (kn.uid === it.uid) g.fixed++;
 				continue;
 			}
@@ -1026,6 +1034,7 @@ export class Broker {
 			stats: { ...this.stats, saved: fmtMs(this.stats.savedMs), spent: fmtMs(this.stats.ranMs) },
 			known: Object.keys(this.known.ids).length,
 			flaky: Object.entries(this.flaky).sort((a, b) => b[1].count - a[1].count).slice(0, 20).map(([id, f]) => ({ id, count: f.count, title: f.title, last: f.last })),
+			flakyTotal: Object.keys(this.flaky).length,
 			measured: Object.keys(this.durations).length,
 			recent: this.recent.slice(0, 10),
 		};
@@ -1129,6 +1138,8 @@ export async function serve(main) {
 			switch (url.pathname) {
 				case "/ping":
 					return json(200, { ok: true, pid: process.pid, version: VERSION });
+				case "/flaky":
+					return json(200, { flaky: Object.entries(b.flaky).sort((x, y) => y[1].count - x[1].count).map(([id, f]) => ({ id, count: f.count, title: f.title, last: f.last })) });
 				case "/status":
 					return json(200, b.status());
 				case "/touch":

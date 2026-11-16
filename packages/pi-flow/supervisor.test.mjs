@@ -575,3 +575,24 @@ console.log(JSON.stringify({type:"message_end",message:{role:"assistant",stopRea
 		}
 	}
 });
+
+test("a thinking-only tier is validated against the task's model, not the planning chat's", async (t) => {
+	const { handoff } = await import("./extension.ts");
+	const { repo } = fixture(t);
+	const dir = join(repo, ".tasks/sample");
+	const small = { provider: "example", id: "small", reasoning: false, cost: { input: 1, output: 2 } };
+	const large = { provider: "example", id: "large", reasoning: true, cost: { input: 3, output: 6 } };
+	writeFileSync(join(dir, "items.md"), "- [ ] A01 — Write out/a.txt. Done when: created. [areas: out] [tier: deep]\n");
+	saveJson(join(dir, "task.json"), { allowedPaths: ["out"], checks: ["git diff --check"], model: "example/small", thinking: "off", tiers: { deep: { thinking: "high" } } });
+	const result = await handoff(repo, "sample", { model: large, modelRegistry: { getAvailable: () => [small, large] } });
+	assert.equal(result.ok, false);
+	assert.match(result.text, /tier "deep": high is not supported by example\/small/);
+});
+
+test("retry/limits/skip start the queue, but never over a pause", { timeout: 30000 }, async (t) => {
+	const { repo } = fixture(t, "pass");
+	await control(repo, { action: "pause" });
+	assert.match(await control(repo, { action: "retry", ids: ["A01"] }), /applies on the next start/);
+	assert.match(await control(repo, { action: "next", ids: ["A01"] }), /applies on the next start/);
+	assert.equal(existsSync(join(repo, ".pi-queue/supervisor.pid")), false);
+});
