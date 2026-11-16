@@ -10,7 +10,9 @@ After an approved handoff passes its baseline, a detached supervisor watches the
 - Agree `task.json.recovery` upfront: recommended `{"maxAttempts":2,"maxRepairs":4,"maxRestarts":2}`. Attempts are per failed item; repairs and clean restarts are task-wide. Handoff accepts integers 0–5 / 0–20 / 0–5, including zero to disable an action. Budgets are persisted before dispatch and survive supervisor restarts. Legacy plans without this authority retain two retries/two restarts but cannot create repair items.
 - One repair proposal targets one original failed item with up to three concrete work lines. Repairs must fit both its original areas and task allowed paths, inherit checks/model/size limits, and run before the original item is attempted again. Repairs cannot spawn further repairs. No changed checks, guessed provider/model, new goal, destructive reset or fabricated credentials.
 - Manual pause/stop, changed approval/configuration and uncertain target ownership prevent recovery. Missing decisions/credentials and exhausted budgets remain recorded failures; they do not freeze independent safe work. Quarantined work is preserved, never reclaimed automatically.
-- A crash with recorded workers quarantines their worktrees: no reset, cleanup or automatic orphan reclamation. Quiet tests/provider retries are not treated as hangs.
+- A dead runner is restarted without a model turn; the restart budget (`maxRestarts`) counts restarts with no item passing in between. On start the runner reconciles interrupted workers: it stops any that still run, keeps their changes on `queue-failed/<id>-interrupted-*`, frees the worktree and queues the item again (`autoReconcile: false` keeps the old fail-closed behaviour).
+- Timeouts and session/provider errors are retried without a model (`retryTransient`). `BLOCKED: decision:` / `BLOCKED: env:`, scope and exhausted budgets are left for you; other failures are diagnosed by the manager model, and retried on the recorded evidence if that model cannot be reached.
+- The manager runs as background pi (`managerIn: "web"` to use Pi Web); `managerModel` / `managerThinking` pick a cheaper model for it. Changing `parallel` does not revoke management. On macOS the supervisor keeps the machine awake (`keepAwake`).
 - Set `manager: false` in `.pi-queue/config.json` to disable automatic management. A direct `node runner.mjs` invocation is unsupervised; normal handoff and `/queue start` launch the supervisor.
 - Models requiring a custom provider extension cannot run in the isolated chat-only manager; configure an available built-in/configured provider. No model fallback is guessed.
 
@@ -24,13 +26,16 @@ After an approved handoff passes its baseline, a detached supervisor watches the
 |---|---|
 | `queue_overview` | counts, running items, failed items with reasons, parked and open items, recent log |
 | `queue_item` | one item: its line, status, commit (files changed), last result, activity |
-| `queue_control` | `stop`, `start`, `retry`, `recheck`, `rerun`, `unpark`, `next`, `add`, `parallel` |
+| `queue_control` | `stop`, `pause`, `start`, `retry`, `answer`, `limits`, `skip`, `recheck`, `rerun`, `unpark`, `next`, `add`, `parallel` |
 
 `ids` are item ids or prefixes: `V04` matches `V04a…V04h`. Empty ids means all.
 
 | Action | Effect |
 |---|---|
-| `retry` | failed or parked items run again |
+| `retry` | failed or parked items run again; starts the queue if it is not running |
+| `answer` | ids + text: your decision or guidance is added to the items' evidence, then they run again. The way to resolve `BLOCKED: decision` |
+| `limits` | ids + `{maxNetLines, maxFilesGrowing, itemMinutes}`: raise limits for those items, then run them again |
+| `skip` | accept items as done without running them; their dependents proceed |
 | `recheck` | passed `[check]` items run again |
 | `rerun` | passed items run again (their commits stay; the new run builds on top) |
 | `unpark` | parked/deferred items run normally, in parallel, without waiting for the end |
@@ -40,6 +45,8 @@ After an approved handoff passes its baseline, a detached supervisor watches the
 | `stop` / `start` | stop the run (running items' work kept on branches) / start it |
 
 Controls go through atomic files in `.pi-queue/control/`. The runner alone applies them, within seconds while running or on the next start otherwise; applied actions are logged. `/queue pause` lets current workers finish; `/queue stop` aborts them and preserves work. Only an explicit `/queue start` clears those markers. Wait for the old runner/supervisor to exit before starting.
+
+`/queue report` shows the end-of-run report (`.pi-queue/report.md`): failures grouped by what they need, each with how many items it holds up. `/queue answer <id> <text>` and `/queue skip <ids>` exist too.
 
 The same actions exist as commands: `/queue retry [id]`, `/queue recheck [id]`, `/queue rerun <id>`, `/queue unpark`, `/queue next <ids>`, `/queue parallel <n>`.
 
@@ -59,3 +66,17 @@ The same actions exist as commands: `/queue retry [id]`, `/queue recheck [id]`, 
 - Never edit code, revert commits or delete branches. If that is needed, say so.
 - Never add items the user did not agree to.
 - Queue items cannot use these tools (they refuse inside `.pi-queue/worktrees/` and in sessions named `queue …`).
+
+## Unattended behaviour (1.8)
+
+| Situation | What happens without you |
+|---|---|
+| Provider/session error before any work | all workers pause (30 s → 30 min) and ask again in the same session, up to `outageMinutes` |
+| Worker asks `BLOCKED: decision:` | with `autonomy: "full"` the manager model answers from brief/rules/questions, logs it in `.pi-queue/decisions.md`, reruns the item. `"ask"` leaves it for you |
+| Runner error in one item | worker stopped, work kept on `queue-failed/…`, slot freed, item tried again (max twice) |
+| Item out of time | one shorter turn to finish; next attempt gets 1.5× the time |
+| Runner dies / machine slept | supervisor restarts it; interrupted workers are reconciled |
+| Setup or baseline fails at start | retried after 1 and 5 minutes |
+| `BLOCKED: env:`, credentials, scope, budgets used up | waits for you: `/queue report`, then `/queue answer <id> <text>` |
+
+Manager mode belongs to the chat named `manager…`: every turn gets the rules and the current overview, so it keeps working after reloads and long conversations.

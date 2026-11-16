@@ -37,3 +37,9 @@ The checks fail on today's code, so every item would fail. `/queue problem` show
 **Nothing happens overnight.** Keep the machine awake (`caffeinate -dims`) and Pi Web running for Web workers. The detached supervisor survives closing the planning chat, not a machine shutdown or killed supervisor. Explicit start resumes saved state only when no interrupted worker ownership remains. Grant project trust before starting unattended CLI workers; saved trust denials are not overridden.
 
 **Parallel items rerun the same tests and the machine crawls.** Install pi-check (a separate plugin). The queue then sends every check through one shared broker per repo. Results are cached by file content and shared by all worktrees, identical runs in progress are joined, and heavy runs are throttled. Go failures that already fail on the base branch stop blocking items. See `/check status` for what runs and how much time was saved.
+
+**The queue grew far beyond the plan.** Fixed in 1.7: BLOCKED items are no longer split, splits make 2–4 parts, and all derived items share `growthMax` (default 30% of the plan). If items still stop on size, set `"limits"` in the plan's `task.json`, or `limits` through the manager.
+
+**An overnight run stopped early.** Read `/queue report`. What is listed under "needs your decision" or "needs environment" could not be decided by the queue: answer with `/queue answer <id> <text>` (the queue starts again by itself). "interrupted workers remain" only appears now when a worker is still running and could not be stopped; stop that session and `/queue start`.
+
+**Many tiny items, each a full session on the strongest model.** A planning defect. The handoff now refuses plans with mergeable items; define `"tiers"` in `task.json` and tag mechanical items `[tier: light]`.

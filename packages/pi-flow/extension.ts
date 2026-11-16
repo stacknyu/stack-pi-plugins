@@ -37,6 +37,12 @@ import {
 	loadJson,
 	itemConfig,
 	parseQueue,
+	planLint,
+	failureGroups,
+	growthUsed,
+	growthBudget,
+	LIMIT_KEYS,
+	TIER_KEYS,
 	readConfig,
 	run,
 	tail,
@@ -183,7 +189,7 @@ function liveLines(cwd: string): string[] {
 	const log = readText(join(cwd, DIR, "log.md"))
 		.trim()
 		.split("\n")
-		.filter((l) => /\b(PASS|FAIL|CONFLICT|REDO|SPLIT|WIDTH|LIMITS RAISED|STOPP|END|NOT STARTED|ERROR|CRASH|CLEANUP)\b/.test(l))
+		.filter((l) => /\b(PASS|FAIL|CONFLICT|REDO|SPLIT|GAPS|WAITING|DEFERRED|RECONCILED|MANAGER|WIDTH|LIMITS RAISED|STOPP|END|NOT STARTED|ERROR|CRASH|CLEANUP)\b/.test(l))
 		.slice(-5)
 		.map((l) => `  ${l.replace(/^- \d{4}-\d\d-\d\d /, "")}`);
 	const manager = loadJson(join(cwd, DIR, "manager.json"), {});
@@ -259,9 +265,12 @@ The pi-flow skill's references/items.md explains the item format, tags and how t
   "checks": [commands that must pass after every item: prefer the verified ones above, covering every package the task touches; each must pass on the current code${checkBroker({}) ? `. pi-check is installed: the single entry "pi-check" runs the tests, type checks and lint each item affects in every Go/TypeScript/Python project and ignores failures that already exist on the base branch; prefer ["pi-check"] plus any check it cannot cover (custom scripts)` : ""}],
   "parallel": <how many agent items may run at once, judged from independence and the user's preference; expensive checks have a separate pi-check budget>,
   "model": <optional default exact provider/id from the catalog>, "thinking": <optional supported default level>,
-  "recovery": {"maxAttempts": 2, "maxRepairs": 4, "maxRestarts": 2}
-- Agree recovery authority upfront in rules.md/questions.md: retries per failed item, total narrowly scoped repair items, and clean runner restarts. The recommended recovery budget above needs no further approval during execution; set individual budgets to 0 to prohibit them. Handoff accepts maximums of 5 attempts, 20 repair items and 5 restarts. Repairs inherit the failed item's paths, checks, model and limits; no new goals, credentials, destructive recovery or safety bypass. Resolve required environment access and decisions before launch. Unrepairable work is recorded as failed while independent work continues.
-- Choose [model: provider/id] and [thinking: level] for each item during planning. Use the least costly model/effort you judge sufficient, not automatically the cheapest: routine localized edits may need less; cross-cutting design, authority/security, migrations and final verification need stronger reasoning. Honor the user's model preferences. Record a short rationale per class of items in rules.md. Do not claim an objectively perfect model or infer speed from price. With no catalog, inherit defaults rather than guess.
+  "tiers": {"light": {"model": <cheap/fast provider/id>, "thinking": "low"}, "standard": {"model": …, "thinking": "medium"}, "heavy": {"model": …, "thinking": "high"}} — only models from the catalog; a tier may also set "maxNetLines", "maxFilesGrowing", "itemMinutes",
+  "limits": {"maxNetLines": 150, "maxFilesGrowing": 5, "itemMinutes": 40} — the size/time every item starts with. When the user asks for higher limits, or the repo's files are large, set them HERE; nothing else makes them apply,
+  "autonomy": "full" (default: while the queue runs, the automatic manager answers workers' decision questions itself from brief/rules/questions and logs each answer in .pi-queue/decisions.md) or "ask" (such items wait for the user). Use "ask" only when the user wants to make those calls personally,
+  "recovery": {"maxAttempts": 2, "maxRepairs": 4, "maxRestarts": 3}
+- Agree recovery authority upfront in rules.md/questions.md: retries per failed item, total narrowly scoped repair items, and clean runner restarts. The recommended recovery budget above needs no further approval during execution; set individual budgets to 0 to prohibit them. Handoff accepts maximums of 5 attempts, 20 repair items and 10 restarts (restarts count only while no item passes in between). Repairs inherit the failed item's paths, checks, model and limits; no new goals, credentials, destructive recovery or safety bypass. Resolve required environment access and decisions before launch. Unrepairable work is recorded as failed while independent work continues.
+- Choose a [tier: light|standard|heavy] for each item during planning (or an exact [model: provider/id] [thinking: level] when one item needs something special). Use the least costly tier you judge sufficient, not automatically the cheapest: copy/text changes, renames, config and other mechanical localized edits are light; ordinary feature work is standard; cross-cutting design, authority/security, migrations and final verification are heavy. Never give a mechanical edit the strongest model. Honor the user's model preferences. Record a short rationale per tier in rules.md. Do not claim an objectively perfect model or infer speed from price. With no catalog, omit "tiers" and the tags and inherit defaults rather than guess.
 - Decide size-escalation/splitting policy upfront in rules.md; automatic increases never override explicit repository/task prohibitions. Resolve approval questions now, not during unattended work.
 
 ## 3. Ask
@@ -284,12 +293,21 @@ When every file is written (in an earlier step, not in the same batch of tool ca
 Rules for items:
 - Each item is done by a fresh agent that has never seen this conversation. It reads AGENTS.md, brief.md, rules.md, the answers in questions.md, and the map/inventory parts the item names. Everything it needs must be there or in the item line.
 - Ids: a capital-letter prefix plus a number (A01, A02, B01…), unique. File order breaks ties; actual prerequisites belong in [after].
-- Size: one coherent change, normally at most 5 files gaining lines and 150 net added lines. A bigger item is fine when splitting it would be artificial; the queue raises limits on request and splits items that stall.
+- Granularity is the most important planning decision. Every item costs a full agent session: it re-reads the plan, runs the checks and merges. One item = one coherent change worth roughly 10–40 minutes of agent work.
+  - Never make a trivial edit (a text/copy change, a label, a rename, a one-line config or style tweak) its own item. Fold all such edits for one screen/module into one item, or into the feature item that already touches those files.
+  - Items that change exactly the same files and do not depend on each other must be ONE item: they could only run one after another anyway.
+  - Do not split a change across items just to keep each one tiny, and do not create one item per file. Most tasks need 5–40 items; needing more than about 60 usually means the items are too small.
+  - The other direction: an item that needs more than the "limits" in task.json gets [big] or [files=… lines=… min=…]; one that cannot be described in a single "Done when" is two items.
+- Size: an item must fit the "limits" in task.json (default 5 files gaining lines, 150 net added lines). The queue raises limits when an agent asks, and splits only what is still too big at the top level; it never grows by more than about 30% of your item count, so plan the sizes properly here.
 - [areas: …] is required: the narrowest folders/files the item changes. Items with overlapping areas never run at the same time; disjoint ones run in parallel. Accurate areas mean speed and no conflicts.
-- [after: …] only for real dependencies (a helper built in A01 used by A05). Do not chain independent items or add blanket stage barriers. The scheduler prioritizes prerequisites on the longest remaining dependency chain and fills free slots with disjoint ready items. Use [after: *] only for genuinely whole-task verification; otherwise give checks their exact prerequisites.
+- [after: …] for every real dependency (a helper, type, endpoint, migration or schema built in A01 and used by A05), and only for those. If an item's text names another item, it almost always needs [after] on it: an item that runs before its prerequisite wastes a session. Walk the list once before handoff and ask of each item "what must already exist in the code for this to compile and pass the checks?". Do not chain independent items or add blanket stage barriers. The scheduler prioritizes prerequisites on the longest remaining dependency chain and fills free slots with disjoint ready items. Use [after: *] only for genuinely whole-task verification; otherwise give checks their exact prerequisites.
 - Every item must leave the checks passing. No item may depend on an unanswered question.
 - Verification goes into [check] items: "- [ ] V01 — Check <what>. Done when: <what must hold>. [check] [areas: <what it verifies>] [after: <the items it verifies>]". A check passes without changes when everything holds; it may fix tests/docs; when it finds production gaps it reports them and the queue adds fix items and checks again. A passed check runs again automatically when an item it covers changes later.
-- No "investigate" or "review" items that produce nothing: every item either changes code/docs or is a [check].`;
+- No "investigate" or "review" items that produce nothing: every item either changes code/docs or is a [check].
+- Few, meaningful [check] items: one per area or milestone plus one final [after: *] check, not one per work item. Each check costs a session and can add fix items.
+- The queue runs unattended. Write rules.md so that a manager model with no tools can settle open questions from it: state the conventions to follow, the defaults to prefer ("when unsure, match the nearest existing screen/module"), and anything that must never be done.
+- Settle decisions now. An item that would have to ask "which option?" at run time stops for the user: put the question in questions.md, or decide it in rules.md.
+- The handoff tool lints the plan (items to merge, missing [after], areas that serialize the queue) and reports how many rounds it needs with your "parallel". Fix what it reports; set "planLint": "accept: <reason>" in task.json only for a finding that is genuinely wrong.`;
 }
 
 // ---------- handoff ----------
@@ -317,8 +335,25 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 	if (noDone.length) problems.push(`${noDone.length} item(s) have no "Done when:": ${noDone.slice(0, 6).map((i) => i.id).join(", ")}`);
 	const noAreas = (items as any[]).filter((i) => !i.areas?.length);
 	if (noAreas.length) problems.push(`${noAreas.length} item(s) have no [areas: …]: ${noAreas.slice(0, 6).map((i) => i.id).join(", ")}`);
-	const defaults = { ...readConfig(cwd), ...(task.model !== undefined ? { model: task.model } : {}), ...(task.thinking !== undefined ? { thinking: task.thinking } : {}) };
 	const available = ctx?.modelRegistry?.getAvailable?.() ?? [];
+	// task-wide size limits and model tiers come from the plan: this is where "use higher limits" becomes real
+	const limits: any = {};
+	if (task.limits !== undefined) {
+		if (!task.limits || typeof task.limits !== "object" || Array.isArray(task.limits) || Object.entries(task.limits).some(([k, v]) => !LIMIT_KEYS.includes(k) || !Number.isInteger(v) || (v as number) <= 0)) problems.push(`task.json "limits" may only set positive integers for ${LIMIT_KEYS.join(", ")}.`);
+		else Object.assign(limits, task.limits);
+	}
+	const tiers: any = {};
+	if (task.tiers !== undefined) {
+		if (!task.tiers || typeof task.tiers !== "object" || Array.isArray(task.tiers)) problems.push('task.json "tiers" must be an object of named presets.');
+		else for (const [name, tier] of Object.entries(task.tiers) as any[]) {
+			if (!/^[a-z][a-z0-9-]*$/.test(name) || !tier || typeof tier !== "object" || Object.keys(tier).some((k) => !TIER_KEYS.includes(k))) { problems.push(`tier "${name}": use a lowercase name and only ${TIER_KEYS.join(", ")}.`); continue; }
+			const model = tier.model ? available.find((m: any) => `${m.provider}/${m.id}` === tier.model) : ctx?.model;
+			if (tier.model && !model) problems.push(`tier "${name}": model ${tier.model} is not available/authenticated.`);
+			if (tier.thinking && model && !getSupportedThinkingLevels(model).includes(tier.thinking)) problems.push(`tier "${name}": ${tier.thinking} is not supported by ${model.provider}/${model.id}.`);
+			tiers[name] = tier;
+		}
+	}
+	const defaults = { ...readConfig(cwd), ...limits, tiers, ...(task.model !== undefined ? { model: task.model } : {}), ...(task.thinking !== undefined ? { thinking: task.thinking } : {}) };
 	for (const item of items) {
 		try {
 			const selected = itemConfig(defaults, item);
@@ -327,7 +362,13 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 			if (selected.thinking && model && !getSupportedThinkingLevels(model).includes(selected.thinking)) problems.push(`${item.id}: ${selected.thinking} is not supported by ${model.provider}/${model.id}.`);
 		} catch (e: any) { problems.push(e.message); }
 	}
-	try { dependencyGraph(items); } catch (e: any) { problems.push(e.message); }
+	let lint: any;
+	try {
+		dependencyGraph(items);
+		const wanted = Math.max(1, Math.floor(Number(task.parallel)) || readConfig(cwd).parallel || DEFAULTS.parallel);
+		lint = planLint(items, wanted);
+		if (lint.findings.length && !/^accept\b/i.test(String(task.planLint ?? ""))) problems.push(...lint.findings.slice(0, 12).map((f: string) => `plan: ${f}`), 'After fixing the plan findings call task_handoff again. Only for a finding that is genuinely wrong, set "planLint": "accept: <reason>" in task.json.');
+	} catch (e: any) { problems.push(e.message); }
 	const openQs = readText(join(cwd, W, "questions.md"))
 		.split("\n")
 		.filter((l) => /^\s*-\s\[\s\]/.test(l));
@@ -336,8 +377,8 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 	const allowed: string[] = Array.isArray(task.allowedPaths) ? task.allowedPaths.filter((p: any) => typeof p === "string" && p.trim()) : [];
 	if (allowed.length === 0) problems.push(`task.json has no "allowedPaths".`);
 	if (task.recovery !== undefined) {
-		const caps = { maxAttempts: 5, maxRepairs: 20, maxRestarts: 5 };
-		if (!task.recovery || typeof task.recovery !== "object" || Array.isArray(task.recovery) || Object.keys(task.recovery).some((k) => !(k in caps)) || Object.entries(caps).some(([k, cap]) => !Number.isInteger(task.recovery[k]) || task.recovery[k] < 0 || task.recovery[k] > cap)) problems.push("task.json recovery must specify maxAttempts (0–5), maxRepairs (0–20), maxRestarts (0–5).");
+		const caps = { maxAttempts: 5, maxRepairs: 20, maxRestarts: 10 };
+		if (!task.recovery || typeof task.recovery !== "object" || Array.isArray(task.recovery) || Object.keys(task.recovery).some((k) => !(k in caps)) || Object.entries(caps).some(([k, cap]) => !Number.isInteger(task.recovery[k]) || task.recovery[k] < 0 || task.recovery[k] > cap)) problems.push("task.json recovery must specify maxAttempts (0–5), maxRepairs (0–20), maxRestarts (0–10).");
 	}
 	const outside = (items as any[]).filter((i) => i.areas?.length && !i.areas.every((a: string) => allowed.some((p) => areasOverlap([a], [p]) && a.startsWith(p.split("*")[0].replace(/\/+$/, "")))));
 	if (outside.length) warnings.push(`${outside.length} item(s) list areas outside allowedPaths (${outside.slice(0, 4).map((i) => i.id).join(", ")}); their changes there will be rejected.`);
@@ -408,6 +449,9 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 		checks,
 		model: defaults.model,
 		thinking: defaults.thinking,
+		...Object.fromEntries(LIMIT_KEYS.map((k) => [k, limits[k] ?? (DEFAULTS as any)[k]])), // this plan's limits, never the previous task's
+		tiers,
+		autonomy: task.autonomy === "ask" ? "ask" : "full",
 		recovery: task.recovery, // authority belongs to this plan, never inherited from the previous task
 		parallel,
 		worktrees: parallel > 1 ? true : existing.worktrees ?? DEFAULTS.worktrees,
@@ -426,7 +470,7 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 	}
 	return {
 		ok: true,
-		text: `Queued ${items.length} items for task ${slug} (up to ${parallel} coding and ${parallel} verifying in worktree mode). Checks: ${checks.join(" · ")}.${warnings.length ? `\nWarnings: ${warnings.join(" ")}` : ""}\nThe live panel below shows progress; /task status for a summary.`,
+		text: `Queued ${items.length} items for task ${slug} (up to ${parallel} coding and ${parallel} verifying in worktree mode). Checks: ${checks.join(" · ")}.${lint ? `\nPlan shape: about ${lint.rounds} rounds at parallel ${parallel} (longest dependency chain ${lint.criticalPath}); the queue may add at most ${growthBudget(config, items.length)} items by itself.` : ""}${warnings.length ? `\nWarnings: ${warnings.join(" ")}` : ""}\nThe live panel below shows progress; /task status for a summary.`,
 	};
 }
 
@@ -526,10 +570,13 @@ function overviewText(cwd: string): string {
 	const parked = by((i) => !state.done[i.key] && !state.failed[i.key] && (state.retried?.[i.key] || state.deferred?.[i.key]));
 	const open = by((i) => !state.done[i.key] && !state.failed[i.key] && !state.retried?.[i.key] && !state.deferred?.[i.key]);
 	const logTail = readText(join(cwd, DIR, "log.md")).trim().split("\n").slice(-15).join("\n");
+	const fg = failureGroups(items, state);
+	const planned = parseQueue(readText(join(cwd, cfg.queue || ""))).length;
+	const manager: any = loadJson(join(cwd, DIR, "manager.json"), {});
 	return [
-		`task ${cfg.task || "(none)"} · queue ${runnerPid(cwd) ? "RUNNING" : "not running"} · ${items.length} items: passed ${by((i) => state.done[i.key]).length}, failed ${failed.length}, parked ${parked.length}, open ${open.length}`,
-		running.length ? `running now:\n${running.map((r) => `  ${r.id} · ${r.doing ?? ""}`).join("\n")}` : "",
-		failed.length ? `failed (reason):\n${failed.map((i) => fmt(i, `: ${String(state.failed[i.key]).slice(0, 200)}`)).join("\n")}` : "",
+		`task ${cfg.task || "(none)"} · queue ${runnerPid(cwd) ? "RUNNING" : "not running"}${runnerPid(cwd, "supervisor") ? " · automatic manager watching" : ""} · ${items.length} items (${planned} planned, ${growthUsed(state)} of at most ${growthBudget(cfg, planned)} added by the queue): passed ${by((i) => state.done[i.key]).length}, failed ${failed.length}, parked ${parked.length}, open ${open.length}`,
+		running.length ? `running now:\n${running.map((r) => `  ${r.id} · ${r.doing ?? ""}${r.quarantined ? " (interrupted: freed at the next start)" : ""}`).join("\n")}` : "",
+		fg.groups.length ? `failed, by what they need${fg.waiting ? ` (${fg.waiting} more only wait on one of these)` : ""}:\n${fg.groups.map((g: any) => `  ${g.kind}:\n${g.items.map((f: any) => `    ${f.id}${f.blocks ? ` · holds up ${f.blocks}` : ""}${manager.attempts?.[f.id] ? ` · ${manager.attempts[f.id]} automatic retr${manager.attempts[f.id] === 1 ? "y" : "ies"} used` : ""} — ${f.title.slice(0, 70)}: ${String(f.reason).slice(0, 220)}`).join("\n")}`).join("\n")}` : "",
 		parked.length ? `parked (conflict or deferred BLOCKED; they run when everything else is done):\n${parked.map((i) => fmt(i, state.deferred?.[i.key] ? " (deferred)" : " (conflict)")).join("\n")}` : "",
 		open.length ? `open:\n${open.slice(0, 40).map((i) => fmt(i, i.after?.length ? ` [after: ${i.after.join(", ")}]` : "")).join("\n")}${open.length > 40 ? `\n  … ${open.length - 40} more` : ""}` : "",
 		`recent log:\n${logTail}`,
@@ -569,24 +616,51 @@ async function control(cwd: string, ctl: any): Promise<string> {
 		return err ? `The queue did not start:\n${err}` : "Queue started.";
 	}
 	const cfg: any = readConfig(cwd);
+	if (ctl.action === "answer") {
+		// the user's answer to a blocked item: the next attempt reads it with the earlier evidence
+		const text = String(ctl.text ?? "").trim();
+		if (!text || !ctl.ids?.length) return "answer needs ids and text (the decision or guidance for those items).";
+		const known = allItems(readText(join(cwd, cfg.queue || "")), readState(cwd));
+		const targets = known.filter((i: any) => ctl.ids.some((w: string) => i.id === w || i.id.startsWith(w)));
+		if (!targets.length) return `No item matches ${ctl.ids.join(", ")}.`;
+		mkdirSync(join(cwd, DIR, "notes"), { recursive: true });
+		for (const i of targets) writeFileSync(join(cwd, DIR, "notes", `${i.id}.md`), `${readText(join(cwd, DIR, "notes", `${i.id}.md`))}\n\n## Answer from the user (authoritative; it settles the earlier BLOCKED question)\n${text}\n`);
+		ctl = { action: "retry", ids: ctl.ids };
+	}
 	enqueueControl(cwd, { ...ctl, task: cfg.task, by: "user" });
-	return `${ctl.action} queued; ${runnerPid(cwd) ? "the runner applies it within seconds" : "it applies on the next start"}.`;
+	if (runnerPid(cwd)) return `${ctl.action} queued; the runner applies it within seconds.`;
+	// asking for work to run again means: run it. No second command needed.
+	if (cfg.queue && ["retry", "recheck", "rerun", "unpark", "next", "add", "limits", "skip"].includes(ctl.action) && !runnerPid(cwd, "supervisor")) {
+		const err = await startRunner(cwd, true);
+		return err ? `${ctl.action} queued, but the queue did not start:\n${err}` : `${ctl.action} queued and the queue started.`;
+	}
+	return `${ctl.action} queued; it applies on the next start.`;
 }
 
 function managerPrompt(cwd: string): string {
+	return `${managerRules(cwd)}
+
+Start with a short overview of where things stand and anything that needs my attention.`;
+}
+
+function managerRules(cwd: string): string {
 	const cfg: any = readConfig(cwd);
 	return `You are now the MANAGER of this repo's work queue${cfg.task ? ` (task ${cfg.task}, plan in .tasks/${cfg.task}/)` : ""}. You act only on what I ask in each message; you never start work on your own.
 
 The pi-flow skill (references/manager.md, items.md, troubleshooting.md) explains every action and the usual causes of failures; read it when unsure.
 
-Your tools: queue_overview (status, failures with reasons, parked/open items, recent log), queue_item (one item: its line, status, commit, last result, activity), queue_control (stop, start, retry, recheck, rerun, unpark, add, parallel).
+Your tools: queue_overview (status, failures grouped by what they need and how many items each holds up, parked/open items, recent log), queue_item (one item: its line, status, commit, last result, activity), queue_control.
+
+How the queue already looks after itself (do not redo this by hand): a detached supervisor restarts a dead runner, frees interrupted workers, retries timeouts/session errors, and asks a chat-only manager model to diagnose check failures; each failed item gets a bounded number of automatic retries (shown in the overview). What is left for us is what it must not decide alone.
 
 How to help me:
-- When I ask what is wrong: read the overview and the failing items, find the real cause (often several failures share one cause, or a check ran before the work it checks), and explain it in a few lines with what you would do.
-- When I ask you to act: say what you will do, do it with queue_control, then show the result. retry = run failed/parked items again; recheck = run passed [check] items again; rerun = run passed items again; unpark = let parked items run normally and in parallel; next = run these items next; add = new items in the work-list format (only when I agreed to them); parallel = how many run at once, also while running (my number becomes the ceiling).
-- Never edit code, revert commits or delete branches. If something needs that, tell me.
-
-Start with a short overview of where things stand and anything that needs my attention.`;
+- When I ask what is wrong: read the overview, then queue_item for the failures that hold up the most items. Find the real cause. Typical ones: several failures share one cause; an item needs a decision (BLOCKED: decision); something is missing in the environment (BLOCKED: env); an item ran before its prerequisite. Answer in a few lines: the cause, which items it holds up, and the one action you recommend. Lead with the failure that unblocks the most.
+- When an item needs a decision: put the question to me plainly with your recommended answer. When I answer, pass it on with queue_control answer (ids + text): the item runs again with my answer, and everything waiting on it reopens by itself.
+- When I ask you to act ("fix it", "handle it", "retry those"): do it with queue_control and report the result; no second confirmation for retry, answer, next, unpark, limits or parallel. Ask first only for skip, add, rerun and stop, because they change what gets built.
+- Actions: retry = failed/parked items run again (the queue starts by itself if it was not running); answer = record my decision for blocked items, then retry them; limits = raise an item's size/time limits (limits: {maxNetLines, maxFilesGrowing, itemMinutes}), then retry; skip = accept items as done without running them so their dependents proceed; recheck = passed [check] items run again; rerun = passed items run again; unpark = parked items run now; next = run these first; add = new work-list lines; parallel = how many run at once (also while running); pause / stop / start.
+- A retry without new information repeats the failure. Before retrying a real failure, add what the worker needs with answer.
+- Decisions the automatic manager made for workers are in .pi-queue/decisions.md; when I ask what was decided, read it and point out any I should revisit. To overrule one, use answer on that item and rerun it.
+- Never edit code, revert commits or delete branches. If something needs that, tell me.`;
 }
 
 // exported for tests
@@ -619,6 +693,15 @@ export default function (pi: ExtensionAPI) {
 		watch.unref?.();
 	}
 	pi.on("session_shutdown", async (_event, ctx) => stopWatch(ctx));
+	// Manager mode belongs to the chat, not to one message: it survives reloads, compaction and long conversations,
+	// and every turn starts from the queue's current state instead of what was true many messages ago.
+	pi.on("before_agent_start", async (event: any, ctx: any) => {
+		try {
+			if (!/^manager\b/.test(pi.getSessionName?.() ?? "") || insideQueueItem(ctx)) return;
+			const cwd = ctx.cwd;
+			return { systemPrompt: `${event.systemPrompt}\n\n# Queue manager mode\n${managerRules(cwd)}\n\n## Queue right now (${new Date().toISOString().slice(11, 16)} UTC)\n${overviewText(cwd).slice(0, 6000)}` };
+		} catch {}
+	});
 
 	pi.registerTool({
 		name: "task_handoff",
@@ -664,15 +747,18 @@ export default function (pi: ExtensionAPI) {
 		name: "queue_control",
 		label: "Control queue",
 		description:
-			"Change the work queue, only when the user asked for it: pause (stop dispatch, let running items finish) | stop (abort running items) | start | retry (failed/parked items run again) | recheck (passed [check] items run again) | rerun (passed items run again) | unpark (parked/deferred items run normally, in parallel) | next (run these items next: un-parks them and puts them first) | add (new work-list lines, only ones the user agreed to) | parallel (value = how many at once, becomes the ceiling; works while running). ids are item ids or prefixes (e.g. V04 matches V04a…V04h); empty ids = all.",
-		promptSnippet: "queue_control: pause/stop/start/retry/recheck/rerun/unpark/next/add/parallel (only when the user asks)",
+			"Change the work queue, only when the user asked for it: pause (stop dispatch, let running items finish) | stop (abort running items) | start | retry (failed/parked items run again; starts the queue if needed) | answer (ids + text: the user's decision or guidance for blocked items, then they run again) | limits (ids + limits: raise size/time limits, then run again) | skip (accept items as done without running them; dependents proceed) | recheck (passed [check] items run again) | rerun (passed items run again) | unpark (parked/deferred items run normally, in parallel) | next (run these items next: un-parks them and puts them first) | add (new work-list lines, only ones the user agreed to) | parallel (value = how many at once, becomes the ceiling; works while running). ids are item ids or prefixes (e.g. V04 matches V04a…V04h); empty ids = all (not for answer, skip, limits).",
+		promptSnippet: "queue_control: pause/stop/start/retry/answer/limits/skip/recheck/rerun/unpark/next/add/parallel (only when the user asks)",
 		parameters: Type.Object({
-			action: Type.Union(["pause", "stop", "start", "retry", "recheck", "rerun", "unpark", "next", "add", "parallel"].map((a) => Type.Literal(a))),
+			action: Type.Union(["pause", "stop", "start", "retry", "answer", "limits", "skip", "recheck", "rerun", "unpark", "next", "add", "parallel"].map((a) => Type.Literal(a))),
 			ids: Type.Optional(Type.Array(Type.String())),
+			text: Type.Optional(Type.String({ description: "For answer: the user's decision or guidance, in full sentences" })),
+			limits: Type.Optional(Type.Object({ maxNetLines: Type.Optional(Type.Number()), maxFilesGrowing: Type.Optional(Type.Number()), itemMinutes: Type.Optional(Type.Number()) })),
 			lines: Type.Optional(Type.Array(Type.String({ description: "Work-list lines: A01 — what. Done when: … [areas: …] [after: …]" }))),
 			value: Type.Optional(Type.Number()),
 		}),
 		async execute(_id: string, p: any, _s: any, _u: any, ctx: any) {
+			if (["skip", "limits", "answer"].includes(p.action) && !p.ids?.length) return { content: [{ type: "text", text: `${p.action} needs explicit item ids.` }], details: {} };
 			return guard(ctx) ?? { content: [{ type: "text", text: await control(ctx.cwd, p) }], details: {} };
 		},
 	} as any);
@@ -806,7 +892,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("queue", {
-		description: "Control the task queue: /queue start | stop | status | watch [off] | log <id> | open <id> | retry [id] | recheck [id] | rerun <id> | unpark | next <ids> | parallel <n> | problem",
+		description: "Control the task queue: /queue start | stop | status | report | watch [off] | log <id> | open <id> | retry [id] | answer <id> <text> | skip <ids> | recheck [id] | rerun <id> | unpark | next <ids> | parallel <n> | problem",
 		handler: async (args, ctx) => {
 			const cwd = ctx.cwd;
 			const [cmd = "status", arg] = (args ?? "").trim().split(/\s+/).filter(Boolean);
@@ -871,13 +957,23 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(problemText(cwd, 200) || "queue: no recorded problem.", "info");
 				return;
 			}
-			if (["stop", "pause", "recheck", "rerun", "unpark", "parallel", "retry", "next"].includes(cmd)) {
+			if (cmd === "report") {
+				ctx.ui.notify(readText(join(cwd, DIR, "report.md")).trim() || overviewText(cwd), "info");
+				return;
+			}
+			if (cmd === "answer") {
+				const m = (args ?? "").trim().match(/^answer\s+(\S+)\s+([\s\S]+)$/);
+				ctx.ui.notify(m ? `queue: ${await control(cwd, { action: "answer", ids: m[1].split(","), text: m[2] })}` : "Usage: /queue answer <id[,id]> <your decision or guidance>", m ? "info" : "warning");
+				return;
+			}
+			if (["stop", "pause", "recheck", "rerun", "unpark", "parallel", "retry", "next", "skip"].includes(cmd)) {
 				const ids = (args ?? "").trim().split(/[\s,]+/).filter(Boolean).slice(1);
+				if (cmd === "skip" && !ids.length) { ctx.ui.notify("Usage: /queue skip <ids>", "warning"); return; }
 				ctx.ui.notify(`queue: ${await control(cwd, cmd === "parallel" ? { action: cmd, value: Number(arg) } : { action: cmd, ids })}`, "info");
 				return;
 			}
 			if (cmd !== "start") {
-				ctx.ui.notify("Usage: /queue start | stop | status | watch [off] | log <id> | open <id> | retry [id] | recheck [id] | rerun <id> | unpark | next <ids> | parallel <n> | problem", "warning");
+				ctx.ui.notify("Usage: /queue start | stop | pause | status | report | watch [off] | log <id> | open <id> | retry [id] | answer <id> <text> | skip <ids> | recheck [id] | rerun <id> | unpark | next <ids> | parallel <n> | problem", "warning");
 				return;
 			}
 			const pid = runnerPid(cwd);

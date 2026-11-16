@@ -35,6 +35,8 @@ export class Broker {
 		this.mem = new Map();
 		this.known = loadJson(join(this.dir, "known.json"), { ids: {} }) ?? { ids: {} };
 		this.known.ids ??= {};
+		this.flaky = loadJson(join(this.dir, "flaky.json"), {}) ?? {}; // failure id -> { count, last, title }
+		this.durations = loadJson(join(this.dir, "durations.json"), {}) ?? {}; // unit uid -> smoothed ms
 		const st = loadJson(join(this.dir, "state.json"), {}) ?? {};
 		this.stats = { requests: 0, unitsAsked: 0, cacheHits: 0, joined: 0, ran: 0, speculativeRan: 0, speculativeUsed: 0, savedMs: 0, ranMs: 0, preempted: 0, execRuns: 0, execHits: 0, ...(st.stats ?? {}) };
 		this.recent = st.recent ?? [];
@@ -374,6 +376,9 @@ export class Broker {
 		const opts = kindOptions(this.config, task.project?.dir ?? task.exec?.projectDir ?? ".", task.kind) || {};
 		const explicit = opts.lane ?? task.project?.meta?.lane;
 		if (explicit) return explicit;
+		// measured beats guessed: a unit that has run before goes where its real duration puts it
+		const measured = this.durations[task.uid];
+		if (measured) return measured < this.config.fastMs ? "fast" : "heavy";
 		if (!task.exec && ["lint", "vet", "typecheck"].includes(task.kind)) return "fast";
 		if (!task.exec && task.project?.lang === "ts" && task.kind === "test") return "fast";
 		const command = task.exec?.cmd ?? task.project?.meta?.cmd ?? "";
@@ -509,7 +514,7 @@ export class Broker {
 		const r = job.root;
 		const rc = r.rc;
 		const threads = job.threads;
-		const nice = this.config.nice;
+		const nice = job.speculativeOnly() && this.config.speculateQos !== "normal" ? this.config.speculateQos : this.config.nice;
 		if (job.tasks[0].exec) return this.runExecJob(job, threads, nice);
 		const { project, kind } = job;
 		const a = ADAPTERS[project.lang];
@@ -548,6 +553,7 @@ export class Broker {
 			const current = this.unitsOf(rc, project, kind, t.extraEnv, t.extraArgs).find((u) => u.target === t.unit.target);
 			const after = current && rc.batch(() => this.keyOf(rc, project, kind, current, t.extra, t.extraEnv));
 			const rec = { ...result, key: t.key, uid: t.uid, lang: project.lang, project: project.dir, kind, target: t.unit.target, label: t.unit.label, ms, at: Date.now(), root: r.name, speculative: t.speculative && !t.waiters.length };
+			if (ms > 0 && result.status !== "error") this.noteDuration(t.uid, ms);
 			if (t.speculative && !t.waiters.length) this.stats.speculativeRan++;
 			else this.stats.ran++;
 			if (after === t.key) {
@@ -563,9 +569,14 @@ export class Broker {
 			this.unstable.set(t.uid, (this.unstable.get(t.uid) ?? 0) + 1);
 			this.resolveTask(t, { ...rec, source: "ran", stale: true });
 		};
+		// A test that fails gets one more run before anyone is told: a flaky test must not fail an agent's work.
+		const again = [];
+		const retryable = (result) => kind === "test" && this.config.flakyRetries > 0 && result?.status === "fail" && result.failures?.length > 0 && result.failures.length <= 20 && result.failures.every((f) => !/\[(build|package|timeout|suite|error|killed|crash)\]$/.test(f.id));
 		const onUnit = (target, result) => {
 			const t = byTarget.get(target);
-			if (t && !job.ac.signal.aborted) finalize(t, result, Math.round((result.seconds ?? 0) * 1000));
+			if (!t || job.ac.signal.aborted) return;
+			if (retryable(result)) again.push({ t, first: result });
+			else finalize(t, result, Math.round((result.seconds ?? 0) * 1000));
 		};
 		const onProgress = (activity) => { job.activity = activity; job.lastOutputAt = Date.now(); };
 		const res = await a.run({ rc, project, kind, units: live.map((t) => t.unit), opts, threads, signal: job.ac.signal, nice, tmpDir: this.tmpDir, extraArgs: live[0].extraArgs ?? [], onUnit, onProgress });
@@ -586,8 +597,40 @@ export class Broker {
 		}
 		this.stats.ranMs += res.ms ?? 0;
 		for (const t of live) {
+			if (finalized.has(t) || again.some((x) => x.t === t)) continue;
 			const result = res.results.get(t.unit.target) ?? { status: "error", failures: [{ id: `${t.uid}:[no result]`, title: `${t.unit.label}: no result from ${project.lang} ${kind}`, output: "" }] };
-			finalize(t, result, result.seconds ? Math.round(result.seconds * 1000) : per);
+			if (retryable(result)) again.push({ t, first: result });
+			else finalize(t, result, result.seconds ? Math.round(result.seconds * 1000) : per);
+		}
+		for (let round = 0; again.length && round < this.config.flakyRetries && !job.ac.signal.aborted; round++) {
+			const batch = again.splice(0);
+			job.activity = `running ${batch.reduce((n, x) => n + x.first.failures.length, 0)} failed test(s) again to rule out flakiness`;
+			const base = live[0].extraArgs ?? [];
+			// Go: only the failed tests of the package; other runners: the failed files
+			const names = [...new Set(batch.flatMap((x) => x.first.failures.map((f) => (f.id.startsWith(`${x.t.unit.label}:`) ? f.id.slice(x.t.unit.label.length + 1) : f.id.slice(f.id.lastIndexOf(":") + 1)).split("/")[0])))];
+			const extraArgs = project.lang === "go" && !base.some((a) => /^-?-run\b/.test(a)) ? [...base, "-run", `^(${names.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})$`] : base;
+			const second = await a.run({ rc, project, kind, units: batch.map((x) => x.t.unit), opts, threads, signal: job.ac.signal, nice, tmpDir: this.tmpDir, extraArgs, onProgress });
+			this.stats.ranMs += second.ms ?? 0;
+			if (job.ac.signal.aborted) { again.push(...batch); break; }
+			for (const { t, first } of batch) {
+				const r2 = second.results.get(t.unit.target);
+				const stillIds = new Set((r2?.failures ?? []).map((f) => f.id));
+				const still = r2?.status === "pass" ? [] : r2?.status === "fail" ? first.failures.filter((f) => stillIds.has(f.id)) : first.failures;
+				const cured = first.failures.filter((f) => !still.includes(f));
+				const sameAgain = r2?.status === "fail" && !still.length ? r2.failures : still; // a different test failed the second time: report that
+				for (const f of cured) this.flaky[f.id] = { count: (this.flaky[f.id]?.count ?? 0) + 1, last: Date.now(), title: f.title, uid: t.uid };
+				if (cured.length) { this.stats.flaky = (this.stats.flaky ?? 0) + cured.length; this.flakyDirty = true; }
+				const ms = Math.round(((first.seconds ?? 0) + (r2?.seconds ?? 0)) * 1000) || per;
+				const merged = sameAgain.length ? { ...first, failures: sameAgain, flaky: cured.map((f) => ({ id: f.id, title: f.title })) } : { ...first, status: "pass", failures: [], flaky: cured.map((f) => ({ id: f.id, title: f.title })), note: `${cured.length} test(s) failed once and passed when run again (flaky)` };
+				if (sameAgain.length && round + 1 < this.config.flakyRetries && retryable(merged)) again.push({ t, first: merged });
+				else finalize(t, merged, ms);
+			}
+		}
+		if (job.ac.signal.aborted) {
+			for (const { t } of again) {
+				if (this.inflight.get(t.key) === t) this.inflight.delete(t.key);
+				if (t.waiters.length) { t.speculative = false; this.inflight.set(t.key, t); this.pending.push(t); }
+			}
 		}
 	}
 
@@ -708,6 +751,7 @@ export class Broker {
 		rc.invalidate(true);
 		const again = this.execPlan(job.root, rc.path(t.exec.cwdRel), t.exec.cmd, t.exec.env);
 		const rec = { exec: true, key: t.key, code: r.code, output: `${r.stdout}${r.stderr ? (r.stdout ? "\n" : "") + r.stderr : ""}`, ms: r.ms, at: Date.now(), root: job.root.name, cmd: t.exec.cmd, killed: r.killed };
+		if (r.ms > 0 && !r.killed) this.noteDuration(t.uid, r.ms);
 		if (t.exec.cache && again.key === t.exec.inputKey && !r.killed && !/panic: test timed out after/.test(rec.output)) this.cachePut(t.key, rec);
 		this.resolveTask(t, { ...rec, source: "ran", stale: again.key !== t.exec.inputKey });
 	}
@@ -817,7 +861,7 @@ export class Broker {
 		for (const { it, res } of results) {
 			const k = `${it.project.lang} ${it.project.dir} · ${it.kind}`;
 			let g = groups.get(k);
-			if (!g) groups.set(k, (g = { lang: it.project.lang, project: it.project.dir, kind: it.kind, total: 0, pass: 0, fail: 0, new: [], known: [], fixed: 0, notes: [] }));
+			if (!g) groups.set(k, (g = { lang: it.project.lang, project: it.project.dir, kind: it.kind, total: 0, pass: 0, fail: 0, new: [], known: [], flaky: [], fixed: 0, notes: [] }));
 			g.total++;
 			src[res?.source === "shared" ? "shared" : res?.source === "cache" ? "cache" : "ran"]++;
 			if (!res) {
@@ -834,6 +878,7 @@ export class Broker {
 			}
 			if (res.status === "pass") {
 				g.pass++;
+				for (const f of res.flaky ?? []) g.flaky.push(f);
 				for (const [, kn] of Object.entries(this.known.ids)) if (kn.uid === it.uid) g.fixed++;
 				continue;
 			}
@@ -860,6 +905,7 @@ export class Broker {
 			const head = `${g.new.length ? "✗" : "✓"} ${g.lang} ${g.project} · ${g.kind}: ${g.pass}/${g.total} pass`;
 			const extra = [g.known.length ? `${g.known.length} pre-existing failure${g.known.length > 1 ? "s" : ""} (also fail on base)` : "", g.fixed ? `${g.fixed} known failure${g.fixed > 1 ? "s" : ""} now pass` : ""].filter(Boolean).join(", ");
 			lines.push(`${head}${extra ? ` — ${extra}` : ""}`);
+			for (const f of g.flaky.slice(0, 5)) lines.push(`   ~ flaky, passed when run again (seen ${this.flaky[f.id]?.count ?? 1}×): ${f.title}`);
 			for (const f of g.new) {
 				if (shown >= 15) continue;
 				shown++;
@@ -870,7 +916,9 @@ export class Broker {
 		if (newFailures > shown) lines.push(`… ${newFailures - shown} more new failures (pi-check run --json for all)`);
 		if (knownFailures && !strict) lines.push(`Pre-existing failures are not caused by these changes and do not fail the check (strict: true to count them).`);
 		lines.push(ok ? `RESULT: PASS${knownFailures ? ` (${knownFailures} pre-existing failures ignored)` : ""}` : `RESULT: FAIL — ${newFailures} new failure${newFailures === 1 ? "" : "s"}${errors ? ` (${errors} could not run)` : ""}`);
-		const out = { ok, ms, units: results.length, ...src, newFailures, knownFailures, errors, groups: [...groups.values()], text: lines.join("\n") };
+		const flakyCount = [...groups.values()].reduce((n, g) => n + g.flaky.length, 0);
+		if (flakyCount) lines.splice(lines.length - 1, 0, `${flakyCount} flaky test(s) passed on a second run: not caused by these changes, but worth fixing (pi-check flaky lists them).`);
+		const out = { ok, ms, units: results.length, ...src, newFailures, knownFailures, flaky: flakyCount, errors, groups: [...groups.values()], text: lines.join("\n") };
 		if (req.detail) out.results = results.map(({ it, res }) => ({ project: it.project.dir, lang: it.project.lang, kind: it.kind, target: it.unit.target, label: it.unit.label, ...res, known: (res?.failures ?? []).filter((f) => this.known.ids[f.id]).map((f) => f.id) }));
 		return out;
 	}
@@ -977,13 +1025,31 @@ export class Broker {
 			roots,
 			stats: { ...this.stats, saved: fmtMs(this.stats.savedMs), spent: fmtMs(this.stats.ranMs) },
 			known: Object.keys(this.known.ids).length,
+			flaky: Object.entries(this.flaky).sort((a, b) => b[1].count - a[1].count).slice(0, 20).map(([id, f]) => ({ id, count: f.count, title: f.title, last: f.last })),
+			measured: Object.keys(this.durations).length,
 			recent: this.recent.slice(0, 10),
 		};
+	}
+
+	/** Smoothed duration per unit: decides lanes and tells waiting agents how long a check usually takes. */
+	noteDuration(uid, ms) {
+		const prev = this.durations[uid];
+		this.durations[uid] = Math.round(prev ? prev * 0.6 + ms * 0.4 : ms);
+		this.durationsDirty = true;
+		this.dirty = true;
 	}
 
 	persist() {
 		if (!this.dirty) return;
 		this.dirty = false;
+		try {
+			if (this.flakyDirty) { this.flakyDirty = false; writeJson(join(this.dir, "flaky.json"), this.flaky); }
+			if (this.durationsDirty) {
+				this.durationsDirty = false;
+				const keep = Object.entries(this.durations);
+				writeJson(join(this.dir, "durations.json"), Object.fromEntries(keep.length > 20000 ? keep.slice(-20000) : keep));
+			}
+		} catch {}
 		try {
 			writeJson(join(this.dir, "state.json"), { stats: this.stats, recent: this.recent, status: { running: [...this.running].map((j) => ({ root: j.root.name, label: j.label })), at: Date.now() } });
 		} catch {}

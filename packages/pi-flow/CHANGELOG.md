@@ -1,5 +1,31 @@
 # pi-flow changelog
 
+## 1.8.0
+
+Audit pass for fully unattended runs.
+
+- **Provider outages no longer kill the queue.** A session/provider error before the agent did any work (rate limit, overload, expired login, network) is waited out in the same session with growing pauses (30 s → 30 min, up to `outageMinutes`, default 180). All workers hold while one sees an outage. Before, each item failed in seconds and used up its retries.
+- **Autonomous decisions** (`autonomy: "full"`, the default; `"ask"` in `task.json` to opt out). The automatic manager answers `BLOCKED: decision:` questions from the brief, rules and answers, records each in `.pi-queue/decisions.md` and the end report, and reruns the item. Environment, credentials and scope blockers still wait for you.
+- **Slots recover inside a run.** A runner error stops the worker, keeps its work on a branch, frees the slot at once and tries the item again (twice at most). Before, each error quarantined a slot until the next restart.
+- **Faster merges.** Rebase and re-check happen outside the merge lock; under the lock only a fast-forward remains unless the branch moved again. One item's checks no longer hold up everyone's merge.
+- **Timeouts keep their work.** An item that runs out of time gets one shorter turn in the same session to finish; if it still fails, its next attempt gets 1.5× the time.
+- **Start failures retry.** A failed setup/install, failing baseline or missing Pi Web is retried after 1 and 5 minutes.
+- **Manager chat.** Manager mode is attached to the chat (session name `manager…`): its rules and a fresh queue overview are added to every turn, so it survives reloads and compaction. The automatic manager's own session is now named `auto manager · <task>`.
+- Pi Web unreachable for 5 minutes ends that worker's turn (was: the whole item time). A merge conflict left after the in-session redo is retried without a model.
+
+## 1.7.0
+
+Unattended runs: fewer stops, no queue blow-up, plans that fit the queue.
+
+- **Bounded growth.** `BLOCKED` items are never split (it multiplied the blocker). Only an item still too big after the last size level is split, into 2–4 parts (`splitMax`). A `[check]` round adds at most 3 merged fix items (`maxGapItems`). All derived items share one budget: `growthMax`, default max(8, 30% of the planned items). Past it, items fail as "needs you" instead of adding more.
+- **Blockers.** Workers reply `WAITING: <ids>` when another item's work is missing: the item is queued again after those items, with no failure. `ALREADY DONE:` passes on the checks instead of failing "no changes". `BLOCKED: decision:` / `BLOCKED: env:` go straight to you; other `BLOCKED` reasons may be retried by the automatic manager with a diagnosis.
+- **No more stuck restarts.** Interrupted workers (crash, sleep, Pi Web restart, runner error) are reconciled at the next start: still-running workers are stopped, their changes are kept on `queue-failed/<id>-interrupted-*`, the worktree is freed and the item queued again. `autoReconcile: false` restores the old fail-closed behaviour.
+- **Supervisor.** A dead runner is restarted without a model turn; the restart budget counts restarts without progress. Timeouts and session/provider errors are retried without a model (`retryTransient`). If the manager model cannot be reached, the item is retried with its recorded evidence. The manager runs as background pi (`managerIn: "web"` to opt back), with optional `managerModel` / `managerThinking`. Changing `parallel` no longer revokes automatic management. macOS: `caffeinate` keeps the machine awake while supervised (`keepAwake`).
+- **Pi Web loss.** A failed session creation is an ordinary retryable failure, not a quarantined slot; when Pi Web is gone, new items run as background pi.
+- **Planning.** `task.json` gains `limits` (task-wide size/time limits) and `tiers` (named model/effort presets for `[tier: light|standard|heavy]`). The planner gets explicit granularity rules. Handoff lints the plan: items to merge, items that name another item without `[after]`, and plans whose areas serialize the queue; `"planLint": "accept: <reason>"` overrides.
+- **Manager.** `queue_overview` groups failures by what they need and how many items each holds up. New actions: `answer` (your decision for blocked items, then retry), `limits`, `skip`. Retry-type actions start the queue when it is not running. `/queue report`, `/queue answer <id> <text>`, `/queue skip <ids>`; a report is written to `.pi-queue/report.md` at the end of each run.
+- Defaults: `fixRounds` 2 (was 1), `splitMax` 4 (was 8); the baseline check is tried twice before the run is refused.
+
 ## 1.6.0
 
 - Separate bounded coding and verification capacity in worktree mode so independent implementation continues during checks; retain verified dependency gates and worktree/area ownership. Direct-repo mode stays serial.

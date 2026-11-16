@@ -45,14 +45,25 @@ export const DEFAULTS = {
 		{ maxFilesGrowing: 40, maxNetLines: 1500, itemMinutes: 120 },
 		{ maxFilesGrowing: 200, maxNetLines: 5000, itemMinutes: 150 },
 	],
-	autoSplit: true, // an item that still cannot be finished is split into smaller items (kept in state.json)
-	splitMax: 8,
+	autoSplit: true, // an item that is still too big after the last size level is split into 2–splitMax parts (never for BLOCKED)
+	splitMax: 4,
+	// Derived items (split parts beyond the parent, gap fixes, repairs) the queue may add on its own.
+	// 0 = automatic: max(8, 30% of the planned items). When it is used up, nothing more is split or added: items fail for you.
+	growthMax: 0,
+	maxGapItems: 3, // a [check] round adds at most this many fix items (gaps on overlapping areas are merged)
 	redoOnConflict: true, // a conflicting item is redone on the latest code in the same session
 	deferBlocked: true, // an item that says BLOCKED while other work is still pending is retried once after that work
 	autoFix: true, // a [check] item that reports GAP: lines gets fix items queued before it, then checks again
 	gapRounds: 2, // how many fix rounds a [check] item may trigger
 	recheck: true, // a passed [check] item runs again when an item it covers ([areas] overlap or [after]) changes later
-	fixRounds: 1,
+	fixRounds: 2,
+	maxWaits: 3, // how often one item may say WAITING: <ids> before it is treated as BLOCKED
+	outageMinutes: 180, // a provider/session error before any work is waited out (growing pauses) for up to this long, per item
+	autonomy: "full", // "full": the automatic manager also answers BLOCKED: decision questions from the plan and logs them in decisions.md; "ask": they wait for you
+	retryTransient: true, // timeouts and session/provider errors are retried by the supervisor without a model diagnosis
+	autoReconcile: true, // on start, preserve and release workers interrupted by a crash, sleep or a Pi Web restart
+	keepAwake: true, // macOS: keep the machine from idle-sleeping while the queue is supervised (caffeinate)
+	tiers: {}, // named model/effort/limit presets for [tier: name] items, set by the plan (task.json "tiers")
 	checkMinutes: 15,
 	stopAfterFailuresInARow: 0, // disabled by default; positive finite values opt into a global safety halt
 
@@ -120,6 +131,7 @@ export function allItems(queueText, state) {
 	return out;
 }
 
+export const APPROVAL_VOLATILE = ["parallel", "parallelStart", "parallelMin", "piWebUrl", "keepAwake", "deleteSessions", "managerModel", "managerThinking"];
 export function approvedTask(repo, c) {
 	if (!c.task || basename(c.task) !== c.task || [".", ".."].includes(c.task)) return undefined;
 	const folder = join(repo, ".tasks", c.task);
@@ -131,7 +143,28 @@ export function approvedTask(repo, c) {
 	if (JSON.stringify(task.allowedPaths) !== JSON.stringify(c.allowedPaths) || JSON.stringify(task.checks) !== JSON.stringify(c.checks)) return undefined;
 	if (c.queue !== `.tasks/${c.task}/items.md`) return undefined;
 	if ((task.recovery !== undefined || c.recovery !== undefined) && JSON.stringify(task.recovery) !== JSON.stringify(c.recovery)) return undefined;
-	return createHash("sha256").update(JSON.stringify([files.map(text), c])).digest("hex");
+	// Operational knobs (how many run at once, which Pi Web) are not part of what was approved:
+	// changing them mid-run must not switch automatic management off.
+	const pinned = Object.fromEntries(Object.entries(c).filter(([k]) => !APPROVAL_VOLATILE.includes(k)));
+	return createHash("sha256").update(JSON.stringify([files.map(text), pinned])).digest("hex");
+}
+
+/** Failures automatic recovery must leave to a person: decisions, environment, scope, budgets. */
+export const NEEDS_PERSON = /BLOCKED: (decision|env)\b|needs you|credentials?|missing contract|outside.*(scope|allowed)|not authorized|permission denied|growth budget/i;
+/** Failures that say nothing about the code: retried without a model diagnosis. */
+export const TRANSIENT = /^(timed out after|pi exited with an error|runner error|Pi Web|worker did not confirm|stopped by request|interrupted|conflict with an item merged meanwhile)/i;
+export const DECISION = /BLOCKED: decision\b/i;
+
+/** Derived items the queue added by itself (split parts beyond their parent, gap fixes, repairs). */
+export function growthUsed(state) {
+	let n = 0;
+	for (const kids of Object.values(state.splits ?? {})) n += Math.max(0, kids.length - 1);
+	for (const fixes of Object.values(state.fixes ?? {})) n += fixes.length;
+	return n;
+}
+export function growthBudget(c, planned) {
+	const configured = Math.floor(Number(c.growthMax));
+	return configured > 0 ? configured : Math.max(8, Math.ceil(planned * 0.3));
 }
 
 /** Bound automatic work to a failed target and its startup-approved authority. */
@@ -143,9 +176,10 @@ export function validateRecovery(proposal, state, items, manager = {}, c = {}) {
 		if (!failure || state.done?.[item.key] || (manager.attempts?.[id] ?? 0) >= (c.recovery?.maxAttempts ?? 2)) throw new Error(`${id}: not failed or recovery budget exhausted`);
 		if (Object.values(state.running ?? {}).some((r) => !r || (!r.id && !r.key) || r.key === item.key || r.id === id)) throw new Error(`${id}: worker still owns the item`);
 		if (/^depends on \S+, which (failed|is unknown)$/.test(failure)) throw new Error(`${id}: recover the failed prerequisite instead`);
-		if (/BLOCKED|credentials?|missing contract|decision|outside.*(scope|allowed)|runner error|not authorized|permission denied/i.test(failure)) throw new Error(`${id}: needs human attention, not automatic recovery`);
+		const decided = proposal.decided === true && c.autonomy === "full" && DECISION.test(failure) && !NEEDS_PERSON.test(failure.replace(DECISION, ""));
+		if (NEEDS_PERSON.test(failure) && !decided) throw new Error(`${id}: needs human attention, not automatic recovery`);
 	}
-	const action = { action: proposal.action, ids, reason: proposal.reason.slice(0, 3000) };
+	const action = { action: proposal.action, ids, reason: proposal.reason.slice(0, 3000), ...(proposal.decided === true ? { decided: true } : {}) };
 	if (proposal.action === "retry") return action;
 	const parent = items.find((i) => i.id === ids[0]);
 	if (!c.recovery || ids.length !== 1 || parent.child || parent.added || !Array.isArray(proposal.lines) || !proposal.lines.length || proposal.lines.length > 3 || (manager.repairs ?? 0) + proposal.lines.length > c.recovery.maxRepairs) throw new Error("repair authority or budget exceeded");
@@ -208,6 +242,27 @@ export function applyControl(state, items, ctl) {
 		}
 		state.priority = [...new Set([...keys, ...(state.priority ?? [])])];
 		changed.push(...items.filter((i) => keys.includes(i.key)).map((i) => i.id));
+	} else if (ctl.action === "skip") {
+		// the user accepts these as done without running them: dependents may proceed
+		for (const i of pick(ctl.ids)) {
+			if (state.done[i.key]) continue;
+			state.done[i.key] = "skipped";
+			delete state.failed[i.key];
+			if (state.retried) delete state.retried[i.key];
+			if (state.deferred) delete state.deferred[i.key];
+			changed.push(i.id);
+		}
+	} else if (ctl.action === "limits") {
+		// raise (or set) size/time limits for these items, then let them run again
+		const limits = Object.fromEntries(LIMIT_KEYS.filter((k) => Number(ctl.limits?.[k]) > 0).map((k) => [k, Math.floor(Number(ctl.limits[k]))]));
+		for (const i of pick(ctl.ids)) {
+			if (state.done[i.key]) continue;
+			state.limits = { ...(state.limits ?? {}), [i.key]: { ...(state.limits?.[i.key] ?? {}), ...limits } };
+			delete state.failed[i.key];
+			if (state.retried) delete state.retried[i.key];
+			if (state.deferred) delete state.deferred[i.key];
+			changed.push(i.id);
+		}
 	} else if (ctl.action === "add") {
 		const lines = (ctl.lines ?? []).map((l) => (String(l).trim().startsWith("- [ ]") ? String(l).trim() : `- [ ] ${String(l).trim()}`));
 		state.added = [...(state.added ?? []), ...lines];
@@ -219,18 +274,99 @@ export function applyControl(state, items, ctl) {
 		for (const i of items) {
 			const dependency = state.failed[i.key]?.match(/^depends on (\S+), which failed$/)?.[1];
 			const parents = dependency && items.filter((p) => p.id === dependency || (p.child && p.id.startsWith(dependency) && /^[a-z]$/.test(p.id.slice(dependency.length))));
-			if (parents?.length && parents.every((p) => !state.failed[p.key])) { delete state.failed[i.key]; reopened = true; }
+			if (parents?.length && parents.every((p) => !state.failed[p.key])) { delete state.failed[i.key]; reopened = true; changed.push(i.id); }
 		}
 	}
 	return changed;
 }
 
-function splitPrompt(c, item, reason) {
-	return `This item could not be finished in one go (${firstLine(reason).slice(0, 200)}).
+function overtimePrompt(c) {
+	return `You ran out of time before replying. Do not start anything new. Finish the change you were making so that it is complete and consistent, run ${checksText(c)}, and reply as instructed (DONE with the changed files, or WAITING / BLOCKED). If the item is clearly too big to finish now, reply NEEDS: <files> files, <lines> lines.`;
+}
 
-Do NOT edit any file. Split it into 3 to ${c.splitMax} smaller items that together cover everything it requires. Each must be doable on its own by a fresh agent in one session (about 10 files at most), touch a different set of files than the others, and be checkable with the typecheck and build. Use [after] only for actual prerequisites; independent parts must be runnable in parallel, not chained by list order.
+function splitPrompt(c, item, reason) {
+	return `This item is too big to finish in one session even at the highest size limits (${firstLine(reason).slice(0, 200)}).
+
+Do NOT edit any file. Split it into as FEW parts as possible: 2 to ${c.splitMax ?? 4}, never more. Together they must cover everything it requires. Each must be doable on its own by a fresh agent in one session, touch a different set of files than the others, and leave the checks passing. Do not create parts for trivial edits; fold them into the part that touches the same files. Use [after] only for actual prerequisites; independent parts must be runnable in parallel, not chained by list order.
 
 Reply with one line per item, in order, each starting with "ITEM: ", then what to do, then "Done when: <something observable>", then the tags [areas: <folders or files it changes, comma separated>] and, only if it needs earlier parts finished first, [after: <their numbers, e.g. 1, 2>]. Parts are numbered from 1 in the order you list them. No other text. If it truly cannot be split, reply with one line: BLOCKED: <reason>`;
+}
+
+/** Failed items grouped by what they need, each with how many other items it holds up. */
+export function failureGroups(items, state) {
+	const failed = items.filter((i) => state.failed?.[i.key]);
+	const blockedBy = (id) => {
+		const seen = new Set();
+		for (let grew = true; grew;) {
+			grew = false;
+			for (const i of failed) {
+				const dep = state.failed[i.key].match(/^depends on (\S+), which/)?.[1];
+				if (dep && !seen.has(i.id) && (dep === id || seen.has(dep) || id.startsWith(dep) && /^[a-z]$/.test(id.slice(dep.length)))) { seen.add(i.id); grew = true; }
+			}
+		}
+		return seen.size;
+	};
+	const kinds = [
+		["needs your decision", /BLOCKED: decision\b/i],
+		["needs environment or credentials", /BLOCKED: env\b|credentials?|permission denied|not authorized/i],
+		["outside the allowed scope", /outside|files outside/i],
+		["growth budget used up", /growth budget/i],
+		["blocked (other)", /BLOCKED/i],
+		["checks failed", /check failed|breaks checks|gaps remain/i],
+		["too big", /net added lines|files gain lines|NEEDS/i],
+		["timed out or session error", /timed out|pi exited|runner error|Pi Web/i],
+		["no changes made", /no changes/i],
+	];
+	const groups = new Map();
+	let waiting = 0;
+	for (const i of failed) {
+		const reason = state.failed[i.key];
+		if (/^depends on \S+, which/.test(reason)) { waiting++; continue; }
+		const kind = kinds.find(([, re]) => re.test(reason))?.[0] ?? "other";
+		if (!groups.has(kind)) groups.set(kind, []);
+		groups.get(kind).push({ id: i.id, title: i.title, reason, blocks: blockedBy(i.id) });
+	}
+	return { groups: [...groups].map(([kind, list]) => ({ kind, items: list.sort((a, b) => b.blocks - a.blocks) })), waiting };
+}
+
+export function runReport(items, state) {
+	const { groups, waiting } = failureGroups(items, state);
+	const done = items.filter((i) => state.done?.[i.key]).length;
+	const open = items.filter((i) => !state.done?.[i.key] && !state.failed?.[i.key]).length;
+	const lines = [`# Queue report · ${new Date().toISOString().slice(0, 16).replace("T", " ")}`, "", `${items.length} items: ${done} passed, ${items.length - done - open} failed (${waiting} of them only wait on another failed item), ${open} open. The queue added ${growthUsed(state)} item(s) by itself.`];
+	for (const g of groups) {
+		lines.push("", `## ${g.kind} (${g.items.length})`);
+		for (const f of g.items) lines.push(`- ${f.id}${f.blocks ? ` (holds up ${f.blocks})` : ""} — ${f.title.slice(0, 80)}: ${f.reason.slice(0, 240)}`);
+	}
+	if (!groups.length) lines.push("", open ? "Nothing failed so far." : "Everything passed.");
+	return lines.join("\n");
+}
+
+/** Fold a check's GAP lines into at most `max` fix items: gaps on overlapping areas always share one item. */
+export function mergeGaps(gaps, max) {
+	const parsed = gaps.map((g) => {
+		const areas = (g.match(/\[areas?:\s*([^\]]+)\]/i)?.[1] ?? "").split(",").map((a) => a.trim()).filter(Boolean);
+		const body = g.replace(/\s*\[areas?:[^\]]*\]/gi, "").trim();
+		const [what, done] = body.split(/\s*Done when:\s*/i);
+		return { what: what.replace(/[.\s]+$/, ""), done: (done ?? "").replace(/[.\s]+$/, ""), areas };
+	});
+	const groups = [];
+	for (const g of parsed) {
+		const hit = groups.find((x) => g.areas.length && x.areas.length && areasOverlap(g.areas, x.areas));
+		if (hit) hit.parts.push(g), hit.areas.push(...g.areas);
+		else groups.push({ parts: [g], areas: [...g.areas] });
+	}
+	while (groups.length > Math.max(1, max)) {
+		groups.sort((a, b) => a.parts.length - b.parts.length);
+		const [a, b] = groups.splice(0, 2);
+		groups.push({ parts: [...a.parts, ...b.parts], areas: [...a.areas, ...b.areas] });
+	}
+	return groups.map(({ parts, areas }) => {
+		const what = parts.map((p) => p.what).join("; ");
+		const done = parts.map((p) => p.done).filter(Boolean).join("; and ") || "the check can verify it";
+		const area = [...new Set(areas)];
+		return `${what}. Done when: ${done}.${area.length ? ` [areas: ${area.join(", ")}]` : ""}`;
+	});
 }
 
 /** Do two [areas: …] lists touch the same path? (prefix match; globs cut at the first *) */
@@ -248,6 +384,9 @@ export function areasOverlap(a, b) {
 	return false;
 }
 
+export const TIER_KEYS = ["model", "thinking", "maxNetLines", "maxFilesGrowing", "itemMinutes"];
+export const LIMIT_KEYS = ["maxNetLines", "maxFilesGrowing", "itemMinutes"];
+
 /** Per-item limits and session selection; omitted tags inherit the queue defaults. */
 export function itemConfig(c, item) {
 	if (item.repairParent) return { ...itemConfig(c, item.repairParent), allowedPaths: item.areas };
@@ -255,7 +394,15 @@ export function itemConfig(c, item) {
 	if (c.itemChecks) {
 		const checks = c.itemChecks[item.id] ?? c.itemChecks[item.id.match(/^([A-Z]+\d+)[a-z]$/)?.[1]];
 		if (!Array.isArray(checks) || checks.some((cmd) => typeof cmd !== "string" || !cmd.trim())) throw new Error(`${item.id}: missing or invalid focused itemChecks`);
-		out.checks = [...c.checks, ...checks];
+		out.checks = [...new Set([...c.checks, ...checks])];
+	}
+	const tierTags = [...item.line.matchAll(/\[tier:\s*([^\]]*)\]/gi)];
+	if (tierTags.length > 1) throw new Error(`${item.id}: duplicate [tier: …] tags`);
+	if (tierTags.length) {
+		const name = tierTags[0][1].trim();
+		const tier = c.tiers?.[name];
+		if (!tier || typeof tier !== "object") throw new Error(`${item.id}: unknown [tier: ${name}] (task.json "tiers" defines: ${Object.keys(c.tiers ?? {}).join(", ") || "none"})`);
+		for (const key of TIER_KEYS) if (tier[key] !== undefined) out[key] = tier[key];
 	}
 	if (/\[big\]/i.test(item.line)) Object.assign(out, c.big ?? {});
 	const tag = item.line.match(/\[((?:files|lines|min)=\d+(?:[\s,]+(?:files|lines|min)=\d+)*)\]/i)?.[1];
@@ -297,7 +444,7 @@ export function parseQueue(text) {
 		items.push({
 			key: line,
 			id,
-			title: title.replace(/\s*\[(areas?|after|model|thinking|big|check|files=|lines=|min=)[^\]]*\]/gi, "").trim(),
+			title: title.replace(/\s*\[(areas?|after|model|thinking|tier|big|check|files=|lines=|min=)[^\]]*\]/gi, "").trim(),
 			line,
 			areas: tag("areas?"),
 			after: tag("after"),
@@ -333,6 +480,65 @@ export function dependencyGraph(items) {
 	};
 	for (const id of graph.keys()) visit(id);
 	return graph;
+}
+
+/** How many rounds a plan needs with `parallel` workers when every item takes one round (dependencies and area locks applied). */
+export function simulatePlan(items, parallel) {
+	const graph = dependencyGraph(items), done = new Set();
+	let left = [...items], rounds = 0;
+	while (left.length) {
+		const now = [];
+		for (const i of left) {
+			if (now.length >= parallel) break;
+			if (!graph.get(i.id).every((d) => done.has(d))) continue;
+			if (now.some((r) => r.areas?.length && i.areas?.length && areasOverlap(r.areas, i.areas))) continue;
+			now.push(i);
+		}
+		if (!now.length) break;
+		rounds++;
+		for (const i of now) done.add(i.id);
+		left = left.filter((i) => !done.has(i.id));
+	}
+	const depth = new Map();
+	const chain = (id) => depth.get(id) ?? (depth.set(id, 0), depth.set(id, 1 + Math.max(0, ...graph.get(id).map(chain))), depth.get(id));
+	return { rounds, ideal: Math.ceil(items.length / Math.max(1, parallel)), criticalPath: Math.max(0, ...items.map((i) => chain(i.id))) };
+}
+
+/** Objective plan defects that waste sessions or serialize the queue. Returned to the planner at handoff. */
+export function planLint(items, parallel) {
+	const findings = [];
+	const work = items.filter((i) => !i.check);
+	const graph = dependencyGraph(items);
+	// 1. items on exactly the same files with no order between them: they run one after another anyway
+	const byAreas = new Map();
+	for (const i of work) {
+		if (!i.areas?.length) continue;
+		const k = [...i.areas].sort().join(",");
+		byAreas.set(k, [...(byAreas.get(k) ?? []), i]);
+	}
+	for (const [areas, group] of byAreas) {
+		const ids = new Set(group.map((i) => i.id));
+		const free = group.filter((i) => !graph.get(i.id).some((d) => ids.has(d)) && !group.some((o) => graph.get(o.id).includes(i.id)));
+		if (free.length >= 3) findings.push(`merge ${free.map((i) => i.id).join(", ")}: they all change only [${areas}] and do not depend on each other, so they would run one at a time as ${free.length} separate sessions. Make them one item (or two) with a combined "Done when".`);
+	}
+	// 2. an item that names another item but does not wait for it
+	const ids = new Set(items.map((i) => i.id));
+	for (const i of items) {
+		const text = i.line.replace(/\[[^\]]*\]/g, " ").replace(/^[A-Z]+\d+[A-Za-z0-9-]*/, "");
+		const named = [...new Set(text.match(/\b[A-Z]+\d+[a-z]?\b/g) ?? [])].filter((id) => ids.has(id) && id !== i.id && !graph.get(i.id).includes(id) && !(i.after ?? []).includes("*"));
+		if (named.length) findings.push(`${i.id} mentions ${named.join(", ")} but has no [after: ${named.join(", ")}]: add it (or reword the item) so it cannot run first and block.`);
+	}
+	// 3. the plan cannot use the parallelism it asks for
+	const sim = simulatePlan(items, parallel);
+	const floor = Math.max(sim.ideal, sim.criticalPath);
+	if (items.length >= 8 && parallel > 1 && sim.rounds > 1.6 * floor) {
+		const count = new Map();
+		for (const i of work) for (const a of new Set(i.areas ?? [])) count.set(a, (count.get(a) ?? 0) + work.filter((o) => o !== i && areasOverlap([a], o.areas ?? [])).length);
+		const top = [...count].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([a]) => a);
+		findings.push(`with parallel ${parallel} this plan needs about ${sim.rounds} rounds where ${floor} would do: too many items lock the same paths (most contended: ${top.join(", ")}). Narrow [areas] to the files each item really edits, or merge items that share files.`);
+	}
+	if (work.length > 80) findings.push(`${work.length} work items is a lot: every item costs a full agent session (reading the plan, checks, a merge). Fold small edits (copy text, renames, one-line changes) into the item that touches the same screen or module; aim for items of roughly 10–40 minutes of agent work.`);
+	return { findings, ...sim };
 }
 
 /** Prefer work that unlocks the longest remaining chain; explicit next order wins. */
@@ -506,7 +712,13 @@ Rules (the script enforces the first two and throws away the whole change if bro
 - Do not ask the user questions. Do not commit. Do not touch git history or branches.
 - Write focused regression coverage. The runner executes the configured checks after you stop, in separate verification capacity; do not run the mandatory suite in this coding turn. Use only a narrowly targeted diagnostic when needed to make the fix.${item.repaired ? "\n- Earlier verified repairs may already satisfy this item. Inspect them against the original Done when; if complete, report DONE without inventing another edit." : ""}
 - If the item clearly needs more than these size limits, do not start editing: reply with exactly one line NEEDS: <files> files, <lines> lines (your honest estimate). The limits are then raised for you.
-- If it cannot be done for any other reason (a missing contract, a decision nobody made, scope), undo your edits and reply with exactly one line: BLOCKED: <reason>
+- If the current code already does everything "Done when" asks (another item did it), change nothing and reply with one line: ALREADY DONE: <where you verified it>. The runner still runs the checks.
+- If it needs work from another queue item that has not landed yet, undo your edits and reply with one line: WAITING: <item ids, e.g. A03, B02> — <what is missing>. It runs again after them.
+- If it cannot be done for any other reason, undo your edits and reply with exactly one line:
+  BLOCKED: decision: <the question only the user can answer>   (a product/design choice the plan does not settle)
+  BLOCKED: env: <what is missing>   (credentials, a service, a tool that is not installed)
+  BLOCKED: <reason>   (anything else, e.g. the plan contradicts the code)
+  Prefer the plan's rules and the existing code's conventions over asking; only real gaps are BLOCKED.
 - When finished, reply: DONE, then each changed file with one sentence.`;
 }
 
@@ -528,7 +740,7 @@ const BYPASS = /\b(bypass|ignore|lift|remove|raise|disable|drop|skip)\b[^.\n]{0,
 async function bypassAsked(ctx, ref) {
 	try {
 		let file = ref.file;
-		if (!file && ctx.web && ref.id) file = await ctx.web.send(ref.id, { type: "get_state" }).then((r) => r?.data?.sessionFile);
+		if (!file && ref.web && ref.id) file = await ref.web.send(ref.id, { type: "get_state" }).then((r) => r?.data?.sessionFile);
 		if (!file) return false;
 		for (const line of readFileSync(file, "utf8").split("\n")) {
 			if (!line.includes('"user"')) continue;
@@ -794,6 +1006,7 @@ async function webTurn(ctx, cwd, ref, name, prompt, minutes, onActivity = () => 
 	const [provider, ...rest] = (c.model || "").split("/");
 	const modelId = rest.join("/");
 	let previousAssistantId;
+	let sent = false;
 	try {
 		if (!ref.id) {
 			const r = await web.create({
@@ -809,23 +1022,29 @@ async function webTurn(ctx, cwd, ref, name, prompt, minutes, onActivity = () => 
 		}
 		const { context } = await web.history(ref.id);
 		previousAssistantId = context.entryIds[context.messages.findLastIndex((m) => m.role === "assistant")];
+		sent = true; // from here on the session may be working even if the request itself fails
 		await web.send(ref.id, { type: "prompt", message: prompt });
 	} catch (e) {
-		return { status: "error", reply: "", err: String(e?.message ?? e), code: -1, quiescent: false };
+		// nothing was asked of the session yet: an ordinary (retryable) failure, not an uncertain worker
+		return { status: "error", reply: "", err: `Pi Web: ${String(e?.message ?? e)}`, code: -1, quiescent: !sent };
 	}
 	onActivity("thinking");
 	let sessionFile;
 	let status = "ok";
 	let awaitingSince = 0;
 	let notRunning = 0;
+	let unreachableSince = 0;
 	let lastSeen = "";
 	while (true) {
 		await new Promise((r) => setTimeout(r, 3000));
 		let snap;
 		try {
 			snap = await web.running(ref.id);
+			unreachableSince = 0;
 		} catch {
-			if (!stopRequested() && Date.now() <= deadline) continue;
+			unreachableSince ||= Date.now();
+			// Pi Web restarting is normal; gone for 5 minutes means this worker cannot be followed any more
+			if (!stopRequested() && Date.now() <= deadline && Date.now() - unreachableSince < 5 * 60_000) continue;
 			await web.send(ref.id, { type: "abort" }).catch(() => {});
 			return { status: "error", reply: "", err: "Pi Web unreachable; worker termination is unconfirmed", code: -1, quiescent: false };
 		}
@@ -983,10 +1202,14 @@ async function judge(c, cwd, base, reply, item = {}) {
 	}
 	const needs = reply.match(/^\s*NEEDS:\s*~?(\d+)\s*files?\D+?~?(\d+)\s*lines?/im);
 	if (needs) return `agent: NEEDS ${needs[1]} files, ${needs[2]} lines`;
+	const waiting = reply.match(/^\s*WAITING:\s*(.+)$/m);
+	if (waiting) return `agent: WAITING: ${waiting[1].slice(0, 300)}`;
 	const blocked = reply.match(/^\s*BLOCKED:\s*(.+)$/m);
 	if (blocked) return `agent: BLOCKED: ${blocked[1].slice(0, 300)}`;
 	const m = await measure(cwd, base, c.allowedPaths);
-	if (m.files.length === 0) return item.check || item.repaired ? runChecks(c, cwd) : "no changes were made";
+	// an item whose result another item already delivered passes on the same checks, instead of failing its dependents
+	const already = /^\s*ALREADY DONE\b/im.test(reply);
+	if (m.files.length === 0) return item.check || item.repaired || already ? runChecks(c, cwd) : "no changes were made";
 	if (m.outside.length) return `files outside ${c.allowedPaths.join(", ")}: ${m.outside.slice(0, 8).join(", ")}`;
 	if (m.net > c.maxNetLines) return `${m.net} net added lines (limit ${c.maxNetLines})`;
 	if (m.growing > c.maxFilesGrowing) return `${m.growing} files gain lines (limit ${c.maxFilesGrowing})`;
@@ -1006,9 +1229,22 @@ async function prepareWorktree(ctx, slot) {
 		if (add.code !== 0) throw new Error(`git worktree add failed: ${tail(add.out, 5)}`);
 		rmSync(ready, { force: true });
 	}
-	if (!(await treeIsClean(wt))) throw new Error(`worktree ${wt} has unpreserved changes; refusing to reset it`);
 	const tip = (await git(repo, "rev-parse", ctx.branch)).out.trim();
-	if ((await git(wt, "merge-base", "--is-ancestor", "HEAD", tip)).code !== 0) throw new Error(`worktree ${wt} has unintegrated commits; refusing to reset it`);
+	const dirty = !(await treeIsClean(wt));
+	if (dirty || (await git(wt, "merge-base", "--is-ancestor", "HEAD", tip)).code !== 0) {
+		// leftovers from an interrupted run: keep them on a branch instead of refusing to start
+		if (c.autoReconcile === false) throw new Error(`worktree ${wt} has unpreserved changes or commits; refusing to reset it`);
+		await git(wt, "rebase", "--abort");
+		if (dirty) {
+			await git(wt, "add", "-A");
+			const committed = await git(wt, "commit", "--no-verify", "-m", `queue LEFTOVER w${slot}`);
+			if (committed.code !== 0) throw new Error(`worktree ${wt} has changes that could not be preserved: ${tail(committed.out, 3)}`);
+		}
+		const name = `queue-failed/w${slot}-leftover-${Date.now()}`;
+		const made = await git(repo, "branch", name, (await git(wt, "rev-parse", "HEAD")).out.trim());
+		if (made.code !== 0) throw new Error(`worktree ${wt} has changes that could not be preserved: ${tail(made.out, 3)}`);
+		log(`RECONCILED w${slot} · leftover changes kept on ${name}`);
+	}
 	const checkout = await git(wt, "checkout", "--detach", tip);
 	if (checkout.code !== 0) throw new Error(checkout.out);
 	// Ignored project-local plugins are absent in fresh worktrees. Reuse the installed extension, not its state/settings.
@@ -1109,6 +1345,12 @@ async function workItem(ctx, slot, wt, item) {
 	item = { ...item, repaired: (state.fixes?.[item.key] ?? []).some((line) => parseQueue(line).some((fix) => fix.id.startsWith(`${item.id}-repair`) && state.done[fix.key])) };
 	const itemChecks = loadJson(join(repo, ".tasks", ctx.c.task, "task.json"), {}).itemChecks;
 	let c = itemConfig({ ...ctx.c, itemChecks }, item); // keep worker, judge and rebase checks identical
+	if (state.limits?.[item.key]) c = { ...c, ...state.limits[item.key] }; // raised by you or the manager
+	// Pi Web went away (restart, laptop lid, update): new items run as background pi instead of failing one by one
+	if (ctx.web && ctx.c.runIn !== "web" && !(await ctx.web.available())) {
+		ctx.web = null;
+		log("Pi Web is not reachable any more · new items run as background pi");
+	}
 	const started = Date.now();
 	const solo = wt === repo; // working directly in the repo folder
 	let base = (await git(repo, "rev-parse", branch)).out.trim();
@@ -1118,13 +1360,33 @@ async function workItem(ctx, slot, wt, item) {
 	await git(wt, "clean", "-fd");
 
 	const cliId = randomUUID();
-	const ref = { id: ctx.web ? undefined : cliId };
+	const web = ctx.web; // one backend for the whole item, even if Pi Web goes away meanwhile
+	const ref = { id: web ? undefined : cliId, web };
 	const turn = async (prompt, minutes, onAct, phase = "coding") => {
-		if (!(await ctx.acquirePhase(slot, phase))) return { status: "stopped", reply: "", err: "" };
-		const worker = { ...ctx, c, onWorker: (identity) => { Object.assign(live, identity); save(); } };
-		const result = await (ctx.web ? webTurn(worker, wt, ref, name, prompt, minutes, onAct) : piTurn(worker, wt, cliId, name, prompt, minutes, onAct));
-		if (result.quiescent === false) throw new Error(`${result.err}; worktree quarantined`);
-		return result;
+		const worker = { ...ctx, web, c, onWorker: (identity) => { Object.assign(live, identity); save(); } };
+		const giveUpAt = Date.now() + (c.outageMinutes ?? 180) * 60_000;
+		for (let attempt = 0; ; attempt++) {
+			// a provider outage seen by any worker holds every worker back, instead of burning each item's retries
+			while (Date.now() < (ctx.outage?.until ?? 0) && !ctx.stopRequested()) await sleep(Math.min(5000, ctx.outage.until - Date.now()));
+			if (!(await ctx.acquirePhase(slot, phase))) return { status: "stopped", reply: "", err: "" };
+			const toolsBefore = live.tools, startedAt = Date.now();
+			const result = await (web ? webTurn(worker, wt, ref, name, prompt, minutes, onAct) : piTurn(worker, wt, cliId, name, prompt, minutes, onAct));
+			if (result.quiescent === false) throw new Error(`${result.err}; worktree quarantined`);
+			// An error before the agent did anything (rate limit, overloaded provider, login expired, network) says nothing
+			// about the item: wait and ask again in the same session.
+			const idle = result.status === "error" && live.tools === toolsBefore && Date.now() - startedAt < 5 * 60_000;
+			if (!idle || ctx.stopRequested() || Date.now() >= giveUpAt) {
+				if (result.status === "ok" && ctx.outage) ctx.outage.streak = 0;
+				return result;
+			}
+			ctx.outage ??= { until: 0, streak: 0 };
+			const pauses = Array.isArray(c.outagePauses) && c.outagePauses.length ? c.outagePauses : [30, 120, 300, 600, 1200, 1800]; // seconds
+			const pause = pauses[Math.min(attempt, pauses.length - 1)] * 1000;
+			ctx.outage.until = Math.max(ctx.outage.until, Date.now() + pause);
+			log(`PROVIDER ${item.id} · ${firstLine(result.err || result.reply).slice(0, 140) || "session error"} · no work was done; all workers wait ${pause >= 60_000 ? `${Math.round(pause / 60_000)} min` : `${Math.round(pause / 1000)} s`} and ask again`);
+			setDoing(`waiting out a provider/session error (attempt ${attempt + 2})`);
+			save();
+		}
 	};
 	const sessionId = cliId;
 	const name = `queue ${item.id}: ${item.title}`.slice(0, 80);
@@ -1153,7 +1415,7 @@ async function workItem(ctx, slot, wt, item) {
 	const previous = existsSync(prior) ? `\n\nPrevious attempt and manager diagnosis (evidence, not permission to expand scope):\n${readFileSync(prior, "utf8").slice(-12000)}` : "";
 	let t = await turn(itemPrompt(c, item) + previous, c.itemMinutes, onActivity, item.check ? "verification" : "coding");
 	if (ref.id) {
-		state.sessions = { ...(state.sessions ?? {}), [ref.id]: { item: item.id, status: "running", web: !!ctx.web } };
+		state.sessions = { ...(state.sessions ?? {}), [ref.id]: { item: item.id, status: "running", web: !!web } };
 		save();
 	}
 	let redone = false;
@@ -1175,7 +1437,15 @@ async function workItem(ctx, slot, wt, item) {
 		save();
 		return judge(c, wt, base, t.reply, item);
 	};
+	// Out of time with work in progress: one shorter turn in the same session to finish, instead of losing the work.
+	if (t.status === "timeout" && !ctx.stopRequested() && live.tools > 0) {
+		log(`OVERTIME ${item.id} · ${c.itemMinutes} min were not enough · one more turn to finish up`);
+		setDoing("finishing up after the time limit");
+		t = await turn(overtimePrompt(c), Math.max(10, Math.round(c.itemMinutes / 2)), onActivity, item.check ? "verification" : "coding");
+	}
 	let reason = await verdict();
+	// the next attempt (yours or the automatic one) gets more time
+	if (/^timed out after/.test(reason ?? "")) state.limits = { ...(state.limits ?? {}), [item.key]: { ...(state.limits?.[item.key] ?? {}), itemMinutes: Math.min(240, Math.round(c.itemMinutes * 1.5)) } };
 	// stopped only because of the size limit: raise it a level and let the same agent carry on in the same session
 	for (const level of ctx.c.escalate ?? []) {
 		if (!reason || t.status !== "ok" || !isSizeStop(reason) || ctx.stopRequested()) break;
@@ -1188,7 +1458,7 @@ async function workItem(ctx, slot, wt, item) {
 		reason = await verdict();
 	}
 	for (let round = 0; reason && t.status === "ok" && round < c.fixRounds; round++) {
-		if (reason.startsWith("agent: BLOCKED") || reason.startsWith("agent: GAPS") || reason === "no changes were made" || ctx.stopRequested()) break;
+		if (/^agent: (BLOCKED|GAPS|WAITING)/.test(reason) || reason === "no changes were made" || ctx.stopRequested()) break;
 		setDoing(`fixing: ${firstLine(reason).slice(0, 80)}`);
 		t = await turn(fixPrompt(c, reason), Math.max(10, Math.round(c.itemMinutes / 2)), onActivity);
 		reason = await verdict();
@@ -1198,36 +1468,63 @@ async function workItem(ctx, slot, wt, item) {
 	let splitLines = [];
 	let fixLines = [];
 	const sessionTags = `${c.model ? ` [model: ${c.model}]` : ""}${c.thinking ? ` [thinking: ${c.thinking}]` : ""}`;
+	const growthLeft = () => growthBudget(ctx.c, ctx.plannedCount?.() ?? 0) - growthUsed(state);
 	// a check found production gaps: queue fix items before it and check again after them
 	if (reason?.startsWith("agent: GAPS") && item.check) {
 		const round = (state.gapRound?.[item.key] ?? 0) + 1;
-		const gaps = t.reply.split("\n").map((l) => l.match(/^\s*GAP:\s*(.+?)\s*$/)?.[1]).filter(Boolean).slice(0, 8);
-		if (c.autoFix !== false && round <= (c.gapRounds ?? 2)) {
+		const gaps = t.reply.split("\n").map((l) => l.match(/^\s*GAP:\s*(.+?)\s*$/)?.[1]).filter(Boolean).slice(0, 12);
+		const room = Math.min(Math.max(1, Math.floor(c.maxGapItems ?? 3)), growthLeft());
+		if (c.autoFix !== false && round <= (c.gapRounds ?? 2) && room > 0) {
 			const base0 = (state.fixes?.[item.key] ?? []).length;
-			fixLines = gaps.map((g, i) => `- [ ] ${item.id}-fix${base0 + i + 1} — ${/Done when:/i.test(g) ? g : `${g}. Done when: ${item.id} can verify it.`}${sessionTags}`);
+			fixLines = mergeGaps(gaps, room).map((g, i) => `- [ ] ${item.id}-fix${base0 + i + 1} — ${g}${sessionTags}`);
 			kind = "gaps";
 			state.gapRound = { ...(state.gapRound ?? {}), [item.key]: round };
-		} else reason = `gaps remain after ${round - 1} fix round(s): ${gaps.map((g) => g.slice(0, 120)).join(" | ")}`;
+		} else reason = room > 0 ? `gaps remain after ${round - 1} fix round(s): ${gaps.map((g) => g.slice(0, 120)).join(" | ")}` : `needs you: the queue's growth budget is used up (${growthUsed(state)} derived items); gaps: ${gaps.map((g) => g.slice(0, 100)).join(" | ")}`;
 	}
-	// BLOCKED while other work is still pending (often a prerequisite that has not run yet): try once more after it
-	const blockedOnly = reason?.startsWith("agent: BLOCKED") && !isSizeStop(reason) && !SCOPE_REASON.test(reason);
+	// WAITING: <ids> — it needs another item's work first: run it again after those items (no failure, no split)
+	if (reason?.startsWith("agent: WAITING")) {
+		const all = ctx.currentItems?.() ?? [];
+		const named = [...new Set((reason.match(/\b[A-Z]+\d+[A-Za-z0-9-]*\b/g) ?? []).filter((id) => id !== item.id))];
+		const open = named.filter((id) => all.some((i) => (i.id === id || (i.child && i.id.startsWith(id) && /^[a-z]$/.test(i.id.slice(id.length)))) && !state.done[i.key]));
+		const waits = (state.waits?.[item.key] ?? 0) + 1;
+		let ok = open.length > 0 && waits <= (c.maxWaits ?? 3);
+		if (ok) {
+			const waitFor = { ...(state.waitFor ?? {}), [item.key]: [...new Set([...(state.waitFor?.[item.key] ?? []), ...open])] };
+			try { dependencyGraph(allItems(ctx.queueText?.() ?? "", { ...state, waitFor })); }
+			catch { ok = false; } // waiting would close a cycle: treat it as blocked
+			if (ok) {
+				state.waitFor = waitFor;
+				state.waits = { ...(state.waits ?? {}), [item.key]: waits };
+				kind = "waiting";
+			}
+		}
+		if (!ok) reason = `agent: BLOCKED: ${reason.slice("agent: WAITING: ".length)}${named.length && !open.length ? " (the items it waits for are already done or unknown)" : ""}`;
+	}
+	// BLOCKED while other work is still pending (often a prerequisite that has not run yet): try once more after it.
+	// A decision only the user can make is not deferred: it goes straight to "needs you".
+	const blockedOnly = reason?.startsWith("agent: BLOCKED") && !isSizeStop(reason) && !SCOPE_REASON.test(reason) && !/^agent: BLOCKED: decision\b/i.test(reason);
 	if (kind === "fail" && blockedOnly && c.deferBlocked !== false && !state.deferred?.[item.key] && ctx.otherWorkPending?.(item)) kind = "deferred";
-	if (kind === "fail" && reason && c.autoSplit !== false && !item.child && t.status === "ok" && !ctx.stopRequested() && (reason.startsWith("agent: BLOCKED") || isSizeStop(reason)) && !SCOPE_REASON.test(reason)) {
-		setDoing("asking the agent to split this item");
-		save();
-		const st = await turn(splitPrompt(c, item, reason), 15, onActivity);
-		const texts = String(st.reply)
-			.split("\n")
-			.map((l) => l.match(/^\s*ITEM:\s*(.+?)\s*$/)?.[1])
-			.filter(Boolean)
-			.slice(0, c.splitMax ?? 8);
-		if (st.status === "ok" && texts.length >= 2) {
-			const kid = (n) => `${item.id}${String.fromCharCode(96 + n)}`;
-			splitLines = texts.map(
-				(txt, i) =>
-					`- [ ] ${kid(i + 1)} — ${txt.replace(/\[after:\s*([^\]]+)\]/i, (_, deps) => `[after: ${deps.split(/[,\s]+/).filter(Boolean).map((d) => (/^\d+$/.test(d) ? kid(Number(d)) : d)).join(", ")}]`)}${sessionTags}`,
-			);
-			kind = "split";
+	// Split only what is genuinely too big after the last size level. BLOCKED items are never split:
+	// splitting a blocked item multiplies the same blocker.
+	if (kind === "fail" && reason && c.autoSplit !== false && !item.child && t.status === "ok" && !ctx.stopRequested() && isSizeStop(reason) && !reason.startsWith("agent: BLOCKED") && !SCOPE_REASON.test(reason)) {
+		if (growthLeft() < 1) reason = `needs you: too big for one session and the queue's growth budget is used up (${growthUsed(state)} derived items) · ${firstLine(reason)}`;
+		else {
+			setDoing("asking the agent to split this item");
+			save();
+			const st = await turn(splitPrompt(c, item, reason), 15, onActivity);
+			const texts = String(st.reply)
+				.split("\n")
+				.map((l) => l.match(/^\s*ITEM:\s*(.+?)\s*$/)?.[1])
+				.filter(Boolean)
+				.slice(0, Math.min(c.splitMax ?? 4, growthLeft() + 1));
+			if (st.status === "ok" && texts.length >= 2) {
+				const kid = (n) => `${item.id}${String.fromCharCode(96 + n)}`;
+				splitLines = texts.map(
+					(txt, i) =>
+						`- [ ] ${kid(i + 1)} — ${txt.replace(/\[after:\s*([^\]]+)\]/i, (_, deps) => `[after: ${deps.split(/[,\s]+/).filter(Boolean).map((d) => (/^\d+$/.test(d) ? kid(Number(d)) : d)).join(", ")}]`)}${sessionTags}`,
+				);
+				kind = "split";
+			}
 		}
 	}
 	let sha = "";
@@ -1249,13 +1546,26 @@ async function workItem(ctx, slot, wt, item) {
 			// integrate one at a time: rebase onto the branch tip, re-check if it moved, fast-forward
 			setDoing("waiting to merge");
 			save();
-			const r = solo
+			// Rebase and re-check OUTSIDE the merge lock first, so one item's checks never hold up the others' merges.
+			// Under the lock only a fast-forward is left, unless the branch moved again in between.
+			let rebasedOn = base, early;
+			for (let i = 0; !solo && i < 2 && !early; i++) {
+				const tip = (await git(repo, "rev-parse", branch)).out.trim();
+				if (tip === rebasedOn) break;
+				setDoing("rebasing on items merged meanwhile");
+				const rb = await git(wt, "rebase", tip);
+				if (rb.code !== 0) { await git(wt, "rebase", "--abort"); early = { reason: "conflict with an item merged meanwhile", kind: "conflict" }; break; }
+				const broke = await runChecks(c, wt);
+				if (broke) { early = { reason: `breaks checks after merging with other items: ${firstLine(broke)}`, kind: "conflict" }; break; }
+				rebasedOn = tip;
+			}
+			const r = early ?? (solo
 				? { sha: (await git(repo, "rev-parse", "--short", "HEAD")).out.trim() } // already committed on the branch
 				: await lock(async () => {
 				setDoing("merging into the branch");
 				save();
 				const tip = (await git(repo, "rev-parse", branch)).out.trim();
-				if (tip !== base) {
+				if (tip !== rebasedOn) {
 					const rb = await git(wt, "rebase", tip);
 					if (rb.code !== 0) {
 						await git(wt, "rebase", "--abort");
@@ -1269,7 +1579,7 @@ async function workItem(ctx, slot, wt, item) {
 				const ff = await git(repo, "merge", "--ff-only", head);
 				if (ff.code !== 0) return { reason: `could not fast-forward ${branch}: ${tail(ff.out, 3).replace(/\n/g, " ")}`, kind: "fail" };
 				return { sha: (await git(repo, "rev-parse", "--short", "HEAD")).out.trim() };
-			});
+			}));
 			if (r.sha) sha = r.sha;
 			else {
 				reason = r.reason;
@@ -1299,7 +1609,7 @@ async function workItem(ctx, slot, wt, item) {
 	mkdirSync(join(repo, DIR, "notes"), { recursive: true });
 	appendFileSync(
 		join(repo, DIR, "notes", `${item.id}.md`),
-		`\n\n# ${item.line}\n\nResult: ${reason ? `${kind.toUpperCase()} — ${reason}` : `PASS ${sha}`}\nSession: ${ref.id ?? sessionId}${ctx.web ? " (Pi Web)" : ""}\nWorktree: ${wt}\n\n## Agent's last reply\n\n${t.reply}\n${t.err ? `\n## stderr\n\n${t.err.slice(-4000)}\n` : ""}`,
+		`\n\n# ${item.line}\n\nResult: ${reason ? `${kind.toUpperCase()} — ${reason}` : `PASS ${sha}`}\nSession: ${ref.id ?? sessionId}${web ? " (Pi Web)" : ""}\nWorktree: ${wt}\n\n## Agent's last reply\n\n${t.reply}\n${t.err ? `\n## stderr\n\n${t.err.slice(-4000)}\n` : ""}`,
 	);
 
 	let kept = "";
@@ -1333,6 +1643,9 @@ async function workItem(ctx, slot, wt, item) {
 		state.waitFor = { ...(state.waitFor ?? {}), [item.key]: [...new Set([...(state.waitFor?.[item.key] ?? []), ...ids])] };
 		delete state.failed[item.key];
 		log(`GAPS ${item.id} · found ${ids.length} production gap(s) → queued ${ids.join(", ")} · ${item.id} checks again after them · ${mins} min`);
+	} else if (kind === "waiting") {
+		delete state.failed[item.key];
+		log(`WAITING ${item.id} · needs ${state.waitFor[item.key].join(", ")} first · runs again after them · ${mins} min`);
 	} else if (kind === "deferred") {
 		state.deferred = { ...(state.deferred ?? {}), [item.key]: true };
 		delete state.failed[item.key];
@@ -1351,12 +1664,96 @@ async function workItem(ctx, slot, wt, item) {
 		log(`STOPPED ${item.id}${kept}`);
 	}
 	if (ref.id && state.sessions?.[ref.id]) {
-		state.sessions[ref.id].status = !reason ? "pass" : ["split", "gaps", "deferred"].includes(kind) ? kind : reason === "stopped by request" ? "stopped" : "fail";
+		state.sessions[ref.id].status = !reason ? "pass" : ["split", "gaps", "deferred", "waiting"].includes(kind) ? kind : reason === "stopped by request" ? "stopped" : "fail";
 		if (!reason && ctx.c.deleteSessions === "pass") await deleteSessions(ctx, [ref.id]);
 	}
 	save();
-	notifyRunner(!reason ? "completion" : ["deferred", "conflict", "gaps", "split"].includes(kind) ? "deferred" : "failure", { id: item.id, kind, runId: state.runId });
+	notifyRunner(!reason ? "completion" : ["deferred", "conflict", "gaps", "split", "waiting"].includes(kind) ? "deferred" : "failure", { id: item.id, kind, runId: state.runId });
 	return { pass: !reason, kind, redone, stopped: reason === "stopped by request" };
+}
+
+// ---------- interrupted workers ----------
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Workers left in state.running by a crash, sleep or a Pi Web restart: stop them if they still run, keep whatever
+ *  they changed on a queue-failed/<id>-interrupted-* branch, reset their worktree and queue the item again.
+ *  Returns what could not be resolved safely (those slots are left untouched). */
+export async function reconcileInterrupted({ repo, c, state, save, log, branch }) {
+	const unresolved = [];
+	let web, webKnown = false;
+	const webClientFor = async () => {
+		if (webKnown) return web;
+		webKnown = true;
+		const found = await findPiWeb(c);
+		if (found.url) web = webClient({ ...c, piWebUrl: found.url });
+		else if (/answered/.test(found.reason ?? "")) web = "unknown"; // reachable but refused: we cannot tell
+		return web;
+	};
+	const tip = (await git(repo, "rev-parse", branch)).out.trim();
+	for (const [slot, r] of Object.entries(state.running ?? {})) {
+		const id = r?.id ?? `slot ${slot}`;
+		let alive = false;
+		if (Number.isInteger(r?.pid) && pidAlive(r.pid)) {
+			for (const sig of ["SIGTERM", "SIGKILL"]) {
+				try { process.kill(-r.pid, sig); } catch { try { process.kill(r.pid, sig); } catch {} }
+				for (let i = 0; i < 20 && pidAlive(r.pid); i++) await sleep(250);
+				if (!pidAlive(r.pid)) break;
+			}
+			alive = pidAlive(r.pid);
+		}
+		if (!alive && r?.web && r.sessionId) {
+			const w = await webClientFor();
+			if (w === "unknown") alive = true;
+			else if (w) {
+				const active = async () => {
+					const snap = await w.running(r.sessionId);
+					return [...(snap.runningSessionIds ?? []), ...(snap.subagentsActiveSessionIds ?? [])].includes(r.sessionId);
+				};
+				try {
+					if (await active()) {
+						await w.send(r.sessionId, { type: "abort" }).catch(() => {});
+						alive = true;
+						for (let i = 0; i < 20 && alive; i++) {
+							await sleep(3000);
+							alive = await active().catch(() => true);
+						}
+					}
+				} catch { alive = true; }
+			}
+		}
+		if (alive) { unresolved.push(`${id}: its worker is still running`); continue; }
+		const wt = r?.worktree ?? (c.worktrees === false ? repo : join(worktreeRoot(repo), `w${slot}`));
+		let kept = "";
+		if (existsSync(join(wt, ".git"))) {
+			await git(wt, "rebase", "--abort");
+			await git(wt, "merge", "--abort");
+			const dirty = !(await treeIsClean(wt));
+			const head = (await git(wt, "rev-parse", "HEAD")).out.trim();
+			const ahead = wt !== repo && head && head !== tip && (await git(wt, "merge-base", "--is-ancestor", head, tip)).code !== 0;
+			if (dirty || ahead) {
+				let sha = head;
+				await git(wt, "add", "-A");
+				if (wt === repo) sha = (await git(wt, "stash", "create", `queue INTERRUPTED ${id}`)).out.trim() || head;
+				else if (dirty) {
+					await git(wt, "commit", "--no-verify", "-m", `queue INTERRUPTED ${id}`);
+					sha = (await git(wt, "rev-parse", "HEAD")).out.trim();
+				}
+				const name = `queue-failed/${String(id).replace(/[^A-Za-z0-9._-]/g, "-")}-interrupted-${Date.now()}`;
+				const made = await git(repo, "branch", name, sha);
+				if (made.code !== 0) { unresolved.push(`${id}: could not keep its work (${firstLine(made.out)})`); continue; }
+				kept = ` · work kept on ${name}`;
+			}
+			if (wt === repo) await git(wt, "reset", "--hard", "HEAD");
+			else await git(wt, "checkout", "--detach", "--force", tip);
+			await git(wt, "clean", "-fd");
+		}
+		delete state.running[slot];
+		if (r?.key && /^(runner error|stopped by request)/.test(state.failed?.[r.key] ?? "")) delete state.failed[r.key];
+		log(`RECONCILED ${id} · interrupted worker is gone${kept} · ${r?.key ? "item queued again" : "slot freed"}`);
+	}
+	save();
+	return unresolved;
 }
 
 // ---------- the scheduler ----------
@@ -1378,8 +1775,8 @@ export async function main(repo) {
 	const stopRequested = () => existsSync(join(repo, DIR, "STOP"));
 	const pauseRequested = () => existsSync(join(repo, DIR, "PAUSE"));
 	if (stopRequested() || pauseRequested()) return log("NOT STARTED: manually stopped/paused; explicit /queue start is required");
-	if (Object.keys(state.running).length) {
-		problem(repo, "Interrupted workers/worktrees require reconciliation; refusing to reset or reuse them.");
+	if (Object.keys(state.running).length && c.autoReconcile === false) {
+		problem(repo, "Interrupted workers/worktrees require reconciliation; refusing to reset or reuse them (autoReconcile is off).");
 		return log("NOT STARTED: interrupted workers remain; worktrees preserved");
 	}
 	state.phase = "starting";
@@ -1393,6 +1790,16 @@ export async function main(repo) {
 
 	const branch = (await git(repo, "branch", "--show-current")).out.trim();
 	if (!branch) return log("NOT STARTED: the repo is on a detached HEAD; check out a branch first");
+	if (Object.keys(state.running).length) {
+		// a crash, sleep or Pi Web restart left workers behind: stop them, keep their work, queue the items again
+		state.phase = "reconciling interrupted workers";
+		save();
+		const left = await reconcileInterrupted({ repo, c, state, save, log, branch });
+		if (left.length) {
+			problem(repo, `Interrupted workers could not be reconciled automatically:\n- ${left.join("\n- ")}\n\nTheir worktrees are untouched. Stop those sessions, then /queue start again.`);
+			return log(`NOT STARTED: interrupted workers remain (${left.join("; ")}); worktrees preserved`);
+		}
+	}
 	if (!(await treeIsClean(repo))) return log("NOT STARTED: working tree is not clean (commit or stash first)");
 	const queuePath = join(repo, c.queue);
 	if (!c.queue) return log("NOT STARTED: no work list set (run /task to plan one, or set \"queue\" in .pi-queue/config.json)");
@@ -1401,6 +1808,9 @@ export async function main(repo) {
 	catch (e) { return log(`NOT STARTED: ${e.message}`); }
 
 	const ctx = { repo, c, state, save, log, lock: mutex(), branch, stopRequested, pi: await resolvePi(c), env: await loginEnv(), web: null };
+	ctx.queueText = () => { try { return readFileSync(queuePath, "utf8"); } catch { return ""; } };
+	ctx.currentItems = () => allItems(ctx.queueText(), state);
+	ctx.plannedCount = () => parseQueue(ctx.queueText()).length;
 	if (c.runIn !== "cli") {
 		const found = await findPiWeb(c);
 		if (found.url) {
@@ -1426,7 +1836,13 @@ export async function main(repo) {
 	if (checkBroker(c)) log("CHECKS via pi-check · shared across worktrees, cached by file content, pre-existing Go failures do not block");
 	state.phase = "checking the unchanged code (baseline)";
 	save();
-	const baseline = await runChecks(c, wts[0]);
+	let baseline = await runChecks(c, wts[0]);
+	if (baseline) {
+		// a flaky test should not cost a whole night: one more try before giving up
+		log(`BASELINE failed once (${firstLine(baseline).slice(0, 120)}) · trying again`);
+		baseline = await runChecks(c, wts[0]);
+		if (!baseline) log("BASELINE passed on the second try · a check is flaky");
+	}
 	state.phase = "running items";
 	state.width = width;
 	save();
@@ -1633,13 +2049,28 @@ export async function main(repo) {
 				}
 				return workItem(ctx, slot, wts[slot], item);
 			})()
-				.catch((e) => {
+				.catch(async (e) => {
 					state.failed[item.key] = `runner error: ${e?.message ?? e}`;
 					state.running[slot] = { ...(state.running[slot] ?? {}), id: item.id, key: item.key, worktree: wts[slot], quarantined: true };
+					save();
+					log(`ERROR ${item.id} · ${e?.message ?? e}`);
+					// Free the slot right away when the worker is provably gone: stop it, keep its work on a branch, reset the worktree.
+					// The item itself runs again at most twice this way; after that it stays failed for the supervisor.
+					if (c.autoReconcile !== false && !stopRequested()) {
+						const errors = (state.runnerErrors?.[item.key] ?? 0) + 1;
+						state.runnerErrors = { ...(state.runnerErrors ?? {}), [item.key]: errors };
+						const only = { ...state, running: { [slot]: state.running[slot] }, failed: errors <= 2 ? state.failed : {} };
+						const left = await reconcileInterrupted({ repo, c, state: only, save: () => {}, log, branch }).catch((err) => [String(err?.message ?? err)]);
+						if (!left.length) {
+							delete state.running[slot];
+							save();
+							return { pass: false, kind: errors <= 2 ? "requeued" : "fail" };
+						}
+					}
 					item.quarantined = true;
 					save();
 					notifyRunner("quarantine", { id: item.id, runId: state.runId });
-					log(`ERROR ${item.id} · ${e?.message ?? e} · slot quarantined; work preserved`);
+					log(`QUARANTINED ${item.id} · its worker could not be confirmed gone; slot w${slot} stays reserved, work preserved`);
 					return { pass: false, kind: "fail" };
 				})
 				.then((r) => ({ r, slot, item }));
@@ -1695,6 +2126,10 @@ export async function main(repo) {
 	notifyRunner("completion", { runId: state.runId, phase: state.phase });
 	const left = allItems(readFileSync(queuePath, "utf8"), state).filter((i) => !state.done[i.key] && !state.failed[i.key]).length;
 	log(`END · passed ${Object.keys(state.done).length} · failed ${Object.keys(state.failed).length} · still open ${left}${halted ? ` · ${halted}` : ""}`);
+	try {
+		const decisions = existsSync(join(repo, DIR, "decisions.md")) ? `\n\n# Decisions the automatic manager made (review these)\n${readFileSync(join(repo, DIR, "decisions.md"), "utf8")}` : "";
+		writeFileSync(join(repo, DIR, "report.md"), `${runReport(allItems(readFileSync(queuePath, "utf8"), state), state)}${decisions}\n`);
+	} catch {}
 	if (c.deleteSessions && c.deleteSessions !== "pass" && !halted) {
 		const ids = Object.entries(state.sessions ?? {})
 			.filter(([, x]) => !x.deleted && !x.archived && (x.status === "pass" || x.status === "split"))

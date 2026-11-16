@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0
+
+- pi-flow 1.8.0: provider-outage waiting, autonomous decisions with a decision log, in-run slot recovery, merge checks outside the lock, overtime turn, start retries, persistent manager mode.
+
+## 0.3.0
+
+- pi-flow 1.7.0: bounded queue growth, WAITING/ALREADY DONE/BLOCKED kinds, automatic reconciliation of interrupted workers, model-free restarts and transient retries, plan limits/tiers and a plan lint at handoff, manager `answer`/`limits`/`skip`.
+- pi-check 1.2.0: flaky-test reruns, measured scheduling lanes, tsgo, low-priority speculation.
+
 ## 0.2.0
 
 - pi-flow: automatic isolated manager with a detached, no-model health tick and bounded approved-scope recovery; durable controls, explicit resume, worker quarantine and preserved failure work.

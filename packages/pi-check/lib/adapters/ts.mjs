@@ -243,7 +243,7 @@ const adapter = {
 				const solutionOnly = Array.isArray(tc.files) && tc.files.length === 0 && tc.references;
 				if (!solutionOnly && files.some((f) => /\.(ts|tsx|mts|cts|vue)$/.test(f))) {
 					kinds.push("typecheck");
-					meta.tsc = deps["vue-tsc"] || deps.vue ? "vue-tsc" : "tsc";
+					meta.tsc = deps["vue-tsc"] || deps.vue ? "vue-tsc" : rc.config.tsgo !== false && deps["@typescript/native-preview"] ? "tsgo" : "tsc";
 					meta.composite = !!tc.compilerOptions?.composite;
 				}
 			}
@@ -327,12 +327,16 @@ const adapter = {
 				cmd = "/bin/sh";
 				args = ["-c", opts.cmd];
 			} else {
-				cmd = binFor(rc, project, project.meta.tsc ?? "tsc");
-				if (!cmd) return errAll(`${project.meta.tsc ?? "tsc"} not found (install dependencies)`, ""), { results, ms: 0 };
+				let tool = project.meta.tsc ?? "tsc";
+				cmd = binFor(rc, project, tool);
+				if (!cmd && tool === "tsgo") cmd = binFor(rc, project, (tool = "tsc")); // declared but not installed here: the classic compiler
+				if (!cmd) return errAll(`${tool} not found (install dependencies)`, ""), { results, ms: 0 };
 				args = ["--noEmit", "-p", "tsconfig.json", "--pretty", "false"];
+				if (tool === "tsgo") args.push("--checkers", String(Math.max(1, threads)));
 				if (!project.meta.composite) {
 					mkdirSync(tmpDir, { recursive: true });
-					args.push("--incremental", "--tsBuildInfoFile", join(tmpDir, `tsc-${sha(rc.abs + project.dir).slice(0, 12)}.tsbuildinfo`));
+					// tsc and tsgo build-info files are not interchangeable
+					args.push("--incremental", "--tsBuildInfoFile", join(tmpDir, `${tool}-${sha(rc.abs + project.dir).slice(0, 12)}.tsbuildinfo`));
 				}
 				args.push(...(opts?.args ?? []));
 			}

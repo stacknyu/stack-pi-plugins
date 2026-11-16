@@ -264,6 +264,8 @@ export function findBin(name, absDir, stopAt, alsoTry = []) {
 }
 
 export const NICE = which("nice");
+export const IONICE = process.platform === "linux" ? which("ionice") : undefined;
+export const TASKPOLICY = process.platform === "darwin" ? which("taskpolicy") ?? (existsSync("/usr/sbin/taskpolicy") ? "/usr/sbin/taskpolicy" : undefined) : undefined;
 
 /**
  * Run a process in its own process group. Resolves { code, stdout, stderr, killed, ms }.
@@ -272,7 +274,10 @@ export const NICE = which("nice");
 export function runProc({ cmd, args = [], cwd, env, signal, timeoutMs, nice = 10, onData, maxBytes = 8 * 1024 * 1024 }) {
 	return new Promise((resolveP) => {
 		const started = Date.now();
-		const argv = nice && NICE ? [NICE, "-n", String(nice), cmd, ...args] : [cmd, ...args];
+		// "low" / "background": ahead-of-time work must never slow the person or a requested check down
+		const argv = nice === "background" && TASKPOLICY ? [TASKPOLICY, "-b", cmd, ...args]
+			: nice === "low" || nice === "background" ? [...(NICE ? [NICE, "-n", "19"] : []), ...(IONICE ? [IONICE, "-c", "3"] : []), cmd, ...args]
+			: nice && NICE ? [NICE, "-n", String(nice), cmd, ...args] : [cmd, ...args];
 		let child;
 		try {
 			child = spawn(argv[0], argv.slice(1), { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });

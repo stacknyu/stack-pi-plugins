@@ -6,6 +6,7 @@ One check runner per repo, shared by every Pi session and every worktree. It han
 - **Same files, one run.** Each unit is keyed by the content of everything it depends on. If five worktrees ask for the same unit with the same files, it runs once and all five get the result. A unit already running is joined, not repeated.
 - **Ahead of time.** The broker watches every checkout. When files change, the affected units run at low priority, so results are often ready before the agent asks. These runs never take the last free slot, and they stop when the machine is busy, when an agent's request needs the slot, or when their files change again.
 - **Pre-existing failures are separated.** Failures that also fail on the base branch are reported as pre-existing and don't fail the check. Agents fix what they broke, not old debt.
+- **Flaky tests don't fail the work.** A failing test is run once more (Go: only the failed tests). If it passes, the check passes and the test is listed as flaky (`/check flaky`), with a count, so it can be fixed instead of blamed on whoever ran it.
 - **Short checks have reserved capacity.** One broker/cache, with fast and heavy scheduling lanes—not independent unlimited queues per language. Fast checks cannot be trapped behind long Go suites, and heavy work retains its own slots. With three job slots, two heavy jobs and one fast job can coexist.
 - **Useful throughput, not a utilization ceiling.** Agent count is independent of check concurrency. A shared CPU budget is divided among runnable jobs; Go runs one package per job, rather than multiplying package and runtime parallelism. For tests sharing ports/databases, set the project's `parallel: 1`.
 
@@ -79,6 +80,10 @@ Projects are found by `go.mod`, `package.json` (+ `tsconfig.json` / vitest / jes
 | `nice` | 10 | process priority of check runs |
 | `speculate`, `warmBase` | true, false | affected-only ahead-of-time work; full baseline warming is opt-in |
 | `speculateMaxLoad` | 0.75 | ahead-of-time work only while load < cores × this |
+| `speculateQos` | `"low"` | priority of ahead-of-time runs: `low` (nice 19, idle I/O), `background` (macOS: efficiency cores only), `normal` |
+| `flakyRetries` | 1 | extra runs for a failing test before it counts (0–3; 0 disables) |
+| `fastMs` | 20000 | a unit measured faster than this uses the fast lane, slower the heavy lane; explicit `lane` wins |
+| `tsgo` | true | type-check with `tsgo` when the project depends on `@typescript/native-preview` |
 | `intercept` | `"route"` | raw check commands in agent bash: `route` through the broker, `block` (use the tool), `off` |
 | `shimGo` | true | `go test`/`go vet` in agent bash go through the shim |
 | `base` | the branch the main checkout is on | what "changed" and "pre-existing" compare against |

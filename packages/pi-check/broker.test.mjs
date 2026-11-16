@@ -420,3 +420,42 @@ test("conditional Go packages follow Go's build eligibility and request tags", (
 	assert.deepEqual(b.plan(rc, req).map((it) => it.unit.target), ["."]);
 	assert.deepEqual(b.plan(rc, { ...req, extraArgs: ["-tags=fixture"] }).map((it) => it.unit.target).sort(), [".", "tagged"]);
 });
+
+test("a test that passes on a second run is reported as flaky, not failed; a real failure still fails", { timeout: 120000 }, async (t) => {
+	const { root, b, git } = fixture(t, { languages: { go: true, ts: false, python: false }, projects: { ".": { vet: false } } });
+	const mark = join(root, ".pi-check", "flaky-mark");
+	writeFileSync(join(root, "go.mod"), "module example.test/flaky\n\ngo 1.22\n");
+	const source = (broken) => `package flaky\n\nimport (\n\t"os"\n\t"testing"\n)\n\nfunc TestSometimes(t *testing.T) {\n\tif _, err := os.Stat(${JSON.stringify(mark)}); err != nil {\n\t\tos.WriteFile(${JSON.stringify(mark)}, nil, 0o644)\n\t\tt.Fatal("first run fails")\n\t}\n}\n\nfunc TestSteady(t *testing.T) {${broken ? ' t.Fatal("really broken") ' : ""}}\n`;
+	writeFileSync(join(root, "flaky_test.go"), source(false));
+	git("add", "."); git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "go");
+	const first = await b.run({ root, scope: "all", kinds: ["test"] });
+	assert.equal(first.ok, true, first.text);
+	assert.equal(first.flaky, 1);
+	assert.match(first.text, /~ flaky, passed when run again \(seen 1×\): example\.test\/flaky TestSometimes/);
+	assert.equal(b.flaky["example.test/flaky:TestSometimes"].count, 1);
+	assert.equal(b.status().flaky[0].count, 1);
+	assert.ok(Object.values(b.durations)[0] > 0, "the unit's duration was measured");
+	rmSync(mark);
+	writeFileSync(join(root, "flaky_test.go"), source(true));
+	const second = await b.run({ root, scope: "all", kinds: ["test"] });
+	assert.equal(second.ok, false);
+	assert.equal(second.newFailures, 1, second.text);
+	assert.match(second.text, /✗ example\.test\/flaky TestSteady/);
+	assert.doesNotMatch(second.text, /✗ example\.test\/flaky TestSometimes/);
+	const off = fixture(t, { flakyRetries: 0 });
+	assert.equal(off.b.config.flakyRetries, 0);
+	assert.throws(() => fixture(t, { speculateQos: "turbo" }), /speculateQos/);
+});
+
+test("measured durations choose the lane; an explicit lane still wins", (t) => {
+	const { b } = fixture(t, { custom: [{ name: "slow", cmd: "true", inputs: ["input.txt"] }, { name: "pinned", cmd: "true", inputs: ["input.txt"], lane: "fast" }] });
+	const rc = b.root(b.main).rc, [slow, pinned] = b.plan(rc, { scope: "all" });
+	const before = b.laneOf(slow);
+	b.noteDuration(slow.uid, 90_000);
+	b.noteDuration(pinned.uid, 90_000);
+	assert.equal(b.laneOf(slow), "heavy");
+	assert.equal(b.laneOf(pinned), "fast");
+	b.durations[slow.uid] = 500;
+	assert.equal(b.laneOf(slow), "fast");
+	assert.ok(["fast", "heavy"].includes(before));
+});

@@ -133,7 +133,7 @@ export default function (pi: ExtensionAPI) {
 	} as any);
 
 	pi.registerCommand("check", {
-		description: "Shared check broker: /check [status] | run [all] | baseline | known [clear] | speculate [all] | cancel | reload | stop | restart | init | log",
+		description: "Shared check broker: /check [status] | run [all] | baseline | known [clear] | flaky | speculate [all] | cancel | reload | stop | restart | init | log",
 		handler: async (args: string, ctx: any) => {
 			const [cmd = "status", ...rest] = (args ?? "").trim().split(/\s+/).filter(Boolean);
 			const cwd = ctx.cwd;
@@ -165,6 +165,11 @@ export default function (pi: ExtensionAPI) {
 					const res: any = await call(base ? r.main : cwd, "/run", { scope: base || rest[0] === "all" ? "all" : "changed", label: base ? "baseline" : "/check" });
 					ctx.ui.notify(tailLines(res.report.text, 60), res.report.ok ? "info" : "warning");
 					watchStatus(ctx);
+					return;
+				}
+				if (cmd === "flaky") {
+					const st: any = await call(cwd, "/status");
+					ctx.ui.notify(`${(st.flaky ?? []).map((f: any) => `${f.count}×  ${f.title}`).join("\n") || "(none)"}\n${(st.flaky ?? []).length} flaky test(s): failed once, passed when run again`, "info");
 					return;
 				}
 				if (cmd === "known") {
@@ -203,7 +208,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`${out.stdout}${out.stderr}`.trim() || "(no output)", out.code !== 0 || out.killed || out.truncated ? "warning" : "info");
 					return;
 				}
-				ctx.ui.notify("Usage: /check [status] | run [all] | baseline | known [clear|remove <text>] | speculate [all] | cancel | reload | stop | restart | init | projects | log", "warning");
+				ctx.ui.notify("Usage: /check [status] | run [all] | baseline | known [clear|remove <text>] | flaky | speculate [all] | cancel | reload | stop | restart | init | projects | log", "warning");
 			} catch (e: any) {
 				ctx.ui.notify(`check: ${e?.message ?? e}`, "error");
 			}

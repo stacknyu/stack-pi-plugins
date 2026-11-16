@@ -17,6 +17,10 @@ export const DEFAULTS = {
 	speculate: true, // run affected checks ahead of time when files change
 	warmBase: false, // opt in to a full baseline warm-up; normal speculation is affected-only
 	speculateMaxLoad: 0.75, // only speculate while load average < cores * this
+	speculateQos: "low", // priority of ahead-of-time runs: "low" (nice 19, idle I/O) | "background" (macOS: efficiency cores only) | "normal"
+	flakyRetries: 1, // a failing test is run once more; if it passes it is reported as flaky and does not fail the check. 0 disables
+	fastMs: 20000, // units measured faster than this use the fast lane, slower ones the heavy lane (explicit "lane" wins)
+	tsgo: true, // type-check with tsgo (@typescript/native-preview) when the project has it installed
 	debounceMs: 2500,
 	intercept: "route", // route | block | off: what happens to raw test commands agents run in bash
 	shimGo: true, // `go test` / `go vet` inside agent shells go through the broker
@@ -45,6 +49,8 @@ export function loadConfig(main) {
 	c.cpuBudget = c.cpuBudget || CPUS;
 	c.maxJobs = Math.min(c.maxJobs || c.cpuBudget, c.cpuBudget);
 	if (typeof c.fastLane !== "boolean") throw new Error("fastLane must be a boolean");
+	if (!["low", "background", "normal"].includes(c.speculateQos)) throw new Error("speculateQos must be low, background or normal");
+	if (!Number.isInteger(c.flakyRetries) || c.flakyRetries < 0 || c.flakyRetries > 3) throw new Error("flakyRetries must be 0–3");
 	const laneOptions = [...c.custom, ...Object.values(c.projects).flatMap((p) => [p.test, p.vet, p.lint, p.typecheck, p.custom])];
 	for (const opts of laneOptions) if (opts?.lane !== undefined && !["fast", "heavy"].includes(opts.lane)) throw new Error("lane must be fast or heavy");
 	return c;

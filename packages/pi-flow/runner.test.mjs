@@ -39,6 +39,22 @@ test("focused item checks select the exact owner, inherit to children, and fail 
 	assert.throws(() => itemConfig({ ...c, itemChecks: { A01: [""] } }, item()), /invalid/);
 });
 
+test("focused item checks deduplicate exact commands in order without mutating configuration", () => {
+	const global = Object.freeze(["git diff --check", "pnpm run lint", "git diff --check"]);
+	const focused = Object.freeze(["pnpm run lint", "pnpm run test", "pnpm run test", "pnpm run test -- --coverage"]);
+	const c = Object.freeze({ ...DEFAULTS, checks: global, itemChecks: Object.freeze({ A01: focused }) });
+	const expected = ["git diff --check", "pnpm run lint", "pnpm run test", "pnpm run test -- --coverage"];
+	for (const id of ["A01", "A01a"]) {
+		const parent = { ...item(), id };
+		const selected = itemConfig(c, parent);
+		assert.deepEqual(selected.checks, expected);
+		assert.deepEqual(itemConfig(selected, parent).checks, expected);
+		assert.deepEqual(itemConfig(c, { ...item(), id: "A01-repair1", repairParent: parent }).checks, expected);
+	}
+	assert.deepEqual(global, ["git diff --check", "pnpm run lint", "git diff --check"]);
+	assert.deepEqual(focused, ["pnpm run lint", "pnpm run test", "pnpm run test", "pnpm run test -- --coverage"]);
+});
+
 test("focused worker instructions use the runner's broker commands in the worktree", () => {
 	const c = itemConfig({ ...DEFAULTS, checks: ["git diff --check"], itemChecks: { A01: ["node --test tests/one.test.mjs"] } }, item());
 	const text = checksText(c);
@@ -54,7 +70,9 @@ test("planner gets actual model capabilities, cost and upfront selection instruc
 	const { planPrompt } = await import("./extension.ts");
 	const prompt = planPrompt(fixture(t), "sample", "edit a file", [model]);
 	assert.match(prompt, /example\/small: thinking=off; input=1, output=2/);
-	assert.match(prompt, /Choose \[model: provider\/id\] and \[thinking: level\] for each item during planning/);
+	assert.match(prompt, /Choose a \[tier: light\|standard\|heavy\] for each item during planning/);
+	assert.match(prompt, /Never make a trivial edit/);
+	assert.match(prompt, /"limits": \{"maxNetLines"/);
 	assert.match(prompt, /rules.md/);
 	assert.match(prompt, /separate pi-check budget/);
 	assert.match(prompt, /Agree recovery authority upfront/);
@@ -325,7 +343,7 @@ test("automatic recovery rejects unapproved repairs, scope escape, overrides, ow
 	assert.throws(() => validateRecovery(proposal, state, items, {}, { ...c, allowedPaths: ["other"] }), /scope/);
 	for (const running of [{ 0: { id: "A01" } }, { 0: { key: parent.key, quarantined: true } }, { 0: {} }]) assert.throws(() => validateRecovery(proposal, { ...state, running }, items, {}, c), /owns/);
 	assert.doesNotThrow(() => validateRecovery(proposal, { ...state, running: { 0: { id: "B01" } } }, items, {}, c));
-	for (const failure of ["BLOCKED: missing credentials", "outside allowed scope", "runner error: uncertain worker", "permission denied"]) assert.throws(() => validateRecovery(proposal, { failed: { [parent.key]: failure } }, items, {}, c), /human attention/);
+	for (const failure of ["BLOCKED: missing credentials", "outside allowed scope", "agent: BLOCKED: decision: which tier", "agent: BLOCKED: env: no staging key", "permission denied"]) assert.throws(() => validateRecovery(proposal, { failed: { [parent.key]: failure } }, items, {}, c), /human attention/);
 });
 
 test("retry reopens transitive scheduler dependency failures without clearing independent real failures", () => {
@@ -364,7 +382,7 @@ if(n>1&&s.requiresAfterFirst&&!fs.existsSync(s.requiresAfterFirst))throw Error('
 if(!s.check&&/Before you stop, run:|Run the checks, then reply DONE/.test(process.argv.at(-1)))throw Error('mandatory verification leaked into coding prompt');
 await barrier('worker-'+id+'-'+n,s.holdWorker===true||(s.holdWorker||[]).includes(n));
 const reply=(s.replies||[])[n-1]||'DONE';
-if(!s.check&&!s.noChange&&!/BLOCKED|ERROR/.test(reply)){fs.mkdirSync('out',{recursive:true});fs.writeFileSync(s.path||'out/'+id+'.txt',id+' turn '+n+'\\n');}
+if(!s.check&&!s.noChange&&!/BLOCKED|ERROR|WAITING|ALREADY DONE|NEEDS/.test(reply)){fs.mkdirSync('out',{recursive:true});fs.writeFileSync(s.path||'out/'+id+'.txt',id+' turn '+n+'\\n');}
 event('end',id,n,phase);console.log(JSON.stringify({type:'message_end',message:{role:'assistant',stopReason:reply==='ERROR'?'error':'stop',content:[{type:'text',text:reply}]}}));
 })().catch(e=>{console.error(e);process.exitCode=1});\n`, { mode: 0o755 });
 	writeFileSync(check, `${common}
@@ -373,7 +391,7 @@ const s=specs.find(s=>s.id===id),n=count('check-'+id);event('start',id,n,'check'
 await barrier('check-'+id+'-'+n,s.holdCheck===true||(s.holdCheck||[]).includes(n));
 event('end',id,n,'check');if((s.failChecks||[]).includes(n))process.exitCode=1;
 })().catch(e=>{console.error(e);process.exitCode=1});\n`);
-	const c = { ...DEFAULTS, queue: ".tasks/sample/items.md", task: "sample", allowedPaths: ["out"], checks: [`"${process.execPath}" "${check}"`], checkBroker: false, piCommand: worker, runIn: "cli", parallel: 2, setup: "", autoSplit: false, deferBlocked: true, fixRounds: 0, deleteSessions: false, ...config };
+	const c = { ...DEFAULTS, queue: ".tasks/sample/items.md", task: "sample", allowedPaths: ["out"], checks: [`"${process.execPath}" "${check}"`], checkBroker: false, piCommand: worker, runIn: "cli", parallel: 2, setup: "", autoSplit: false, deferBlocked: true, fixRounds: 0, deleteSessions: false, outageMinutes: 0, ...config };
 	saveJson(join(repo, ".pi-queue/config.json"), c);
 	if (Object.keys(seed).length) saveJson(join(repo, ".pi-queue/state.json"), Object.fromEntries(Object.entries(seed).map(([key, ids]) => [key, Object.fromEntries(items.filter((i) => ids.includes(i.id)).map((i) => [i.key, true]))])));
 	git("add", "."); git("commit", "-m", "fixture");
@@ -557,7 +575,7 @@ test("stop cancels capacity waiters without integrating or counting failures", {
 });
 
 test("quarantine retains ownership and capacity while disjoint deferred work finishes", { timeout: 30000 }, async (t) => {
-	const f = schedulerFixture(t, [{ id: "A01" }, { id: "B01", area: "out/A01.txt" }, { id: "C01" }], {}, { deferred: ["C01"] });
+	const f = schedulerFixture(t, [{ id: "A01" }, { id: "B01", area: "out/A01.txt" }, { id: "C01" }], { autoReconcile: false }, { deferred: ["C01"] });
 	saveJson(join(f.repo, ".tasks/sample/task.json"), { itemChecks: { B01: [], C01: [] } });
 	f.git("add", ".tasks"); f.git("commit", "-m", "missing A01 check selection");
 	await f.start();
@@ -569,7 +587,7 @@ test("quarantine retains ownership and capacity while disjoint deferred work fin
 });
 
 test("quarantined coding capacity cannot strand a check waiting to fix", { timeout: 30000 }, async (t) => {
-	const f = schedulerFixture(t, [{ id: "A01" }, { id: "V01", check: true, failChecks: [1] }], { parallel: 1, fixRounds: 1 });
+	const f = schedulerFixture(t, [{ id: "A01" }, { id: "V01", check: true, failChecks: [1] }], { parallel: 1, fixRounds: 1, autoReconcile: false });
 	saveJson(join(f.repo, ".tasks/sample/task.json"), { itemChecks: { V01: [] } });
 	f.git("add", ".tasks"); f.git("commit", "-m", "quarantine fixture");
 	await f.start();
@@ -590,4 +608,146 @@ test("runner IPC remains best-effort when disconnected or the channel fails", (t
 	Object.defineProperty(process, "connected", { configurable: true, value: false });
 	Object.defineProperty(process, "send", { configurable: true, value: () => assert.fail("disconnected send") });
 	notifyRunner("quarantine");
+});
+
+// ---------- 1.7: bounded growth, blockers, waiting, plan lint ----------
+
+test("a BLOCKED item is never split; only a size stop splits, into at most splitMax parts within the growth budget", { timeout: 60000 }, async (t) => {
+	const blocked = schedulerFixture(t, [{ id: "A01", replies: ["BLOCKED: the plan contradicts the code"] }], { autoSplit: true });
+	await blocked.start();
+	assert.deepEqual(blocked.state().splits ?? {}, {});
+	assert.match(Object.values(blocked.state().failed)[0], /BLOCKED/);
+	assert.equal(blocked.events().filter((e) => e.kind === "start" && e.id === "A01").length, 1, "no split prompt was sent");
+
+	const six = Array.from({ length: 6 }, (_, i) => `ITEM: Part ${i + 1}. Done when: part ${i + 1} exists. [areas: out/A01${"abcdef"[i]}.txt]`).join("\n");
+	for (const [growthMax, parts] of [[0, 4], [1, 2]]) {
+		const kids = ["a", "b", "c", "d"].map((x) => ({ id: `A01${x}` }));
+		const f = schedulerFixture(t, [{ id: "A01", replies: ["NEEDS: 500 files, 99999 lines", six] }, ...kids], { autoSplit: true, growthMax });
+		writeFileSync(join(f.repo, ".tasks/sample/items.md"), `- [ ] ${f.items[0].line}\n`);
+		f.git("add", ".tasks"); f.git("commit", "-m", "only the parent is planned");
+		await f.start();
+		const state = f.state();
+		assert.equal(Object.values(state.splits)[0].length, parts, `growthMax ${growthMax}`);
+		assert.equal(Object.keys(state.done).length, parts);
+		assert.equal(Object.keys(state.failed).length, 0);
+	}
+});
+
+test("WAITING re-queues an item after the items it names; ALREADY DONE passes on the checks", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [
+		{ id: "A01", replies: ["WAITING: B01 — its helper is not there yet", "DONE"], requiresAfterFirst: "out/B01.txt" },
+		{ id: "B01" },
+		{ id: "C01", noChange: true, replies: ["ALREADY DONE: out/shared.txt already has it"] },
+		{ id: "D01", after: "C01", requires: "out/shared.txt" },
+		{ id: "E01", replies: ["WAITING: Z99 — an item that does not exist"] },
+	], { parallel: 1, deferBlocked: false });
+	await f.start();
+	const state = f.state(), log = readFileSync(join(f.repo, ".pi-queue/log.md"), "utf8");
+	assert.equal(Object.keys(state.done).length, 4);
+	assert.match(log, /WAITING A01 · needs B01 first/);
+	assert.deepEqual(state.waitFor[f.items[0].key], ["B01"]);
+	assert.equal(state.done[f.items[2].key], "checked");
+	assert.match(state.failed[f.items[4].key], /BLOCKED.*already done or unknown/);
+	assert.match(readFileSync(join(f.repo, ".pi-queue/report.md"), "utf8"), /blocked \(other\) \(1\)/);
+});
+
+test("plan lint finds merge candidates, missing dependencies and serialized plans; gaps merge into few fix items", async () => {
+	const { planLint, mergeGaps, simulatePlan, failureGroups, growthBudget, growthUsed } = await import("./runner.mjs");
+	const q = (lines) => parseQueue(lines.map((l) => `- [ ] ${l}`).join("\n"));
+	const lint = planLint(q([
+		"A01 — Change the login title. Done when: x. [areas: src/Login.tsx]",
+		"A02 — Change the login label. Done when: x. [areas: src/Login.tsx]",
+		"A03 — Change the login hint. Done when: x. [areas: src/Login.tsx]",
+		"B01 — Use the helper from A01. Done when: y. [areas: src/b]",
+		"C01 — Independent. Done when: y. [areas: src/c] [after: B01]",
+	]), 4);
+	assert.match(lint.findings[0], /merge A01, A02, A03/);
+	assert.match(lint.findings[1], /B01 mentions A01 but has no \[after: A01\]/);
+	assert.equal(lint.findings.length, 2);
+	const broad = planLint(q(Array.from({ length: 12 }, (_, i) => `A${String(i + 1).padStart(2, "0")} — Part ${i}. Done when: x. [areas: apps/web, apps/web/f${i}.ts]`)), 4);
+	assert.ok(broad.findings.some((f) => /needs about 12 rounds where 3 would do/.test(f)));
+	const good = q(["A01 — a. Done when: x. [areas: src/a]", "A02 — b. Done when: x. [areas: src/b] [after: A01]", "A03 — c. Done when: x. [areas: src/c]", "V01 — check. Done when: x. [check] [areas: src] [after: *]"]);
+	assert.deepEqual(planLint(good, 2).findings, []);
+	assert.deepEqual(simulatePlan(good, 2), { rounds: 3, ideal: 2, criticalPath: 3 });
+	const merged = mergeGaps(["Fix a. Done when: a ok. [areas: src/a]", "Fix a2. Done when: a2 ok. [areas: src/a/x.ts]", "Fix b. [areas: src/b]", "Fix c. Done when: c ok. [areas: src/c]"], 2);
+	assert.equal(merged.length, 2);
+	assert.match(merged[0], /Fix a; Fix a2\. Done when: a ok; and a2 ok\. \[areas: src\/a, src\/a\/x\.ts\]/);
+	assert.equal(growthBudget({ growthMax: 0 }, 89), 27);
+	assert.equal(growthBudget({ growthMax: 5 }, 89), 5);
+	assert.equal(growthUsed({ splits: { a: ["1", "2", "3"] }, fixes: { b: ["x"] } }), 3);
+	const items = q(["A01 — a. Done when: x. [areas: a]", "B01 — b. Done when: x. [areas: b] [after: A01]", "C01 — c. Done when: x. [areas: c] [after: B01]"]);
+	const groups = failureGroups(items, { failed: { [items[0].key]: "agent: BLOCKED: decision: which tier?", [items[1].key]: "depends on A01, which failed", [items[2].key]: "depends on B01, which failed" } });
+	assert.equal(groups.waiting, 2);
+	assert.deepEqual(groups.groups.map((g) => [g.kind, g.items[0].id, g.items[0].blocks]), [["needs your decision", "A01", 2]]);
+});
+
+test("tiers, task limits and manual limits/skip/answer-style controls resolve per item", () => {
+	const c = { ...DEFAULTS, model: "example/large", thinking: "high", tiers: { light: { model: "example/small", thinking: "low", itemMinutes: 15 } } };
+	const light = itemConfig(c, item("[tier: light]"));
+	assert.deepEqual([light.model, light.thinking, light.itemMinutes, light.maxNetLines], ["example/small", "low", 15, 150]);
+	assert.equal(itemConfig(c, item("[tier: light] [thinking: high]")).thinking, "high", "an explicit tag wins over the tier");
+	assert.throws(() => itemConfig(c, item("[tier: turbo]")), /unknown \[tier: turbo\]/);
+	assert.doesNotMatch(item("[tier: light]").title, /tier/);
+	const items = parseQueue("- [ ] A01 root [areas: a]\n- [ ] B01 child [areas: b] [after: A01]");
+	const state = { done: {}, failed: { [items[0].key]: "agent: BLOCKED: env: no key", [items[1].key]: "depends on A01, which failed" } };
+	assert.deepEqual(applyControl(state, items, { action: "limits", ids: ["A01"], limits: { maxNetLines: 900, bogus: 1 }, by: "user" }), ["A01", "B01"]);
+	assert.deepEqual(state.limits[items[0].key], { maxNetLines: 900 });
+	assert.deepEqual(state.failed, {});
+	state.failed[items[0].key] = "check failed";
+	applyControl(state, items, { action: "skip", ids: ["A01"], by: "user" });
+	assert.equal(state.done[items[0].key], "skipped");
+	assert.deepEqual(state.failed, {});
+});
+
+test("handoff applies plan limits and tiers, and returns plan-lint findings until they are fixed or accepted", async (t) => {
+	const { handoff } = await import("./extension.ts");
+	const root = fixture(t), dir = join(root, ".tasks", "sample");
+	mkdirSync(dir, { recursive: true });
+	for (const f of ["brief.md", "rules.md", "questions.md"]) writeFileSync(join(dir, f), "");
+	const ctx = { modelRegistry: { getAvailable: () => [model] } };
+	const base = { allowedPaths: ["src/"], checks: ["must-not-run"] };
+	const lines = ["A01 — Title. Done when: x. [areas: src/a.ts] [tier: light]", "A02 — Label. Done when: x. [areas: src/a.ts]", "A03 — Hint. Done when: x. [areas: src/a.ts]"];
+	writeFileSync(join(dir, "items.md"), lines.map((l) => `- [ ] ${l}`).join("\n"));
+	for (const [task, error] of [
+		[{ ...base, tiers: { light: { model: "example/missing" } } }, /tier "light": model example\/missing is not available/],
+		[{ ...base, tiers: { light: { model: "example/small", thinking: "high" } } }, /tier "light": high is not supported/],
+		[{ ...base, tiers: { light: { model: "example/small" } }, limits: { maxNetLines: -5 } }, /"limits" may only set positive integers/],
+		[{ ...base }, /unknown \[tier: light\]/],
+		[{ ...base, tiers: { light: { model: "example/small" } } }, /plan: merge A01, A02, A03/],
+	]) {
+		writeFileSync(join(dir, "task.json"), JSON.stringify(task));
+		const result = await handoff(root, "sample", ctx);
+		assert.equal(result.ok, false);
+		assert.match(result.text, error);
+		assert.doesNotMatch(result.text, /checks fail/);
+	}
+	writeFileSync(join(dir, "task.json"), JSON.stringify({ ...base, model: "example/small", thinking: "off", tiers: { light: { model: "example/small" } }, planLint: "accept: three deliberate review points" }));
+	assert.match((await handoff(root, "sample", ctx)).text, /checks fail|must-not-run/, "accepted lint proceeds to the checks");
+});
+
+// ---------- 1.8: unattended recovery inside a run ----------
+
+test("a runner error frees its slot at once: work is preserved, the item is tried again, other items keep running", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "A01" }, { id: "B01", area: "out/A01.txt" }, { id: "C01" }], { parallel: 1 });
+	saveJson(join(f.repo, ".tasks/sample/task.json"), { itemChecks: { B01: [], C01: [] } }); // A01 has no check selection: a deterministic runner error
+	f.git("add", ".tasks"); f.git("commit", "-m", "missing A01 check selection");
+	await f.start();
+	const state = f.state(), log = readFileSync(join(f.repo, ".pi-queue/log.md"), "utf8");
+	assert.deepEqual(state.running, {}, "no slot stays quarantined");
+	assert.equal(state.runnerErrors[f.items[0].key], 3, "requeued twice, then left failed");
+	assert.match(state.failed[f.items[0].key], /^runner error/);
+	assert.equal(f.seen("C01", "coding"), true);
+	assert.ok(state.done[f.items[2].key]);
+	assert.match(state.failed[f.items[1].key] ?? "", /depends on|^$/);
+	assert.equal(state.phase, "finished");
+	assert.match(log, /RECONCILED A01/);
+});
+
+test("a provider error before any work is waited out in the same session instead of failing the item", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "A01", replies: ["ERROR", "ERROR", "DONE"] }, { id: "B01" }], { parallel: 2, outageMinutes: 5, outagePauses: [0.05] });
+	await f.start();
+	const state = f.state(), log = readFileSync(join(f.repo, ".pi-queue/log.md"), "utf8");
+	assert.equal(Object.keys(state.done).length, 2);
+	assert.deepEqual(state.failed, {});
+	assert.equal((log.match(/PROVIDER A01/g) ?? []).length, 2);
 });

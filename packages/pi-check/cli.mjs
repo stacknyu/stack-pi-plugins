@@ -25,6 +25,7 @@ const HELP = `pi-check ${VERSION} — one shared, cached, speculative check runn
   pi-check projects                       detected projects and checks
   pi-check baseline                       run everything on the main checkout; failures there become "known"
   pi-check known [list|add ID…|remove ID|PATTERN…|clear]
+  pi-check flaky                          tests that failed once and passed when run again
   pi-check speculate [--all]              pre-run what the current changes affect (--all: everything)
   pi-check cancel                         drop queued/speculative work for this checkout
   pi-check init                           write ${CONFIG_FILE} with the detected setup
@@ -103,6 +104,12 @@ async function main() {
 			const r = await call(rr.main, "/run", { scope: "all", priority: 5, label: "baseline" }, progress);
 			const k = await call(rr.main, "/known", {});
 			process.stdout.write(`${r.report.text}\n\nKnown failures recorded from the main checkout: ${Object.keys(k.known).length}\n`);
+			return 0;
+		}
+		case "flaky": {
+			const s = await call(cwd, "/status");
+			for (const f of s.flaky ?? []) process.stdout.write(`${String(f.count).padStart(3)}×  ${f.title}  (last ${new Date(f.last).toISOString().slice(0, 16).replace("T", " ")})\n`);
+			process.stdout.write(`${(s.flaky ?? []).length} flaky test(s) seen: they failed once and passed when run again\n`);
 			return 0;
 		}
 		case "known": {

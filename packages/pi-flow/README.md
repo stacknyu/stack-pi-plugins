@@ -124,6 +124,7 @@ It steers a running queue through an inbox the runner reads between items, so no
 
 When [pi-check](https://github.com/stacknyu/stack-pi-plugins/tree/main/packages/pi-check) is installed, the queue uses it automatically (nothing to configure):
 
+- Global `checks` and focused `itemChecks` are combined in first-occurrence order, with exact duplicate commands executed only once per check phase. Distinct commands remain mandatory; post-rebase verification still runs on the integrated candidate.
 - Every check command goes through pi-check's shared broker. `go test` / `go vet` run per package and are cached by file content. Other commands run once per identical set of files, and every worktree shares the results. Heavy runs are throttled, so parallel items stop fighting for the CPU.
 - Go test failures that also fail on the base branch are "pre-existing": they no longer block items or the baseline.
 - Before starting a worktree worker, pi-flow exposes the discovered pi-check installation through an ignored directory symlink at `.pi/extensions/pi-flow-check`. Project-local installations therefore provide the `check` tool and `/check` immediately, without reinstalling packages or copying settings/secrets. Pi deduplicates the same physical extension when it is also installed globally. This does not copy other plugins or skills.

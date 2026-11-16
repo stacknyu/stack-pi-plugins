@@ -1,5 +1,12 @@
 # pi-check changelog
 
+## 1.2.0
+
+- **Flaky tests.** A failing test is run once more (Go: only the failed tests; other runners: the failed files). If it passes, the unit passes and the test is reported as flaky; `/check flaky` and `pi-check flaky` list them with counts. `flakyRetries: 0` disables.
+- **Measured lanes.** Unit durations are recorded; a unit that has run before uses the fast or heavy lane by its real duration (`fastMs`, default 20 s). An explicit `lane` still wins.
+- **tsgo.** Projects that depend on `@typescript/native-preview` are type-checked with `tsgo` (with `--checkers` sized to the job's CPU allocation); `tsgo: false` opts out.
+- **Quieter ahead-of-time runs.** Speculative jobs run at the lowest CPU priority and idle I/O (`speculateQos: "low"`); `"background"` confines them to efficiency cores on macOS.
+
 ## 1.1.1
 
 - Run command helpers asynchronously so native Pi and Pi Web remain responsive; report failed, killed or truncated command results as warnings.

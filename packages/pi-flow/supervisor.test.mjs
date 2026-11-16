@@ -17,7 +17,7 @@ function fixture(t, mode = "recover") {
 	mkdirSync(join(repo, ".tasks", "sample"), { recursive: true });
 	mkdirSync(join(repo, ".pi-queue"));
 	writeFileSync(join(repo, ".gitignore"), ".pi-queue/\n");
-	const c = { ...DEFAULTS, task: "sample", queue: ".tasks/sample/items.md", checks: ["git diff --check"], checkBroker: false, allowedPaths: ["out"], model: "example/small", thinking: "off", runIn: "cli", parallel: 1, setup: "", autoSplit: false, deferBlocked: false, fixRounds: 0, deleteSessions: false, piCommand: join(home, "fake-pi") };
+	const c = { ...DEFAULTS, task: "sample", queue: ".tasks/sample/items.md", checks: ["git diff --check"], checkBroker: false, allowedPaths: ["out"], model: "example/small", thinking: "off", runIn: "cli", retryTransient: false, outageMinutes: 0, autonomy: "ask", parallel: 1, setup: "", autoSplit: false, deferBlocked: false, fixRounds: 0, deleteSessions: false, piCommand: join(home, "fake-pi") };
 	for (const f of ["brief.md", "rules.md", "questions.md"]) writeFileSync(join(repo, ".tasks/sample", f), "Approved fixture\n");
 	writeFileSync(join(repo, c.queue), "- [ ] A01 — Write out/a.txt. Done when: created. [areas: out]\n");
 	saveJson(join(repo, ".tasks/sample/task.json"), { status: "queued", queuedAt: "2026-01-01", allowedPaths: c.allowedPaths, checks: c.checks });
@@ -74,7 +74,7 @@ if(manager){
   if(mode==="stale"||mode==="quarantine"){
    // Test-only fault injection, after the original failure was presented to the model.
    const s=read("state.json"),key=Object.keys(s.failed).find(k=>k.startsWith("A01"));
-   if(mode==="stale")s.failed[key]="BLOCKED: changed contract during review";
+   if(mode==="stale")s.failed[key]="BLOCKED: decision: changed contract during review";
    else s.running[9]={id:"A01",key,quarantined:true};
    fs.writeFileSync(file("state.json"),JSON.stringify(s));
   }
@@ -122,7 +122,7 @@ test("approval and health reject open questions, changed scope, manual intent an
 	assert.equal(assessHealth({}, [], { running: true }), "healthy");
 	assert.equal(assessHealth({}, [], { running: true, stopped: true }), "manual");
 	assert.equal(assessHealth({ startedAt: 1, failed: { a: "check failed" }, running: { 0: { id: "B01" } } }, [{ key: "a" }], { running: true }), "failed");
-	assert.equal(assessHealth({ running: { 0: { pid: 1 } } }, [], { running: false }), "blocked");
+	assert.equal(assessHealth({ running: { 0: { pid: 1 } } }, [], { running: false }), "interrupted");
 	assert.equal(HEALTH_TICK_MS, 60000);
 	assert.equal(pathAllowed("../secret", ["."]), false);
 });
@@ -143,11 +143,26 @@ test("automatic proposals cannot add work, use prefixes, bypass blockers or exce
 	assert.throws(() => validateProposal(proposal, state, items, {}, "failed"));
 });
 
-test("exclusive process ownership and interrupted work prevent restart/cleanup", async (t) => {
+test("exclusive process ownership holds; interrupted work is preserved on a branch and its item queued again", async (t) => {
 	const { repo, state } = fixture(t);
 	const file = join(repo, ".pi-queue/runner.pid"), release = acquireProcessLock(file);
 	assert.throws(() => acquireProcessLock(file), /owns/);
 	release(); release();
+	const { git, c } = fixture(t, "pass");
+	const other = git("rev-parse", "--show-toplevel").trim(), wt = join(other, ".pi-queue/worktrees/w0");
+	git("worktree", "add", "--detach", wt, "main");
+	mkdirSync(join(wt, "out"), { recursive: true });
+	writeFileSync(join(wt, "out/half.txt"), "half-finished\n");
+	const items = allItems(readFileSync(join(other, c.queue), "utf8"), {});
+	saveJson(join(other, ".pi-queue/state.json"), { failed: { [items[0].key]: "runner error: uncertain worker" }, running: { 0: { id: "A01", key: items[0].key, worktree: wt, quarantined: true } } });
+	await main(other);
+	const after = loadJson(join(other, ".pi-queue/state.json"), {});
+	assert.deepEqual(after.running, {});
+	assert.ok(after.done[items[0].key], "the interrupted item ran again and passed");
+	assert.match(git("branch", "--list", "queue-failed/*"), /A01-interrupted/);
+	assert.match(git("log", "--all", "--format=%s"), /queue INTERRUPTED A01/);
+	// opting out keeps the old fail-closed behaviour
+	saveJson(join(repo, ".pi-queue/config.json"), { ...loadJson(join(repo, ".pi-queue/config.json"), {}), autoReconcile: false });
 	saveJson(join(repo, ".pi-queue/state.json"), { running: { 0: { id: "A01", quarantined: true } } });
 	await main(repo);
 	assert.equal(state().running[0].quarantined, true);
@@ -249,6 +264,7 @@ test("quarantined slots exit instead of spinning with independent work left", { 
 	const taskFile = join(repo, ".tasks/sample/task.json");
 	saveJson(taskFile, { ...loadJson(taskFile, {}), itemChecks: { B01: [] } });
 	git("add", ".tasks"); git("commit", "-m", "quarantine fixture");
+	saveJson(join(repo, ".pi-queue/config.json"), { ...c, autoReconcile: false });
 	await main(repo);
 	assert.equal(state().running[0].quarantined, true);
 	assert.match(state().phase, /quarantined/);
@@ -345,7 +361,8 @@ test("stop, pause and changed config during review remain authoritative", { time
 
 test("selected stale failures and newly quarantined targets reject async proposals", { timeout: 60000 }, async (t) => {
 	for (const mode of ["stale", "quarantine"]) {
-		const { repo, itemCount } = liveFixture(t, mode);
+		const { repo, itemCount, c } = liveFixture(t, mode);
+		if (mode === "quarantine") saveJson(join(repo, ".pi-queue/config.json"), { ...c, autoReconcile: false });
 		await supervise(repo, { tickMs: 20, reviewBackoffMs: 100 });
 		assert.equal(itemCount("A01"), 1, mode);
 		assert.deepEqual(loadJson(join(repo, ".pi-queue/manager.json"), {}).attempts, {}, mode);
@@ -354,9 +371,11 @@ test("selected stale failures and newly quarantined targets reject async proposa
 
 test("approval pins recovery authority and all run safety configuration", (t) => {
 	const { repo, c } = fixture(t), original = approvedTask(repo, c);
-	for (const change of [{ maxNetLines: 999 }, { itemChecks: { A01: [] } }, { setup: "unsafe" }, { parallel: 8 }, { stopAfterFailuresInARow: 99 }]) {
+	for (const change of [{ maxNetLines: 999 }, { itemChecks: { A01: [] } }, { setup: "unsafe" }, { stopAfterFailuresInARow: 99 }, { growthMax: 500 }]) {
 		assert.notEqual(approvedTask(repo, { ...c, ...change }), original);
 	}
+	// how many run at once is an operational knob: changing it mid-run must not switch the manager off
+	for (const change of [{ parallel: 8 }, { parallelStart: 2 }, { piWebUrl: "http://127.0.0.1:1" }]) assert.equal(approvedTask(repo, { ...c, ...change }), original);
 	const recovery = { maxAttempts: 2, maxRepairs: 4, maxRestarts: 2 };
 	assert.equal(approvedTask(repo, { ...c, recovery }), undefined);
 	const taskFile = join(repo, ".tasks/sample/task.json");
@@ -381,6 +400,7 @@ test("explicit start overrides exhausted automatic restarts once but never orpha
 	for (const quarantined of [false, true]) {
 		const { repo, c, state, count } = fixture(t, "pass");
 		const running = quarantined ? { 0: { id: "A01", quarantined: true } } : {};
+		if (quarantined) saveJson(join(repo, ".pi-queue/config.json"), { ...c, autoReconcile: false });
 		saveJson(join(repo, ".pi-queue/state.json"), { startedAt: 1, phase: "running items", runId: "crashed", running, done: {}, failed: {} });
 		const budget = { attempts: { A01: 2 }, restarts: 2, repairs: 4 };
 		saveJson(join(repo, ".pi-queue/manager.json"), { task: c.task, approval: approvedTask(repo, c), ...budget });
@@ -445,7 +465,7 @@ test("historical exhausted failures do not suppress a clean restart of unrelated
 	assert.ok(state().done[items[1].key]);
 	assert.equal(state().failed[items[0].key], "old provider failure");
 	assert.equal(count("worker"), 1);
-	assert.equal(count("manager"), 1);
+	assert.equal(count("manager"), 0, "a dead runner is restarted without a model turn");
 	assert.equal(loadJson(join(repo, ".pi-queue/manager.json"), {}).restarts, 1);
 });
 
@@ -498,4 +518,60 @@ test("planning cleanup honors Web refusal/errors and remains retryable; CLI clea
 	writeFileSync(file, "CLI session\n");
 	await cleanup(repo, false, "current");
 	assert.equal(existsSync(file), false);
+});
+
+test("transient failures are retried without a manager turn, and a parallel change keeps supervision on", { timeout: 30000 }, async (t) => {
+	const { repo, c, state, count } = fixture(t); // first worker turn: provider error; second: writes the file
+	saveJson(join(repo, ".pi-queue/config.json"), { ...c, retryTransient: true });
+	await supervise(repo, { tickMs: 20 });
+	assert.equal(Object.keys(state().done).length, 1);
+	assert.equal(count("worker"), 2);
+	assert.equal(count("manager"), 0, "no model diagnosis for a provider error");
+	const log = readFileSync(join(repo, ".pi-queue/log.md"), "utf8");
+	assert.match(log, /MANAGER retry A01 · transient failure/);
+	assert.equal(approvedTask(repo, { ...c, parallel: 7 }), approvedTask(repo, c));
+});
+
+test("answer records the user's decision for a blocked item and starts the queue by itself", { timeout: 30000 }, async (t) => {
+	const { repo, c, state, count } = fixture(t, "blocked");
+	await main(repo);
+	const items = allItems(readFileSync(join(repo, c.queue), "utf8"), state());
+	assert.match(state().failed[items[0].key], /BLOCKED/);
+	assert.match(await control(repo, { action: "answer", ids: ["A01"] }), /needs ids and text/);
+	assert.match(await control(repo, { action: "answer", ids: ["A01"], text: "Use the sandbox key from .env.test." }), /queued and the queue started/);
+	const deadline = Date.now() + 15000;
+	while (existsSync(join(repo, ".pi-queue/supervisor.pid")) || count("worker") < 2) {
+		assert.ok(Date.now() < deadline, "queue did not run the answered item");
+		await new Promise((r) => setTimeout(r, 20));
+	}
+	assert.match(readFileSync(join(repo, ".pi-queue/notes/A01.md"), "utf8"), /Answer from the user[\s\S]*sandbox key/);
+	assert.match(readFileSync(join(repo, ".pi-queue/log.md"), "utf8"), /CONTROL retry A01 · A01 · by user/);
+});
+
+test("full autonomy: the manager answers a worker's decision question, logs it, and the item finishes; ask mode leaves it", { timeout: 30000 }, async (t) => {
+	for (const autonomy of ["full", "ask"]) {
+		const { repo, c, state, count } = fixture(t);
+		saveJson(join(repo, ".pi-queue/config.json"), { ...c, autonomy });
+		writeFileSync(c.piCommand, `#!/usr/bin/env node
+const fs=require("fs"),path=require("path"),repo=${JSON.stringify(repo)};
+const prompt=process.argv.at(-1), manager=process.argv.includes("--no-tools");
+const count=path.join(repo,".pi-queue",manager?"manager-count":"worker-count");
+const n=fs.existsSync(count)?Number(fs.readFileSync(count)):0; fs.writeFileSync(count,String(n+1));
+let text;
+if(manager) text='CONTROL: '+JSON.stringify(prompt.includes("BLOCKED: decision")&&prompt.includes('"action":"decide"')?{action:"decide",ids:["A01"],answer:"Use the list layout, because the rules say to match the nearest existing screen."}:{action:"wait",reason:"nothing to do"});
+else if(prompt.includes("Decision by the automatic manager")){fs.mkdirSync("out",{recursive:true});fs.writeFileSync("out/a.txt","list\\n");text="DONE";}
+else text="BLOCKED: decision: card layout or list layout?";
+console.log(JSON.stringify({type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text}]}}));
+`, { mode: 0o755 });
+		await supervise(repo, { tickMs: 20 });
+		if (autonomy === "full") {
+			assert.equal(Object.keys(state().done).length, 1);
+			assert.equal(count("manager"), 1);
+			assert.match(readFileSync(join(repo, ".pi-queue/decisions.md"), "utf8"), /## A01[\s\S]*card layout or list layout[\s\S]*Decided: Use the list layout/);
+		} else {
+			assert.match(Object.values(state().failed)[0], /BLOCKED: decision/);
+			assert.equal(count("manager"), 0);
+			assert.equal(count("worker"), 1);
+		}
+	}
 });

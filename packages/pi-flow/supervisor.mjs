@@ -5,7 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { DIR, acquireProcessLock, allItems, approvedTask, enqueueControl, ensureDir, findPiWeb, loadJson, piTurn, pidAlive, readConfig, resolvePi, saveJson, validateRecovery, webClient, webTurn } from "./runner.mjs";
+import { DIR, TRANSIENT, DECISION, acquireProcessLock, allItems, approvedTask, enqueueControl, ensureDir, findPiWeb, loadJson, piTurn, pidAlive, readConfig, resolvePi, saveJson, validateRecovery, webClient, webTurn } from "./runner.mjs";
 
 export { approvedTask };
 
@@ -17,13 +17,14 @@ const text = (path) => { try { return readFileSync(path, "utf8"); } catch { retu
 
 export function assessHealth(state, items, { running, stopped, paused }) {
 	if (stopped || paused) return "manual";
-	if (!running && Object.keys(state.running ?? {}).length) return "blocked";
+	// workers left behind by a dead runner: the next start stops them, keeps their work and queues the items again
+	if (!running && Object.keys(state.running ?? {}).length) return "interrupted";
 	// A clean crash can strand unrelated open work even when old failures exhausted recovery.
 	if (!running && state.startedAt && state.phase === "running items" && items.some((i) => !state.done?.[i.key] && !state.failed?.[i.key])) return "crashed";
 	if (state.startedAt && items.some((i) => state.failed?.[i.key])) return "failed";
 	if (Object.values(state.running ?? {}).some((r) => !r || r.quarantined || (!r.id && !r.key))) return "blocked";
 	if (running) return "healthy"; // quiet checks and provider retries are not evidence of a hang
-	if (!state.startedAt || ["starting", "diagnosing the failed baseline", ""].includes(state.phase)) return "blocked";
+	if (!state.startedAt || ["starting", "diagnosing the failed baseline", ""].includes(state.phase)) return "not-started";
 	if (items.every((i) => state.done?.[i.key])) return "complete";
 	return state.phase === "running items" ? "crashed" : "blocked";
 }
@@ -31,6 +32,13 @@ export function assessHealth(state, items, { running, stopped, paused }) {
 /** The runner repeats this boundary when consuming the durable inbox. */
 export function validateProposal(proposal, state, items, manager, health, c = {}) {
 	if (proposal?.action === "wait") return undefined;
+	if (proposal?.action === "decide") {
+		// full autonomy: the manager answers a worker's decision question from the approved plan; the answer is logged for review
+		if (c.autonomy !== "full" || health !== "failed" || !Array.isArray(proposal.ids) || !proposal.ids.length || typeof proposal.answer !== "string" || proposal.answer.trim().length < 10) throw new Error("decide needs ids and a full-sentence answer, and autonomy: full");
+		const action = validateRecovery({ action: "retry", ids: proposal.ids, reason: proposal.answer, decided: true }, state, items, manager, c);
+		for (const id of action.ids) if (!DECISION.test(state.failed[items.find((i) => i.id === id).key])) throw new Error(`${id}: not a decision question`);
+		return { ...action, action: "decide", answer: proposal.answer.trim().slice(0, 3000) };
+	}
 	if (typeof proposal?.reason !== "string" || !proposal.reason.trim()) throw new Error("manager must explain its diagnosis");
 	if (proposal.action === "restart" && health === "crashed" && !Object.keys(state.running ?? {}).length && (manager.restarts ?? 0) < (c.recovery?.maxRestarts ?? 2)) return { action: "restart", reason: proposal.reason.slice(0, 3000) };
 	if (!["retry", "repair"].includes(proposal.action) || health !== "failed" || !Array.isArray(proposal.ids) || !proposal.ids.length) throw new Error("manager action is not permitted");
@@ -46,7 +54,7 @@ function managerPrompt(repo, c, state, items, health, manager) {
 
 Diagnose the supplied evidence. Healthy/complete/manual/blocked states require wait. For failed work, propose retry only when a fresh worker can fix the original item within its original scope, using your specific diagnosis. Never retry unchanged missing credentials, decisions, contracts or safety blockers. At most ${c.recovery?.maxAttempts ?? 2} recovery attempts per parent and ${c.recovery?.maxRestarts ?? 2} clean runner restarts per task. Independent workers may still be running: target only the supplied non-running failures. Group related failures. ${repairRule}
 
-End with ONE line: CONTROL: {"action":"wait","reason":"..."}, CONTROL: {"action":"retry","ids":["A01"],"reason":"specific diagnosis and repair guidance"}, or CONTROL: {"action":"restart","reason":"..."} (only a crashed runner with no remaining workers).${repair ? '\nRepair form: CONTROL: {"action":"repair","ids":["A01"],"lines":["Fix the evidenced bug. Done when: focused check passes. [areas: parent/path]"],"reason":"specific evidence and fix"}' : ""}
+${c.autonomy === "full" ? `Decisions: a failure that starts with "BLOCKED: decision:" is a question a worker could not settle. The user chose full autonomy, so YOU answer it: pick the option that best fits the brief, rules and answers below and the conventions the evidence shows; when they are silent choose the simplest, most conventional, easily reversible option. Answer in full sentences a fresh worker can act on. Form: CONTROL: {"action":"decide","ids":["A01"],"answer":"Use … because …"}. Your answer is logged for the user to review. Only reply wait for a decision that would be destructive, irreversible or outside the allowed paths.\n\n` : ""}End with ONE line: CONTROL: {"action":"wait","reason":"..."}, CONTROL: {"action":"retry","ids":["A01"],"reason":"specific diagnosis and repair guidance"}, or CONTROL: {"action":"restart","reason":"..."} (only a crashed runner with no remaining workers).${repair ? '\nRepair form: CONTROL: {"action":"repair","ids":["A01"],"lines":["Fix the evidenced bug. Done when: focused check passes. [areas: parent/path]"],"reason":"specific evidence and fix"}' : ""}
 
 Health: ${health}; phase: ${state.phase}; passed: ${Object.keys(state.done ?? {}).length}; recovery attempts: ${JSON.stringify(manager.attempts ?? {})}; restarts: ${manager.restarts ?? 0}; repair items used: ${manager.repairs ?? 0}.
 Allowed paths: ${JSON.stringify(c.allowedPaths)}
@@ -59,7 +67,7 @@ ${failures.slice(0, 8).map((i) => `${i.line}\nFailure: ${state.failed[i.key]}\n$
 Problem: ${text(join(repo, DIR, "problem.txt")).slice(-4000)}`;
 }
 
-export async function supervise(repo, { tickMs = HEALTH_TICK_MS, reviewBackoffMs = REVIEW_BACKOFF_MS, resume = false } = {}) {
+export async function supervise(repo, { tickMs = HEALTH_TICK_MS, reviewBackoffMs = REVIEW_BACKOFF_MS, resume = false, ...opts } = {}) {
 	await ensureDir(repo);
 	const release = acquireProcessLock(join(repo, DIR, "supervisor.pid"));
 	const log = (message) => appendFileSync(join(repo, DIR, "log.md"), `- ${new Date().toISOString()} MANAGER ${message}\n`);
@@ -106,7 +114,11 @@ export async function supervise(repo, { tickMs = HEALTH_TICK_MS, reviewBackoffMs
 	try {
 		const c = readConfig(repo), approval = approvedTask(repo, c);
 		const initial = loadJson(join(repo, DIR, "state.json"), {});
-		if (resume && Object.keys(initial.running ?? {}).length) { log("NOT STARTED: interrupted workers remain; worktrees preserved"); return; }
+		if (resume && Object.keys(initial.running ?? {}).length && c.autoReconcile === false) { log("NOT STARTED: interrupted workers remain; worktrees preserved"); return; }
+		if (process.platform === "darwin" && c.keepAwake !== false) {
+			// an overnight queue must not die with the machine's idle sleep
+			try { const awake = spawn("caffeinate", ["-ims", "-w", String(process.pid)], { stdio: "ignore", detached: true }); awake.on("error", () => {}); awake.unref(); } catch {}
+		}
 		// Explicit start grants one initial launch, without resetting automatic budgets.
 		// Without it, a clean crash still needs a budgeted restart proposal.
 		const manualInbox = manualPending(c.task);
@@ -120,19 +132,22 @@ export async function supervise(repo, { tickMs = HEALTH_TICK_MS, reviewBackoffMs
 		manager.reviews ??= {};
 		manager.dispatches ??= [];
 		if (manager.approval !== approval) { log("approval changed; automatic management disabled"); return; }
+		// The manager is a short chat-only turn. It runs as background pi unless managerIn is "web":
+		// it must keep working when Pi Web restarts or was not running at the first start.
 		let web = null;
-		if (c.runIn !== "cli") {
+		if (c.managerIn === "web") {
 			const found = await findPiWeb(c);
 			if (found.url) web = webClient({ ...c, piWebUrl: found.url });
-			else if (c.runIn === "web") { log("Pi Web unavailable; manager not started, no CLI fallback"); return; }
+			else log("Pi Web unavailable; the manager runs as background pi");
 		}
-		if (manager.web !== undefined && manager.web !== !!web) { log("manager backend unavailable/changed; no automatic fallback"); return; }
+		if (manager.web !== undefined && manager.web !== !!web) manager.id = undefined; // other backend: a fresh manager session
 		manager.web = !!web;
 		const ref = { id: manager.id || (web ? undefined : randomUUID()) };
 		const save = () => { manager.id = ref.id; saveJson(file, manager); };
 		save();
 		const authorized = () => !stopped() && !paused() && readConfig(repo).manager !== false && approvedTask(repo, readConfig(repo)) === approval;
-		const ctx = { repo, c, web, pi: await resolvePi(c), env: process.env, manager: true, stopRequested: () => !authorized(), onWorker: (identity) => {
+		const mc = { ...c, model: c.managerModel || c.model, thinking: c.managerThinking || c.thinking };
+		const ctx = { repo, c: mc, web, pi: await resolvePi(c), env: process.env, manager: true, stopRequested: () => !authorized(), onWorker: (identity) => {
 			if (identity.sessionId) ref.id = identity.sessionId;
 			manager.pid = identity.pid;
 			save();
@@ -163,15 +178,59 @@ export async function supervise(repo, { tickMs = HEALTH_TICK_MS, reviewBackoffMs
 				save(); launch(); await wait(); continue;
 			}
 			const incidents = [];
+			// A dead runner needs no diagnosis: start it again (it reconciles interrupted workers itself).
+			// The budget counts restarts without progress, so a long night is not capped by early hiccups.
+			if (health === "crashed" || health === "interrupted") {
+				const passed = Object.keys(state.done ?? {}).length;
+				if (manager.restartPassed !== undefined && passed > manager.restartPassed) manager.restarts = 0;
+				if ((manager.restarts ?? 0) >= (c.recovery?.maxRestarts ?? 2)) { log(`runner is down (${health}) and the restart budget is used up; needs you`); break; }
+				manager.restarts = (manager.restarts ?? 0) + 1;
+				manager.restartPassed = passed;
+				save();
+				log(`restart runner · ${health} · ${manager.restarts}/${c.recovery?.maxRestarts ?? 2} without progress`);
+				launch(); await wait(); continue;
+			}
+			// The run never got going (setup/install failed, checks failed before any change, tree not clean).
+			// Network and flaky causes pass by themselves: try again after a pause, a few times.
+			if (health === "not-started" && !running) {
+				const tries = manager.startRetries ?? 0;
+				const why = text(join(repo, DIR, "log.md")).trim().split("\n").filter((l) => /NOT STARTED/.test(l)).at(-1) ?? "";
+				if (tries >= 2 || !/setup failed|already fail before|Pi Web not usable/i.test(why)) { log("the queue could not start; needs you (see /queue problem)"); break; }
+				manager.startRetries = tries + 1;
+				save();
+				const pause = [1, 5][tries] * (opts.startRetryMs ?? 60_000);
+				log(`start failed · trying again in ${Math.round(pause / 60_000) || "<1"} min (${tries + 1}/2)`);
+				await new Promise((r) => setTimeout(r, pause));
+				if (!authorized()) continue;
+				launch(); await wait(); continue;
+			}
+			if (manager.startRetries && state.startedAt && state.phase === "running items") { manager.startRetries = 0; save(); }
+			// Deterministic dispatch: used for failures that say nothing about the code, and when the model review is unavailable.
+			const dispatchRetry = (item, reason) => {
+				manager.attempts[item.id] = (manager.attempts[item.id] ?? 0) + 1;
+				const control = { task: c.task, by: "auto", approval, action: "retry", ids: [item.id], failures: { [item.id]: state.failed[item.key] }, reason };
+				manager.dispatches.push({ control, launched: false });
+				save();
+				enqueueControl(repo, control);
+				log(`retry ${item.id} · ${reason}`);
+			};
 			if (health === "failed") {
+				let dispatched = false;
 				for (const item of items) {
 					if (!state.failed?.[item.key] || manager.dispatches.some(({ control }) => control.ids.includes(item.id))) continue;
-					try { validateProposal({ action: "retry", ids: [item.id], reason: "Admission check" }, state, items, manager, health, c); }
+					const decision = c.autonomy === "full" && DECISION.test(state.failed[item.key]);
+					try { validateProposal(decision ? { action: "decide", ids: [item.id], answer: "Admission check only." } : { action: "retry", ids: [item.id], reason: "Admission check" }, state, items, manager, health, c); }
 					catch { continue; } // no model turns for blockers, active/quarantined or exhausted targets
-					incidents.push({ item, token: hash([item.key, state.failed[item.key], manager.attempts[item.id] ?? 0]) });
+					const token = hash([item.key, state.failed[item.key], manager.attempts[item.id] ?? 0]);
+					if (c.retryTransient !== false && TRANSIENT.test(state.failed[item.key])) { dispatchRetry(item, "transient failure (timeout, session or provider error): run it again"); dispatched = true; continue; }
+					if (!decision && c.retryTransient !== false && (manager.reviews[token]?.count ?? 0) >= MAX_REVIEW_ATTEMPTS && !manager.reviews[token]?.done) {
+						// the manager model could not be reached: the worker still gets the recorded evidence
+						manager.reviews[token].done = true;
+						dispatchRetry(item, "manager review unavailable: retry with the recorded failure as evidence"); dispatched = true; continue;
+					}
+					incidents.push({ item, token });
 				}
-			} else if (health === "crashed" && (manager.restarts ?? 0) < (c.recovery?.maxRestarts ?? 2)) {
-				incidents.push({ token: hash(["crashed", state.runId, manager.restarts ?? 0]) });
+				if (dispatched) { wake(); await wait(1); continue; }
 			}
 			const pending = incidents.filter(({ token }) => !manager.reviews[token]?.done && (manager.reviews[token]?.count ?? 0) < MAX_REVIEW_ATTEMPTS);
 			const review = pending.filter(({ token }) => (manager.reviews[token]?.nextAt ?? 0) <= Date.now()).slice(0, 8);
@@ -193,7 +252,7 @@ export async function supervise(repo, { tickMs = HEALTH_TICK_MS, reviewBackoffMs
 			save();
 			const prompt = managerPrompt(repo, c, state, review.flatMap(({ item }) => item ? [item] : []), health, manager);
 			let result;
-			try { result = await (web ? webTurn(ctx, repo, ref, `manager · ${c.task}`, prompt, 10) : piTurn(ctx, repo, ref.id, `manager · ${c.task}`, prompt, 10)); }
+			try { result = await (web ? webTurn(ctx, repo, ref, `auto manager · ${c.task}`, prompt, 10) : piTurn(ctx, repo, ref.id, `auto manager · ${c.task}`, prompt, 10)); }
 			catch (e) { result = { status: "error", err: e.message, quiescent: false }; }
 			manager.reply = String(result.reply || result.err || "").slice(-12000);
 			if (result.quiescent !== false) manager.pid = undefined;
@@ -240,10 +299,13 @@ export async function supervise(repo, { tickMs = HEALTH_TICK_MS, reviewBackoffMs
 						manager.attempts[id] = (manager.attempts[id] ?? 0) + 1;
 						failures[id] = state.failed[selected.item.key];
 						manager.reviews[selected.token].done = true;
-						appendFileSync(join(repo, DIR, "notes", `${id}.md`), `\n\n## Manager diagnosis\n${action.reason}\n`);
+						if (action.action === "decide") {
+							appendFileSync(join(repo, DIR, "notes", `${id}.md`), `\n\n## Decision by the automatic manager (authoritative; it settles the BLOCKED: decision question)\n${action.answer}\n`);
+							appendFileSync(join(repo, DIR, "decisions.md"), `\n## ${id} · ${new Date().toISOString().slice(0, 16).replace("T", " ")}\nQuestion: ${failures[id]}\nDecided: ${action.answer}\n`);
+						} else appendFileSync(join(repo, DIR, "notes", `${id}.md`), `\n\n## Manager diagnosis\n${action.reason}\n`);
 					}
 					if (action.action === "repair") manager.repairs = (manager.repairs ?? 0) + action.lines.length;
-					const control = { task: c.task, by: "auto", approval, action: action.action, ids: action.ids, lines: action.lines, failures, reason: action.reason };
+					const control = { task: c.task, by: "auto", approval, action: action.action === "decide" ? "retry" : action.action, ids: action.ids, lines: action.lines, failures, reason: action.reason, ...(action.decided ? { decided: true } : {}) };
 					manager.dispatches.push({ control, launched: false });
 					save(); // persist dedup AND budgets before dispatch; the runner is the only state writer
 					enqueueControl(repo, control);
