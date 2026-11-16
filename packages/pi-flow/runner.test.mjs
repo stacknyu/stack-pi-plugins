@@ -376,13 +376,13 @@ async function barrier(key,hold){const until=Date.now()+20000;while(hold&&!fs.ex
 	const worker = join(home, "worker.cjs"), check = join(home, "check.cjs");
 	writeFileSync(worker, `#!/usr/bin/env node\n${common}
 (async()=>{const id=process.argv[process.argv.indexOf('-n')+1].match(/queue (\\S+):/)[1],s=specs.find(s=>s.id===id),n=count('worker-'+id),phase=s.check&&n===1?'verification':'coding';
-fs.writeFileSync(file(path.basename(process.cwd())+'.owner'),id);event('start',id,n,phase);
+fs.writeFileSync(file(path.basename(process.cwd())+'.owner'),id);fs.writeFileSync(file('prompt-'+id+'-'+n),process.argv.at(-1));event('start',id,n,phase);
 if(s.requires&&!fs.existsSync(s.requires))throw Error('dependency not integrated: '+s.requires);
 if(n>1&&s.requiresAfterFirst&&!fs.existsSync(s.requiresAfterFirst))throw Error('deferred work retried before integration');
 if(!s.check&&/Before you stop, run:|Run the checks, then reply DONE/.test(process.argv.at(-1)))throw Error('mandatory verification leaked into coding prompt');
 await barrier('worker-'+id+'-'+n,s.holdWorker===true||(s.holdWorker||[]).includes(n));
 const reply=(s.replies||[])[n-1]||'DONE';
-if(!s.check&&!s.noChange&&!/BLOCKED|ERROR|WAITING|ALREADY DONE|NEEDS/.test(reply)){fs.mkdirSync('out',{recursive:true});fs.writeFileSync(s.path||'out/'+id+'.txt',id+' turn '+n+'\\n');}
+if(!s.check&&!s.noChange&&!/BLOCKED|ERROR|WAITING|ALREADY DONE|NEEDS/.test(reply)){fs.mkdirSync('out',{recursive:true});fs.writeFileSync(s.path||'out/'+id+'.txt',id+' turn '+n+'\\n');for(const [p,k] of Object.entries(s.write||{})){fs.mkdirSync(path.dirname(p),{recursive:true});fs.writeFileSync(p,Array.from({length:k},(_,j)=>'line '+j).join('\\n')+'\\n');}}
 event('end',id,n,phase);console.log(JSON.stringify({type:'message_end',message:{role:'assistant',stopReason:reply==='ERROR'?'error':'stop',content:[{type:'text',text:reply}]}}));
 })().catch(e=>{console.error(e);process.exitCode=1});\n`, { mode: 0o755 });
 	writeFileSync(check, `${common}
@@ -412,7 +412,8 @@ event('end',id,n,'check');if((s.failChecks||[]).includes(n))process.exitCode=1;
 		if (running) { writeFileSync(join(repo, ".pi-queue/STOP"), ""); await running; }
 		rmSync(home, { recursive: true, force: true });
 	});
-	return { repo, items, git, state, events, seen, wait, release, start: () => running = main(repo) };
+	const prompt = (id, n = 1) => (existsSync(join(home, `prompt-${id}-${n}`)) ? readFileSync(join(home, `prompt-${id}-${n}`), "utf8") : "");
+	return { repo, items, git, state, events, seen, wait, release, prompt, start: () => running = main(repo) };
 }
 
 function assertPhaseBounds(events, parallel) {
@@ -750,4 +751,65 @@ test("a provider error before any work is waited out in the same session instead
 	assert.equal(Object.keys(state.done).length, 2);
 	assert.deepEqual(state.failed, {});
 	assert.equal((log.match(/PROVIDER A01/g) ?? []).length, 2);
+});
+
+// ---------- 1.8.1: the false-DONE incident (Y01: "kept TS6, lock additions exceed the cap" reported as DONE) ----------
+
+test("a size stop is never answered with 'make it fit': with no level left the item fails instead of shrinking and passing", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "A01", replies: ["NEEDS: 5 files, 216 lines", "DONE\n- out/A01.txt: kept TS6 so it fits"] }], { escalate: [], autoSplit: false, fixRounds: 2 });
+	await f.start();
+	assert.equal(f.seen("A01", "coding", 2), false, "no second turn asked it to squeeze under the limit");
+	assert.deepEqual(f.state().done, {});
+	assert.match(Object.values(f.state().failed)[0], /NEEDS 5 files, 216 lines/);
+});
+
+test("lockfile lines never count toward the size limit", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "A01", write: { "out/pnpm-lock.yaml": 400, "out/__snapshots__/a.snap": 300 } }], { maxNetLines: 20, escalate: [], autoSplit: false });
+	await f.start();
+	assert.equal(Object.keys(f.state().done).length, 1, JSON.stringify(f.state().failed) + readFileSync(join(f.repo, ".pi-queue/log.md"), "utf8"));
+	const { isGenerated } = await import("./runner.mjs");
+	assert.equal(isGenerated("apps/web/package-lock.json"), true);
+	assert.equal(isGenerated("src/lock.ts"), false);
+	assert.equal(isGenerated("gen/api.ts", ["gen"]), true);
+});
+
+test("a DONE that admits a shortfall gets one confirmation turn: NEEDS then fails it, DONE: CONFIRMED passes it", { timeout: 30000 }, async (t) => {
+	const admit = "DONE\n- out/A01.txt: retained the original compiler because the lock additions exceed the line cap";
+	const f = schedulerFixture(t, [
+		{ id: "A01", replies: [admit, "NEEDS: 5 files, 216 lines"] },
+		{ id: "B01", replies: [admit.replace("A01", "B01"), "DONE: CONFIRMED\n- the compiler is replaced in out/B01.txt"] },
+		{ id: "C01", replies: ["DONE\n- out/C01.txt: wrote the new value"] },
+	], { escalate: [], autoSplit: false });
+	await f.start();
+	const state = f.state(), log = readFileSync(join(f.repo, ".pi-queue/log.md"), "utf8");
+	assert.match(state.failed[f.items[0].key], /NEEDS/);
+	assert.ok(state.done[f.items[1].key]);
+	assert.ok(state.done[f.items[2].key]);
+	assert.equal(f.seen("C01", "coding", 2), false, "an ordinary DONE is not questioned");
+	assert.match(f.prompt("A01", 2), /exceed the line cap[\s\S]*reads as if part of the item was not done/);
+	assert.equal((log.match(/CONFIRM /g) ?? []).length, 2);
+	assert.match(f.prompt("A01", 1), /Never keep the old implementation/);
+});
+
+test("a [check] still runs when an item it covers failed, and audits passed items by the code", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "A01", replies: ["BLOCKED: env: no staging key"] }, { id: "B01" }, { id: "V01", check: true, after: "A01, B01" }], { deferBlocked: false });
+	await f.start();
+	const state = f.state();
+	assert.ok(state.done[f.items[2].key], JSON.stringify(state.failed));
+	assert.match(f.prompt("V01"), /These covered items FAILED[\s\S]*A01 \(agent: BLOCKED: env: no staging key\)/);
+	assert.match(f.prompt("V01"), /not by its DONE message/);
+});
+
+test("plan lint rejects a Done when with an escape hatch; handoff does not inherit a disabled escalation", async (t) => {
+	const { planLint } = await import("./runner.mjs");
+	const q = (lines) => parseQueue(lines.map((l) => `- [ ] ${l}`).join("\n"));
+	const lint = planLint(q([
+		"Y01 — Adopt TS7 for typecheck. Done when: native typecheck uses TS7; unavailable/incompatible/slower means keep original compiler and report why. [areas: apps/a]",
+		"L01 — Migrate lint. Done when: lint runs Oxlint and preserves all existing ESLint rules. [areas: apps/b]",
+	]), 2);
+	assert.equal(lint.findings.length, 1);
+	assert.match(lint.findings[0], /^Y01: its "Done when" passes without the change/);
+	const { carriedConfig } = await import("./extension.ts");
+	const kept = carriedConfig({ escalate: [], autoSplit: false, fixRounds: 0, maxNetLines: 10, parallel: 3, piWebUrl: "http://x", runIn: "cli" });
+	assert.deepEqual(kept, { parallel: 3, piWebUrl: "http://x", runIn: "cli" });
 });

@@ -63,6 +63,7 @@ export const DEFAULTS = {
 	retryTransient: true, // timeouts and session/provider errors are retried by the supervisor without a model diagnosis
 	autoReconcile: true, // on start, preserve and release workers interrupted by a crash, sleep or a Pi Web restart
 	keepAwake: true, // macOS: keep the machine from idle-sleeping while the queue is supervised (caffeinate)
+	generatedPaths: [], // extra generated files/folders whose lines do not count toward size limits (lockfiles and __snapshots__ never count)
 	tiers: {}, // named model/effort/limit presets for [tier: name] items, set by the plan (task.json "tiers")
 	checkMinutes: 15,
 	stopAfterFailuresInARow: 0, // disabled by default; positive finite values opt into a global safety halt
@@ -528,7 +529,13 @@ export function planLint(items, parallel) {
 		const named = [...new Set(text.match(/\b[A-Z]+\d+[a-z]?\b/g) ?? [])].filter((id) => ids.has(id) && id !== i.id && !graph.get(i.id).includes(id) && !(i.after ?? []).includes("*"));
 		if (named.length) findings.push(`${i.id} mentions ${named.join(", ")} but has no [after: ${named.join(", ")}]: add it (or reword the item) so it cannot run first and block.`);
 	}
-	// 3. the plan cannot use the parallelism it asks for
+	// 3. "Done when" that lets the item pass without the change ("otherwise keep the original and report why")
+	for (const i of work) {
+		const done = i.line.split(/Done when:/i)[1]?.replace(/\[[^\]]*\]/g, " ") ?? "";
+		const hatch = done.match(/[^.;]*\b((unavailable|incompatible|slower|not possible|infeasible|fails?|otherwise|if not|else)\b[^.;]{0,100}\b(keep|retain|report|document|skip|leave|fall ?back)|(report|document)s? (why|the reason)|keep(s|ing)? (the )?(original|old|existing) (one|implementation|compiler|tool|setup|config))\b[^.;]*/i)?.[0]?.trim();
+		if (hatch) findings.push(`${i.id}: its "Done when" passes without the change ("${hatch.slice(0, 140)}"). A worker under a size limit will take that exit and report DONE. Make the target state the only passing outcome; if keeping the old way is genuinely acceptable, decide that now (questions.md) and say so plainly.`);
+	}
+	// 4. the plan cannot use the parallelism it asks for
 	const sim = simulatePlan(items, parallel);
 	const floor = Math.max(sim.ideal, sim.criticalPath);
 	if (items.length >= 8 && parallel > 1 && sim.rounds > 1.6 * floor) {
@@ -655,18 +662,25 @@ export function pathAllowed(file, allowed) {
 	});
 }
 
-export async function measure(cwd, base, allowed) {
+/** Machine-written files: they must still be in scope, but their lines never count toward the size limits. */
+export const GENERATED = /(^|\/)(pnpm-lock\.yaml|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|bun\.lockb?|go\.sum|go\.work\.sum|Cargo\.lock|poetry\.lock|uv\.lock|Pipfile\.lock|Gemfile\.lock|composer\.lock|Podfile\.lock|flake\.lock)$|(^|\/)__snapshots__\//;
+export function isGenerated(p, extra = []) {
+	return GENERATED.test(p) || extra.some((g) => pathAllowed(p, [g]));
+}
+
+export async function measure(cwd, base, allowed, generated = []) {
 	const files = new Set();
 	let net = 0;
 	let growing = 0;
 	const inScope = (p) => pathAllowed(p, allowed);
+	const counts = (p) => inScope(p) && !isGenerated(p, generated);
 	const numstat = await git(cwd, "diff", "--numstat", "--no-renames", base);
 	for (const row of numstat.out.split("\n")) {
 		const [a, d, p] = row.split("\t");
 		if (!p) continue;
 		files.add(p);
 		const delta = (Number(a) || 0) - (Number(d) || 0);
-		if (inScope(p)) {
+		if (counts(p)) {
 			net += delta;
 			if (delta > 0) growing++;
 		}
@@ -679,7 +693,7 @@ export async function measure(cwd, base, allowed) {
 			const t = readFileSync(join(cwd, p), "utf8");
 			lines = t ? t.split("\n").length - (t.endsWith("\n") ? 1 : 0) : 0;
 		} catch {}
-		if (inScope(p)) {
+		if (counts(p)) {
 			net += lines;
 			if (lines > 0) growing++;
 		}
@@ -719,7 +733,23 @@ Rules (the script enforces the first two and throws away the whole change if bro
   BLOCKED: env: <what is missing>   (credentials, a service, a tool that is not installed)
   BLOCKED: <reason>   (anything else, e.g. the plan contradicts the code)
   Prefer the plan's rules and the existing code's conventions over asking; only real gaps are BLOCKED.
+- DONE means every condition in "Done when" now holds because of your change. Never keep the old implementation, deliver only part of the item, or replace the change with an explanation or documentation and call that DONE. If the whole item does not fit the limits, reply NEEDS; if it truly cannot be done, reply BLOCKED with the evidence.
 - When finished, reply: DONE, then each changed file with one sentence.`;
+}
+
+/** A DONE reply that admits part of the item was not done (kept the old way, hit a cap, deferred…). */
+export const SHORTFALL = /\b(exceed(s|ed|ing)?|(line|size|file) (cap|limit)|over the (cap|limit)|retain(ed|s|ing)?|kept|keeps|keep(ing)? (the )?(old|original|existing|current)|instead of|fall ?back|not (implemented|adopted|migrated|enabled|done|completed|changed)|skipp(ed|ing)|deferred|left (for|as|unchanged)|out of scope|partial(ly)?|could not|couldn't|unable to|blocked by|remains? (unchanged|on|as)|unchanged)\b/i;
+
+function confirmPrompt(c, item, reply) {
+	const hint = reply.match(new RegExp(`[^\n]*${SHORTFALL.source}[^\n]*`, "i"))?.[0]?.trim().slice(0, 300) ?? "";
+	return `Your DONE reply says: "${hint}". That reads as if part of the item was not done.
+
+ITEM: ${item.line}
+
+Compare the code now with every condition in "Done when". Keeping the old implementation, doing part of it, or explaining why instead of changing it is NOT done.
+- If something is missing and it fits the limits (${c.maxFilesGrowing} files gaining lines, ${c.maxNetLines} net added lines; lockfiles do not count), finish it now and reply DONE.
+- If it does not fit, reply NEEDS: <files> files, <lines> lines. If it truly cannot be done, reply BLOCKED: <evidence>.
+- If every condition really holds, reply DONE: CONFIRMED, then one line per condition with where it holds.`;
 }
 
 // ---------- size limits: raised automatically, or when the person says so in the session ----------
@@ -776,6 +806,7 @@ Verify what the check describes against the current code (read it, run tests/com
 - You may fix tests, fixtures and docs under ${c.allowedPaths.join(", ")} when they are wrong or missing. Do not change production code.
 - If production code does not do what the plan requires, do not fix it. Report each gap on its own line:
   GAP: <what is wrong and what to change, naming the files>. Done when: <observable result>. [areas: <folders/files the fix changes>]
+- Judge each covered item by the code, not by its DONE message, notes or commit message. A passed item that kept the old implementation, did only part of its "Done when", or documented why instead of changing it, is a GAP.
 - If everything holds, reply: CHECKED, then one line per thing you verified or fixed.
 - If you cannot check it at all (missing environment, credentials, or a decision), reply with exactly one line: BLOCKED: <reason>
 - Do not ask questions. Do not commit. Before you stop, run: ${checksText(c)}`;
@@ -784,7 +815,7 @@ Verify what the check describes against the current code (read it, run tests/com
 function fixPrompt(c, reason) {
 	return `The script rejected the change: ${reason}
 
-Fix only that. Same rules: only ${c.allowedPaths.join(", ")}, at most ${c.maxNetLines} net added lines, at most ${c.maxFilesGrowing} files gaining lines, no new abstractions, no questions, no commits. If it cannot be fixed within the rules, undo your edits and reply with one line: BLOCKED: <reason>`;
+Fix only that, without dropping any part of the item: the item's "Done when" must still fully hold afterwards. Same rules: only ${c.allowedPaths.join(", ")}, at most ${c.maxNetLines} net added lines, at most ${c.maxFilesGrowing} files gaining lines, no new abstractions, no questions, no commits. If it cannot be fixed within the rules, undo your edits and reply with one line: BLOCKED: <reason>`;
 }
 
 // ---------- running pi ----------
@@ -1206,7 +1237,7 @@ async function judge(c, cwd, base, reply, item = {}) {
 	if (waiting) return `agent: WAITING: ${waiting[1].slice(0, 300)}`;
 	const blocked = reply.match(/^\s*BLOCKED:\s*(.+)$/m);
 	if (blocked) return `agent: BLOCKED: ${blocked[1].slice(0, 300)}`;
-	const m = await measure(cwd, base, c.allowedPaths);
+	const m = await measure(cwd, base, c.allowedPaths, c.generatedPaths ?? []);
 	// an item whose result another item already delivered passes on the same checks, instead of failing its dependents
 	const already = /^\s*ALREADY DONE\b/im.test(reply);
 	if (m.files.length === 0) return item.check || item.repaired || already ? runChecks(c, cwd) : "no changes were made";
@@ -1411,15 +1442,18 @@ async function workItem(ctx, slot, wt, item) {
 	};
 	const onActivity = (what) => setDoing(what, what !== "thinking" && what !== "compacting context" && !what.endsWith(" failed"));
 
+	const failedDeps = item.check ? allItems(ctx.queueText?.() ?? "", state).filter((o) => state.failed[o.key] && ((item.after ?? []).includes("*") || (item.after ?? []).some((d) => o.id === d || o.id.startsWith(d)))) : [];
+	const failedNote = failedDeps.length ? `\n\nThese covered items FAILED; their work is not in the code. Do not report GAPs for them (the queue tracks them): ${failedDeps.map((o) => `${o.id} (${String(state.failed[o.key]).slice(0, 120)})`).join("; ")}` : "";
 	const prior = join(repo, DIR, "notes", `${item.repairParent?.id ?? item.id}.md`);
 	const previous = existsSync(prior) ? `\n\nPrevious attempt and manager diagnosis (evidence, not permission to expand scope):\n${readFileSync(prior, "utf8").slice(-12000)}` : "";
-	let t = await turn(itemPrompt(c, item) + previous, c.itemMinutes, onActivity, item.check ? "verification" : "coding");
+	let t = await turn(itemPrompt(c, item) + failedNote + previous, c.itemMinutes, onActivity, item.check ? "verification" : "coding");
 	if (ref.id) {
 		state.sessions = { ...(state.sessions ?? {}), [ref.id]: { item: item.id, status: "running", web: !!web } };
 		save();
 	}
 	let redone = false;
 	let bypassed = false;
+	let confirmed = false;
 	const raise = (why, limits) => {
 		c = { ...c, ...limits };
 		log(`LIMITS RAISED ${item.id} · ${why} · now ${c.maxFilesGrowing} files / ${c.maxNetLines} lines`);
@@ -1432,6 +1466,15 @@ async function workItem(ctx, slot, wt, item) {
 		if (!bypassed && (await bypassAsked(ctx, ref))) {
 			bypassed = true;
 			raise("you asked for it in the session", UNLIMITED);
+		}
+		// a DONE that admits a shortfall gets one turn to finish or say NEEDS/BLOCKED, instead of passing on green checks
+		if (!item.check && !confirmed && /^\s*DONE\b/m.test(t.reply) && !/DONE:\s*CONFIRMED/i.test(t.reply) && SHORTFALL.test(t.reply.replace(/^\s*DONE\b.*$/m, ""))) {
+			confirmed = true;
+			log(`CONFIRM ${item.id} · DONE reply admits a shortfall · asked to finish it or say NEEDS/BLOCKED`);
+			setDoing("confirming that Done when is fully met");
+			save();
+			t = await turn(confirmPrompt(c, item, t.reply), Math.max(10, Math.round(c.itemMinutes / 2)), onActivity);
+			return verdict();
 		}
 		setDoing("runner: checking scope, size and checks");
 		save();
@@ -1458,7 +1501,9 @@ async function workItem(ctx, slot, wt, item) {
 		reason = await verdict();
 	}
 	for (let round = 0; reason && t.status === "ok" && round < c.fixRounds; round++) {
-		if (/^agent: (BLOCKED|GAPS|WAITING)/.test(reason) || reason === "no changes were made" || ctx.stopRequested()) break;
+		// A size stop is never "fixed" by asking the agent to fit under the limit: that is how a worker
+		// drops the real change, keeps the old implementation and reports DONE. Too big stays too big.
+		if (/^agent: (BLOCKED|GAPS|WAITING)/.test(reason) || isSizeStop(reason) || reason === "no changes were made" || ctx.stopRequested()) break;
 		setDoing(`fixing: ${firstLine(reason).slice(0, 80)}`);
 		t = await turn(fixPrompt(c, reason), Math.max(10, Math.round(c.itemMinutes / 2)), onActivity);
 		reason = await verdict();
@@ -1820,6 +1865,7 @@ export async function main(repo) {
 		else log(`Pi Web not usable (${found.reason}); items run as background pi instead`);
 	}
 	const parallel = c.worktrees ? Math.max(1, Math.floor(c.parallel) || 1) : 1;
+	const startTip = (await git(repo, "rev-parse", branch)).out.trim();
 	log(`START · branch ${branch} · ${c.worktrees ? `up to ${parallel} coding + ${parallel} verification (worktrees)` : "one at a time in your repo folder"} · ${c.model || "default model"} @ ${c.thinking || "default"} · ${ctx.web ? `items run as Pi Web sessions (${c.piWebUrl})` : `items run as background pi (${ctx.pi})`}`);
 
 	// worktrees are made when a slot is first used; w0 now, for the baseline check
@@ -1885,6 +1931,8 @@ export async function main(repo) {
 			let wait = false;
 			for (const d of i.after ?? []) {
 				const st = depState(d);
+				// a [check] still runs when an item it covers failed: it reports what is missing instead of silently never running
+				if (st === "failed" && i.check) continue;
 				if (st === "failed" || st === "unknown") {
 					state.failed[i.key] = `depends on ${d}, which ${st === "unknown" ? "is unknown" : "failed"}`;
 					log(`FAIL ${i.id} · depends on ${d}, which failed · not started`);
@@ -2126,6 +2174,14 @@ export async function main(repo) {
 	notifyRunner("completion", { runId: state.runId, phase: state.phase });
 	const left = allItems(readFileSync(queuePath, "utf8"), state).filter((i) => !state.done[i.key] && !state.failed[i.key]).length;
 	log(`END · passed ${Object.keys(state.done).length} · failed ${Object.keys(state.failed).length} · still open ${left}${halted ? ` · ${halted}` : ""}`);
+	// merged items changed dependencies: bring the main checkout's install up to date so its own checks run
+	if (c.setup && startTip) {
+		const changed = (await git(repo, "diff", "--name-only", startTip, branch)).out.split("\n").filter((f) => GENERATED.test(f) || /(^|\/)(package\.json|go\.mod|pyproject\.toml|requirements[^/]*\.txt)$/.test(f));
+		if (changed.length && (await treeIsClean(repo))) {
+			const r = await run(repo, LOGIN_SHELL, ["-lc", c.setup], { timeoutMs: 20 * 60_000, env: cleanEnv() });
+			log(r.code === 0 ? `SETUP main checkout · dependencies changed (${changed.slice(0, 3).join(", ")}) · installed` : `SETUP main checkout failed (exit ${r.code}) · run it yourself: ${c.setup}`);
+		}
+	}
 	try {
 		const decisions = existsSync(join(repo, DIR, "decisions.md")) ? `\n\n# Decisions the automatic manager made (review these)\n${readFileSync(join(repo, DIR, "decisions.md"), "utf8")}` : "";
 		writeFileSync(join(repo, DIR, "report.md"), `${runReport(allItems(readFileSync(queuePath, "utf8"), state), state)}${decisions}\n`);

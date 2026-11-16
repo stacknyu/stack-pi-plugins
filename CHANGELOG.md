@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1
+
+- pi-flow 1.8.1: fixes items passing as DONE after dropping work to fit a size cap (no squeeze-to-fit fix round, lockfiles excluded from size, DONE confirmation, escape-hatch lint, config reset at handoff, checks always run).
+
 ## 0.4.0
 
 - pi-flow 1.8.0: provider-outage waiting, autonomous decisions with a decision log, in-run slot recovery, merge checks outside the lock, overtime turn, start retries, persistent manager mode.

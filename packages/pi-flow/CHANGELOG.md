@@ -1,5 +1,17 @@
 # pi-flow changelog
 
+## 1.8.1
+
+Fixes the "false DONE" failure: an item that kept the old implementation because of a size cap passed and was reported as done.
+
+- **A size stop is never answered with "make it fit".** Once no larger size level is left, a `NEEDS` / over-limit result fails the item (or splits it). Before, the fix round told the worker to stay under the limit, so it dropped the real change and replied DONE.
+- **Lockfiles don't count toward size limits** (pnpm/npm/yarn/bun, go.sum, Cargo, Poetry, uv, Gemfile, composer, Podfile, flake, `__snapshots__/`; more via `generatedPaths`). They must still be in scope.
+- **DONE must mean Done when.** The worker prompt forbids passing off a partial change, a kept old implementation, or an explanation as DONE. A DONE reply that admits a shortfall ("kept", "retained", "exceeds the cap", "instead of", "not migrated"…) gets one confirmation turn: finish it, reply NEEDS/BLOCKED, or `DONE: CONFIRMED` with evidence per condition.
+- **Plan lint:** a "Done when" with an escape hatch ("if incompatible/slower, keep the original and report why") is rejected at handoff.
+- **Handoff resets the queue's strictness.** Only operational settings (parallel, Pi Web, setup, …) carry over from an old or hand-written `.pi-queue/config.json`; limits, escalation, splitting and fix rounds come from the defaults and `task.json`. The planner is told not to write that file.
+- **`[check]` items always run.** A check whose covered item failed still runs, is told which items failed, and judges passed items by the code rather than their DONE messages.
+- After a run that changed dependencies, the setup command runs once in the main checkout, so its own checks don't fail on a stale install.
+
 ## 1.8.0
 
 Audit pass for fully unattended runs.

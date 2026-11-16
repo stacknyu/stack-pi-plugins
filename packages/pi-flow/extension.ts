@@ -306,6 +306,8 @@ Rules for items:
 - No "investigate" or "review" items that produce nothing: every item either changes code/docs or is a [check].
 - Few, meaningful [check] items: one per area or milestone plus one final [after: *] check, not one per work item. Each check costs a session and can add fix items.
 - The queue runs unattended. Write rules.md so that a manager model with no tools can settle open questions from it: state the conventions to follow, the defaults to prefer ("when unsure, match the nearest existing screen/module"), and anything that must never be done.
+- "Done when" states the target state only. Never write an escape hatch such as "if incompatible/slower, keep the original and report why": a worker under a size limit takes that exit and reports DONE. If a fallback is truly acceptable, settle it now in questions.md.
+- Do not write .pi-queue/config.json: the queue's limits, escalation and splitting come from task.json ("limits", "tiers") and the defaults. Lockfiles and snapshots never count toward size limits.
 - Settle decisions now. An item that would have to ask "which option?" at run time stops for the user: put the question in questions.md, or decide it in rules.md.
 - The handoff tool lints the plan (items to merge, missing [after], areas that serialize the queue) and reports how many rounds it needs with your "parallel". Fix what it reports; set "planLint": "accept: <reason>" in task.json only for a finding that is genuinely wrong.`;
 }
@@ -438,7 +440,9 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 		}
 	}
 
-	const existing: any = loadJson(join(cwd, DIR, "config.json"), {});
+	// Only operational settings carry over from the previous config. Size limits, escalation, splitting and fix rounds
+	// come from the defaults and this plan's task.json, so a hand-edited or planner-written config cannot disable them.
+	const existing: any = carriedConfig(loadJson(join(cwd, DIR, "config.json"), {}));
 	const parallel = Math.max(1, Math.floor(Number(task.parallel)) || existing.parallel || DEFAULTS.parallel);
 	const config = {
 		...DEFAULTS,
@@ -472,6 +476,12 @@ async function handoff(cwd: string, slug: string, ctx: any): Promise<{ ok: boole
 		ok: true,
 		text: `Queued ${items.length} items for task ${slug} (up to ${parallel} coding and ${parallel} verifying in worktree mode). Checks: ${checks.join(" · ")}.${lint ? `\nPlan shape: about ${lint.rounds} rounds at parallel ${parallel} (longest dependency chain ${lint.criticalPath}); the queue may add at most ${growthBudget(config, items.length)} items by itself.` : ""}${warnings.length ? `\nWarnings: ${warnings.join(" ")}` : ""}\nThe live panel below shows progress; /task status for a summary.`,
 	};
+}
+
+const CARRIED = ["parallel", "parallelMin", "piWebUrl", "runIn", "piCommand", "copyFromRepo", "checkBroker", "deleteSessions", "keepAwake", "managerIn", "managerModel", "managerThinking", "checkMinutes", "generatedPaths", "worktrees"];
+/** The operational settings a new plan keeps from the previous queue config; everything else is reset. */
+export function carriedConfig(previous: any): any {
+	return Object.fromEntries(Object.entries(previous ?? {}).filter(([k]) => CARRIED.includes(k)));
 }
 
 // ---------- cleanup ----------
