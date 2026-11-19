@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpa
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULTS, parseQueue, itemConfig, piTurn, webTurn, applyControl, checksText, checkLine, dependencyGraph, orderQueue, areasOverlap, webClient, deleteSessions, main, loadJson, saveJson, notifyRunner, allItems, validateRecovery } from "./runner.mjs";
+import { DEFAULTS, boosted, straysIn, killStrays, parseQueue, itemConfig, piTurn, webTurn, applyControl, checksText, checkLine, dependencyGraph, orderQueue, areasOverlap, webClient, deleteSessions, main, loadJson, saveJson, notifyRunner, allItems, validateRecovery, pidAlive, widenable, mentionedPaths, reworkable, planGapJobs, admissionProblem, reopenDependents, runReport, checkOwners } from "./runner.mjs";
 
 const item = (tags = "") => parseQueue(`- [ ] A01 — Edit one file. Done when: tested. [areas: src/a] ${tags}`)[0];
 const model = { provider: "example", id: "small", reasoning: false, cost: { input: 1, output: 2 } };
@@ -30,12 +30,13 @@ test("item session tags override defaults without mutating them", () => {
 
 test("focused item checks select the exact owner, inherit to children, and fail closed", () => {
 	const c = { ...DEFAULTS, checks: ["git diff --check"], itemChecks: { A01: ["cd apps/api && go test ./roles -run '^TestSelectedBranch$'"] } };
-	for (const id of ["A01", "A01a"]) {
+	// generated items (split parts, gap fixes, repairs, their parts) use the planned item's checks
+	for (const id of ["A01", "A01a", "A01-fix1", "A01a-fix2", "A01-repair1", "A01-fix1b"]) {
 		const selected = itemConfig(c, { ...item(), id });
-		assert.deepEqual(selected.checks, [...c.checks, ...c.itemChecks.A01]);
+		assert.deepEqual(selected.checks, [...c.checks, ...c.itemChecks.A01], id);
 		assert.deepEqual(c.checks, ["git diff --check"]);
 	}
-	for (const id of ["B01", "A01-fix1"]) assert.throws(() => itemConfig(c, { ...item(), id }), /focused itemChecks/);
+	for (const id of ["B01", "B01-fix1"]) assert.throws(() => itemConfig(c, { ...item(), id }), /focused itemChecks/);
 	assert.throws(() => itemConfig({ ...c, itemChecks: { A01: [""] } }, item()), /invalid/);
 });
 
@@ -74,7 +75,8 @@ test("planner gets actual model capabilities, cost and upfront selection instruc
 	assert.match(prompt, /Never make a trivial edit/);
 	assert.match(prompt, /"limits": \{"maxNetLines"/);
 	assert.match(prompt, /rules.md/);
-	assert.match(prompt, /separate pi-check budget/);
+	assert.match(prompt, /The user.s setting is the ceiling/);
+	assert.match(prompt, /\[readonly\] items: they take no area locks/);
 	assert.match(prompt, /Agree recovery authority upfront/);
 	assert.match(prompt, /set individual budgets to 0 to prohibit them/);
 });
@@ -366,7 +368,7 @@ function schedulerFixture(t, specs, config = {}, seed = {}) {
 	mkdirSync(join(repo, "out"));
 	writeFileSync(join(repo, "out", "shared.txt"), "initial\n");
 	writeFileSync(join(repo, ".gitignore"), ".pi-queue/\n");
-	const items = parseQueue(specs.map((s) => `- [ ] ${s.id} — ${s.id}. Done when: verified. [areas: ${s.area || `out/${s.id}.txt`}] ${s.check ? "[check]" : ""} ${s.after ? `[after: ${s.after}]` : ""}`).join("\n"));
+	const items = parseQueue(specs.map((s) => `- [ ] ${s.id} — ${s.id}. Done when: verified. [areas: ${s.area || `out/${s.id}.txt`}] ${s.check ? "[check]" : ""} ${s.readonly ? "[readonly]" : ""} ${s.after ? `[after: ${s.after}]` : ""} ${s.tags ?? ""}`).join("\n"));
 	writeFileSync(join(repo, ".tasks/sample/items.md"), items.map((i) => `- [ ] ${i.line}`).join("\n"));
 	const common = `const fs=require('fs'),path=require('path'),home=${JSON.stringify(home)},specs=${JSON.stringify(specs)};
 const file=(name)=>path.join(home,name), read=(name)=>fs.existsSync(file(name))?fs.readFileSync(file(name),'utf8'):'';
@@ -376,19 +378,45 @@ async function barrier(key,hold){const until=Date.now()+20000;while(hold&&!fs.ex
 `;
 	const worker = join(home, "worker.cjs"), check = join(home, "check.cjs");
 	writeFileSync(worker, `#!/usr/bin/env node\n${common}
-(async()=>{const id=process.argv[process.argv.indexOf('-n')+1].match(/queue (\\S+):/)[1],s=specs.find(s=>s.id===id),n=count('worker-'+id),phase=s.check&&n===1?'verification':'coding';
-fs.writeFileSync(file(path.basename(process.cwd())+'.owner'),id);fs.writeFileSync(file('prompt-'+id+'-'+n),process.argv.at(-1));event('start',id,n,phase);
+let aborted=false;
+async function turn(id,text){const s=specs.find(s=>s.id===id)||{id},n=count('worker-'+id),phase=s.check&&n===1?'verification':'coding';
+fs.writeFileSync(file(path.basename(process.cwd())+'.owner'),id);fs.writeFileSync(file('prompt-'+id+'-'+n),text);event('start',id,n,phase);
 if(s.requires&&!fs.existsSync(s.requires))throw Error('dependency not integrated: '+s.requires);
 if(n>1&&s.requiresAfterFirst&&!fs.existsSync(s.requiresAfterFirst))throw Error('deferred work retried before integration');
-if(!s.check&&/Before you stop, run:|Run the checks, then reply DONE/.test(process.argv.at(-1)))throw Error('mandatory verification leaked into coding prompt');
-await barrier('worker-'+id+'-'+n,s.holdWorker===true||(s.holdWorker||[]).includes(n));
+if(!s.check&&/Before you stop, run:|Run the checks, then reply DONE/.test(text))throw Error('mandatory verification leaked into coding prompt');
+const until=Date.now()+20000,key='worker-'+id+'-'+n,hold=s.holdWorker===true||(s.holdWorker||[]).includes(n);
+while(hold&&!fs.existsSync(file(key))&&!fs.existsSync(file('release-all'))){if(aborted)throw Object.assign(Error('aborted'),{aborted:true});if(Date.now()>until)throw Error('barrier timed out: '+key);await new Promise(r=>setTimeout(r,10));}
 const reply=(s.replies||[])[n-1]||'DONE';
 if(!s.check&&!s.noChange&&!/BLOCKED|ERROR|WAITING|ALREADY DONE|NEEDS/.test(reply)){fs.mkdirSync('out',{recursive:true});fs.writeFileSync(s.path||'out/'+id+'.txt',id+' turn '+n+'\\n');for(const [p,k] of Object.entries(s.write||{})){fs.mkdirSync(path.dirname(p),{recursive:true});fs.writeFileSync(p,Array.from({length:k},(_,j)=>'line '+j).join('\\n')+'\\n');}}
-event('end',id,n,phase);console.log(JSON.stringify({type:'message_end',message:{role:'assistant',stopReason:reply==='ERROR'?'error':'stop',content:[{type:'text',text:reply}]}}));
-})().catch(e=>{console.error(e);process.exitCode=1});\n`, { mode: 0o755 });
+event('end',id,n,phase);return reply;}
+const say=(reply)=>console.log(JSON.stringify({type:'message_end',message:{role:'assistant',stopReason:reply==='ERROR'?'error':'stop',content:[{type:'text',text:reply}]}}));
+const idOf=(name)=>(name.match(/^(?:queue|rework) (\\S+):/)||[])[1];
+if(process.argv.includes('rpc')){
+// RPC mode: one long-lived process; sessions switch, names come from set_session_name
+fs.appendFileSync(file('rpc-starts'),process.pid+'\\n');
+let name='',file0='',buf='';const out=(r)=>process.stdout.write(JSON.stringify(r)+'\\n');
+const head=(f)=>{try{return JSON.parse(fs.readFileSync(f,'utf8').split('\\n')[0])}catch{return {}}};
+const handle=async(cmd)=>{const ok=(data)=>out({id:cmd.id,type:'response',command:cmd.type,success:true,data});
+if(cmd.type==='get_state')return ok({sessionId:head(file0).id,sessionFile:file0});
+// like real pi: a session's tools run in the folder its header names
+if(cmd.type==='switch_session'){file0=cmd.sessionPath;const h=head(file0);if(h.cwd)process.chdir(h.cwd);name=h.name||'';return ok({cancelled:false});}
+if(cmd.type==='set_session_name'){name=cmd.name;fs.writeFileSync(file0,JSON.stringify({...head(file0),name})+'\\n');return ok({});}
+if(cmd.type==='abort'){aborted=true;return ok({});}
+if(cmd.type!=='prompt')return ok({});
+ok({disposition:'started'});aborted=false;
+if(/^rework /.test(name)){fs.appendFileSync(file('reworks'),idOf(name)+'\\n');const s=specs.find(s=>s.id===idOf(name))||{};const k=count('rework-'+idOf(name));say((s.rework||[])[k-1]||'GIVE UP: no idea');return out({type:'agent_settled',aborted:false});}
+try{say(await turn(idOf(name),cmd.message));out({type:'agent_settled',aborted:false});}
+catch(e){out({type:'message_end',message:{role:'assistant',stopReason:e.aborted?'aborted':'error',errorMessage:String(e.message),content:[]}});out({type:'agent_settled',aborted:!!e.aborted});}};
+process.stdin.on('data',(d)=>{buf+=d;let i;while((i=buf.indexOf('\\n'))>=0){const line=buf.slice(0,i);buf=buf.slice(i+1);if(line.trim())handle(JSON.parse(line));}});
+process.stdin.on('end',()=>process.exit(0));
+}else{
+(async()=>{const name=process.argv[process.argv.indexOf('-n')+1];
+if(/^rework /.test(name)){const s=specs.find(s=>s.id===idOf(name))||{};fs.appendFileSync(file('reworks'),idOf(name)+'\\n');const k=count('rework-'+idOf(name));return say((s.rework||[])[k-1]||'GIVE UP: no idea');}
+say(await turn(idOf(name),process.argv.at(-1)));
+})().catch(e=>{console.error(e);process.exitCode=1});}\n`, { mode: 0o755 });
 	writeFileSync(check, `${common}
 (async()=>{const id=read(path.basename(process.cwd())+'.owner');if(!id)return;
-const s=specs.find(s=>s.id===id),n=count('check-'+id);event('start',id,n,'check');
+const s=specs.find(s=>s.id===id)||{id},n=count('check-'+id);event('start',id,n,'check');
 await barrier('check-'+id+'-'+n,s.holdCheck===true||(s.holdCheck||[]).includes(n));
 event('end',id,n,'check');if((s.failChecks||[]).includes(n))process.exitCode=1;
 })().catch(e=>{console.error(e);process.exitCode=1});\n`);
@@ -415,6 +443,14 @@ event('end',id,n,'check');if((s.failChecks||[]).includes(n))process.exitCode=1;
 	});
 	const prompt = (id, n = 1) => (existsSync(join(home, `prompt-${id}-${n}`)) ? readFileSync(join(home, `prompt-${id}-${n}`), "utf8") : "");
 	return { repo, items, git, state, events, seen, wait, release, prompt, start: () => running = main(repo) };
+}
+
+function assertSessionBound(events, parallel) {
+	let active = 0;
+	for (const e of events.filter((e) => e.phase !== "check")) {
+		active += e.kind === "start" ? 1 : -1;
+		assert.ok(active <= parallel, `more than ${parallel} agent sessions at once: ${JSON.stringify(e)}`);
+	}
 }
 
 function assertPhaseBounds(events, parallel) {
@@ -447,15 +483,18 @@ test("runner overlaps fresh coding with verification, retaining areas and verifi
 
 test("check items have independent bounded verification capacity and repo-only mode stays serialized", { timeout: 30000 }, async (t) => {
 	for (const worktrees of [true, false]) {
-		const f = schedulerFixture(t, [{ id: "V01", check: true, holdWorker: true }, { id: "V02", check: true }, { id: "A01", holdWorker: true }], { parallel: 1, worktrees });
+		// parallel is the number of agent sessions: a [check] session and a coding session share it
+		const parallel = worktrees ? 2 : 1;
+		const f = schedulerFixture(t, [{ id: "V01", check: true, holdWorker: true }, { id: "V02", check: true }, { id: "A01", holdWorker: true }], { parallel, worktrees });
 		const done = f.start();
 		await f.wait(() => f.seen("V01", "verification"));
-		if (worktrees) await f.wait(() => f.seen("A01", "coding"));
-		assert.equal(f.seen("V02", "verification"), false);
-		if (!worktrees) assert.equal(f.seen("A01", "coding"), false);
+		if (worktrees) await f.wait(() => f.seen("A01", "coding") || f.seen("V02", "verification"));
+		await new Promise((r) => setTimeout(r, 300));
+		if (!worktrees) { assert.equal(f.seen("V02", "verification"), false); assert.equal(f.seen("A01", "coding"), false); }
 		f.release(); await done;
 		assert.equal(Object.keys(f.state().done).length, 3);
-		assertPhaseBounds(f.events(), 1);
+		assertPhaseBounds(f.events(), parallel);
+		assertSessionBound(f.events(), parallel);
 		if (!worktrees) {
 			let active = 0;
 			for (const e of f.events()) { active += e.kind === "start" ? 1 : -1; assert.ok(active <= 1); }
@@ -859,4 +898,339 @@ test("a Pi Web worker counts as stopped only when its server refuses connections
 		assert.equal(left.length === 0, reclaimed, String(webUrl));
 		assert.equal(!state.running[0], reclaimed, String(webUrl));
 	}
+});
+
+// ---------- 1.9: the overnight failures (stuck on one item, 2 slots of 20, RAM, no updates) ----------
+
+test("read-only audits lock nothing, run side by side, and hand their findings to the items after them", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [
+		{ id: "R01", readonly: true, noChange: true, area: "out", replies: ["DONE\nFinding: the login form has no rate limit."] },
+		{ id: "R02", readonly: true, noChange: true, area: "out", replies: ["DONE\nFinding: none."] },
+		{ id: "R03", readonly: true, area: "out" }, // changes a file: a read-only item must not
+		{ id: "F01", after: "R01, R02" },
+	], { parallel: 3 });
+	await f.start();
+	const state = f.state();
+	assert.ok(state.done[f.items[0].key] && state.done[f.items[1].key] && state.done[f.items[3].key], JSON.stringify(state.failed));
+	assert.match(state.failed[f.items[2].key], /read-only item changed files/);
+	assert.match(readFileSync(join(f.repo, ".pi-queue/reports/R01.md"), "utf8"), /no rate limit/);
+	assert.match(f.prompt("F01"), /Findings of the read-only items you depend on[\s\S]*reports\/R01\.md/);
+	assert.match(f.prompt("R01"), /This item is READ-ONLY/);
+	const starts = f.events().filter((e) => e.kind === "start" && /^R0/.test(e.id)).length;
+	assert.equal(starts, 3);
+	const { simulatePlan } = await import("./runner.mjs");
+	assert.equal(simulatePlan(parseQueue(Array.from({ length: 9 }, (_, i) => `- [ ] R${i + 1} — audit ${i}. Done when: x. [areas: apps] [readonly]`).join("\n")), 9).rounds, 1);
+});
+
+test("a released failure lets the items after it run, told what is missing; WAITING on a failed item blocks at once", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "A01" }, { id: "B01", after: "A01" }, { id: "C01", replies: ["WAITING: A01 — needs its helper"] }], { parallel: 1, deferBlocked: false });
+	const a = f.items[0];
+	saveJson(join(f.repo, ".pi-queue/state.json"), { done: {}, failed: { [a.key]: "check failed: boom" }, released: { [a.key]: "check failed: boom" } });
+	await f.start();
+	const state = f.state();
+	assert.ok(state.done[f.items[1].key], JSON.stringify(state.failed));
+	assert.match(f.prompt("B01"), /These prerequisites FAILED and will not be retried[\s\S]*A01 \(check failed: boom\)/);
+	assert.match(state.failed[f.items[2].key], /BLOCKED/);
+	assert.equal(f.seen("C01", "coding", 2), false);
+	// the control itself reopens dependents that already failed on the prerequisite
+	const items = parseQueue("- [ ] A01 a [areas: a]\n- [ ] B01 b [areas: b] [after: A01]\n- [ ] B02 c [areas: c] [after: A01]");
+	const st = { done: {}, failed: { [items[0].key]: "x", [items[1].key]: "depends on A01, which failed", [items[2].key]: "depends on A01, which failed" } };
+	assert.deepEqual(applyControl(st, items, { action: "release", ids: ["A01"], by: "auto" }), ["A01", "B01", "B02"]);
+	assert.deepEqual(Object.keys(st.failed), [items[0].key]);
+});
+
+test("retries run stronger: heavy tier, high effort, more time; provider errors are not boosted", () => {
+	const items = parseQueue("- [ ] A01 a [areas: a]\n- [ ] B01 b [areas: b]");
+	const st = { done: {}, failed: { [items[0].key]: "check failed: x", [items[1].key]: "pi exited with an error" } };
+	applyControl(st, items, { action: "retry", ids: [], by: "user" });
+	assert.deepEqual(st.boost, { [items[0].key]: 1 });
+	const c = boosted({ ...DEFAULTS, model: "p/light", thinking: "low", itemMinutes: 40, tiers: { heavy: { model: "p/big", thinking: "high" } } }, 1);
+	assert.deepEqual([c.model, c.thinking, c.itemMinutes], ["p/big", "high", 60]);
+	assert.equal(boosted({ ...DEFAULTS, model: "p/one", thinking: "medium" }, 2).model, "p/one");
+});
+
+test("processes left running in a worktree are stopped", { timeout: 20000 }, async (t) => {
+	const dir = realpathSync(mkdtempSync(join(tmpdir(), "pi-flow-stray-")));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const { spawn } = await import("node:child_process");
+	const server = spawn("sleep", ["60"], { cwd: dir, detached: true, stdio: "ignore" });
+	server.unref();
+	await new Promise((r) => setTimeout(r, 300));
+	assert.ok((await straysIn(dir)).includes(server.pid));
+	const lines = [];
+	assert.equal(await killStrays(dir, (l) => lines.push(l), "A01"), 1);
+	await new Promise((r) => setTimeout(r, 300));
+	assert.equal((await straysIn(dir)).length, 0);
+	assert.match(lines[0], /CLEANUP A01 · stopped 1 process/);
+});
+
+test("with too little free memory no further item starts until running ones finish", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "A01", holdWorker: true }, { id: "B01" }, { id: "C01" }], { parallel: 3, minFreeMemoryGB: 1e9 });
+	f.start();
+	await f.wait(() => f.seen("A01", "coding"));
+	await new Promise((r) => setTimeout(r, 1500));
+	assert.equal(f.seen("B01", "coding"), false, "B01 waits while A01 runs");
+	f.release("worker-A01-1");
+	await f.wait(() => Object.keys(f.state().done ?? {}).length === 3);
+	assert.match(readFileSync(join(f.repo, ".pi-queue/log.md"), "utf8"), /MEMORY .* not starting more items/);
+});
+
+test("progress report: counts, pace, what needs you, and a loud line when the queue stopped", async (t) => {
+	const { progressReport } = await import("./extension.ts");
+	const root = fixture(t);
+	mkdirSync(join(root, ".pi-queue"), { recursive: true });
+	mkdirSync(join(root, ".tasks/sample"), { recursive: true });
+	writeFileSync(join(root, ".tasks/sample/items.md"), "- [ ] A01 — a. Done when: x. [areas: a]\n- [ ] B01 — b. Done when: x. [areas: b]\n- [ ] C01 — c. Done when: x. [areas: c]\n");
+	saveJson(join(root, ".pi-queue/config.json"), { task: "sample", queue: ".tasks/sample/items.md" });
+	const items = parseQueue(readFileSync(join(root, ".tasks/sample/items.md"), "utf8"));
+	saveJson(join(root, ".pi-queue/state.json"), { startedAt: 1, done: { [items[0].key]: "abc" }, failed: { [items[1].key]: "agent: BLOCKED: decision: which layout?" } });
+	const now = new Date().toISOString().slice(0, 16).replace("T", " ");
+	writeFileSync(join(root, ".pi-queue/log.md"), `- ${now} PASS A01 · abc\n- ${now} release B01 · out of automatic retries\n- ${now} END · passed 1\n`);
+	const r = progressReport(root);
+	assert.match(r.text, /1\/3 landed · 1 failed · 0 never started \(a prerequisite failed\) · 1 open/);
+	assert.match(r.text, /1 passed in the last hour/);
+	assert.match(r.text, /⚠ the queue is NOT running \(1 items open\)/);
+	assert.match(r.text, /Needs you: needs your decision: B01/);
+	assert.match(r.text, /release B01/);
+	assert.equal(r.urgent, true);
+});
+
+test("background pi: parallel RPC processes serve every item, turn and worktree, and none is left running", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "A01" }, { id: "A02" }, { id: "A03" }, { id: "A04", replies: ["DONE"], failChecks: [1] }, { id: "A05" }], { parallel: 1, fixRounds: 1 });
+	await f.start();
+	const starts = readFileSync(join(f.repo, "..", "rpc-starts"), "utf8").trim().split("\n").map(Number);
+	assert.equal(starts.length, 1, "parallel 1: one pi process serves both worktrees");
+	assert.equal(Object.keys(f.state().done).length, 5);
+	assert.ok(f.events().filter((e) => e.kind === "start" && e.phase === "coding").length >= 6, "the fix turn ran in the same process");
+	for (const pid of starts) assert.equal(pidAlive(pid), false, "the worker exits when the run ends");
+});
+
+test("paths, widenable and reworkable helpers", () => {
+	assert.deepEqual(mentionedPaths("edit apps/web/src/a.ts and ./pkg/b.go, see https://x.dev/a/b and v1/2"), ["apps/web/src/a.ts", "pkg/b.go"]);
+	assert.equal(widenable("apps/api/x.ts"), true);
+	for (const p of [".env", "apps/.env.local", ".github/workflows/ci.yml", "../x", "/etc/passwd", "config/secrets.json", "a/b.pem", ".pi-queue/state.json"]) assert.equal(widenable(p), false, p);
+	assert.equal(reworkable("agent: BLOCKED: out/x.txt does not exist"), true);
+	assert.equal(reworkable("check failed: go test ./..."), true);
+	for (const r of ["timed out after 40 min", "pi exited with an error (code 1)", "agent: BLOCKED: decision: which API?", "agent: BLOCKED: env: no docker", "needs you: reworked 2× and still failing", "stopped by request"]) assert.equal(reworkable(r), false, r);
+});
+
+test("full autonomy: a change that needs files outside the allowed paths is kept and the files are allowed, logged for review", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "A01", write: { "lib/helper.txt": 3 } }], { parallel: 1 });
+	await f.start();
+	const st = f.state(), key = f.items[0].key;
+	assert.ok(st.done[key], JSON.stringify(st.failed) + readFileSync(join(f.repo, ".pi-queue/log.md"), "utf8"));
+	assert.deepEqual(st.scope[key], ["lib/helper.txt"]);
+	assert.match(readFileSync(join(f.repo, ".pi-queue/decisions.md"), "utf8"), /Scope widened for this item: lib\/helper\.txt/);
+	assert.match(readFileSync(join(f.repo, ".pi-queue/log.md"), "utf8"), /SCOPE A01 · also allowed: lib\/helper\.txt/);
+	assert.equal(f.events().filter((e) => e.kind === "start" && e.id === "A01" && e.phase !== "check").length, 1, "no second session: the work was judged again\n" + readFileSync(join(f.repo, ".pi-queue/log.md"), "utf8"));
+	// ask: no widening; rework looks at it and gives up, so the failure says it needs you
+	const g = schedulerFixture(t, [{ id: "A01", write: { "lib/helper.txt": 3 } }], { parallel: 1, autonomy: "ask" });
+	await g.start();
+	assert.match(g.state().failed[g.items[0].key], /^needs you: no idea \(rework\) · files outside out: lib\/helper\.txt/);
+});
+
+test("a scope blocker outside item areas but within the task grant continues on the exact file", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "A01", replies: ["BLOCKED: `out/shared.txt` is outside the item's areas"], path: "out/shared.txt" }]);
+	await f.start();
+	const key = f.items[0].key;
+	assert.ok(f.state().done[key], JSON.stringify(f.state().failed));
+	assert.deepEqual(f.state().scope[key], ["out/shared.txt"]);
+	assert.match(f.prompt("A01", 2), /You may now also change: out\/shared\.txt/);
+	assert.ok(f.seen("A01", "check"));
+});
+
+test("a scope blocker cannot grant a protected path, a folder, or override a task opt-out", { timeout: 30000 }, async (t) => {
+	for (const [path, config] of [["out/.env.local", {}], [".tasks/sample", {}], ["out", {}], ["out/shared.txt", { widenScope: false }]]) {
+		const f = schedulerFixture(t, [{ id: "A01", replies: [`BLOCKED: scope: ${path}`] }], { rework: false, ...config });
+		await f.start();
+		assert.ok(f.state().failed[f.items[0].key], path);
+		assert.equal(f.prompt("A01", 2), "", path);
+	}
+});
+
+test("rework rewrites a failed item from the code, and the rewritten item runs instead of the old one", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "A01", replies: ["BLOCKED: out/config/settings.txt does not exist"], rework: ["REWRITE: Put the setting in out/A01.txt (there is no out/config). Done when: out/A01.txt has the setting. [areas: out/A01.txt]\nEvidence: ls out"] }], { parallel: 1 });
+	await f.start();
+	const st = f.state(), key = f.items[0].key;
+	assert.ok(st.done[key], JSON.stringify(st.failed));
+	assert.equal(st.reworks[key], 1);
+	assert.match(st.rewrites[key], /^A01 — Put the setting in out\/A01\.txt .*Done when: out\/A01\.txt has the setting\. \[areas: out\/A01\.txt\]/);
+	assert.match(f.prompt("A01", 2), /ITEM: A01 — Put the setting in out\/A01\.txt/);
+	assert.match(f.prompt("A01", 2), /## Rework \(fresh read-only session\)/, "the next worker sees the diagnosis");
+	assert.match(readFileSync(join(f.repo, ".pi-queue/log.md"), "utf8"), /REWORK A01 · agent: BLOCKED: out\/config\/settings\.txt does not exist → rewritten: Put the setting/);
+	assert.match(readFileSync(join(f.repo, ".pi-queue/decisions.md"), "utf8"), /Reworked after: agent: BLOCKED[\s\S]*Was: A01 — A01\.[\s\S]*Now: A01 — Put the setting/);
+});
+
+test("a missing file another open item provides makes the item wait for it, without a rework session", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "A01", replies: ["BLOCKED: out/B01.txt does not exist yet"] }, { id: "B01", holdWorker: true }], { parallel: 1 });
+	const done = f.start();
+	await f.wait(() => f.state().waitFor?.[f.items[0].key]?.includes("B01"));
+	f.release();
+	await done;
+	const st = f.state();
+	assert.equal(Object.keys(st.done).length, 2, JSON.stringify(st.failed));
+	assert.equal(existsSync(join(f.repo, "..", "reworks")), false, "no model session was needed");
+	assert.match(readFileSync(join(f.repo, ".pi-queue/log.md"), "utf8"), /REWORK A01 · .* → waits for B01 \(they provide out\/B01\.txt\)/);
+});
+
+test("rework is bounded: after maxReworks the item fails for you; GIVE UP fails it at once with the reason", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "A01", replies: ["BLOCKED: nope", "BLOCKED: still no", "BLOCKED: never"], rework: ["REWRITE: Try out/A01.txt. Done when: it exists. [areas: out/A01.txt]", "REWRITE: Try harder on out/A01.txt. Done when: it exists. [areas: out/A01.txt]"] }], { parallel: 1 });
+	await f.start();
+	const key = f.items[0].key;
+	assert.match(f.state().failed[key], /^needs you: reworked 2× and still failing · agent: BLOCKED: never/);
+	assert.equal(readFileSync(join(f.repo, "..", "reworks"), "utf8").trim().split("\n").length, 2);
+	const g = schedulerFixture(t, [{ id: "A01", replies: ["BLOCKED: the API key for the payment sandbox is not in the repo"], rework: ["GIVE UP: needs a sandbox key only you have"] }], { parallel: 1 });
+	await g.start();
+	assert.match(g.state().failed[g.items[0].key], /^needs you: needs a sandbox key only you have \(rework\)/);
+	// a rework that only repeats the item is not a rework
+	const h = schedulerFixture(t, [{ id: "A01", replies: ["BLOCKED: hmm"], rework: [`REWRITE: A01. Done when: verified. [areas: out/A01.txt]`] }], { parallel: 1 });
+	await h.start();
+	assert.match(h.state().failed[h.items[0].key], /could only repeat the item unchanged/);
+});
+
+// The six findings of a real V90 check (shapes kept, names shortened). Two valid four-file findings share one fixture:
+// the old merge turned them into one seven-file job in a task that allows five.
+const V90 = [
+	"Owner list reuses the shared table. Done when: the list renders from TableShell. [areas: apps/admin/src/owners/List.tsx, apps/admin/src/owners/Row.tsx, apps/admin/src/owners/index.ts, apps/admin/test/fixtures/admin.ts]",
+	"Invoice list reuses the shared table. Done when: invoices render from TableShell. [areas: apps/admin/src/invoices/List.tsx, apps/admin/src/invoices/Row.tsx, apps/admin/src/invoices/index.ts, apps/admin/test/fixtures/admin.ts]",
+	"Drop the duplicate date helper. Done when: one formatDate. [areas: apps/admin/src/lib/date.ts]",
+	"Receipt button label. Done when: the label reads Download receipt. [areas: apps/admin/src/receipts/Button.tsx]",
+	"Empty state copy. Done when: the empty state says No members yet. [areas: apps/admin/src/members/Empty.tsx]",
+	"Settings fixture is stale. Done when: the settings test passes. [areas: apps/admin/test/fixtures/settings.ts]",
+];
+
+test("V90 replay: no generated fix job exceeds the file limit, findings that share a fixture stay separate, none is dropped", () => {
+	const plan = planGapJobs(V90, { room: 3, maxFiles: 5, allowedPaths: ["apps/admin"] });
+	const files = (l) => l.match(/\[areas: ([^\]]+)\]/)[1].split(", ");
+	for (const job of [...plan.jobs, ...plan.leftover]) assert.ok(files(job).length <= 5, job);
+	assert.ok(!plan.jobs.some((j) => /Owner list/.test(j) && /Invoice list/.test(j)), "the two fixture-sharing findings are never one job");
+	const covered = [...plan.jobs, ...plan.leftover].join("\n");
+	for (const g of V90) assert.ok(covered.includes(g.split(". Done when")[0]), `dropped: ${g.slice(0, 40)}`);
+	assert.equal(plan.jobs.length, 3);
+	// with room for two jobs, the two four-file findings cannot absorb the rest: one waits for the next round
+	const tight = planGapJobs(V90, { room: 2, maxFiles: 5, allowedPaths: ["apps/admin"] });
+	assert.equal(tight.jobs.length, 2);
+	assert.ok(tight.leftover.length >= 1);
+	for (const job of [...tight.jobs, ...tight.leftover]) assert.ok(files(job).length <= 5, job);
+	// the two that share the fixture overlap, so they run one after the other, not at once
+	const owners = parseQueue(`- [ ] V90-fix1 — ${[...plan.jobs, ...plan.leftover].find((j) => /Owner list/.test(j))}`)[0];
+	const invoices = parseQueue(`- [ ] V90-fix2 — ${[...plan.jobs, ...plan.leftover].find((j) => /Invoice list/.test(j))}`)[0];
+	assert.equal(areasOverlap(owners.areas, invoices.areas), true);
+	// outside the allowed paths, or without areas: rejected before any worker, with the reason
+	const bad = planGapJobs(["Fix CI. Done when: green. [areas: .github/workflows/ci.yml]", "Fix it. Done when: ok."], { room: 3, maxFiles: 5, allowedPaths: ["apps/admin"] });
+	assert.deepEqual(bad.jobs, []);
+	assert.deepEqual(bad.rejected.map((r) => r.why), ["outside the allowed paths: .github/workflows/ci.yml", "no [areas: …]"]);
+	// one finding that alone needs more files starts at what it needs, never by merging
+	const big = planGapJobs(["Rename across six. Done when: done. [areas: a/1.ts, a/2.ts, a/3.ts, a/4.ts, a/5.ts, a/6.ts]"], { room: 3, maxFiles: 5 });
+	assert.match(big.jobs[0], /\[files=6\]$/);
+});
+
+test("admission: generated jobs need Done when, areas in scope, a file count within the limit, resolvable checks and known prerequisites", () => {
+	const c = { ...DEFAULTS, allowedPaths: ["apps/admin"], checks: ["git diff --check"], itemChecks: { V90: ["pnpm --filter admin test"] } };
+	const items = parseQueue("- [ ] V90 — check. Done when: x. [areas: apps/admin] [check]");
+	assert.equal(admissionProblem("V90-fix1 — Fix a. Done when: ok. [areas: apps/admin/a.ts]", c, items), undefined);
+	assert.equal(itemConfig(c, parseQueue("- [ ] V90-fix1 — Fix a. Done when: ok. [areas: apps/admin/a.ts]")[0]).checks.at(-1), "pnpm --filter admin test", "the fix uses V90's focused checks");
+	assert.match(admissionProblem("X01-fix1 — Fix a. Done when: ok. [areas: apps/admin/a.ts]", c, items), /focused itemChecks/);
+	assert.match(admissionProblem("V90-fix1 — Fix a. [areas: apps/admin/a.ts]", c, items), /no "Done when"/);
+	assert.match(admissionProblem("V90-fix1 — Fix a. Done when: ok. [areas: apps/web/a.ts]", c, items), /outside the allowed paths/);
+	assert.match(admissionProblem(`V90-fix1 — Fix a. Done when: ok. [areas: ${Array.from({ length: 7 }, (_, i) => `apps/admin/f${i}.ts`).join(", ")}]`, c, items), /names 7 files, more than its limit of 5/);
+	assert.equal(admissionProblem(`V90-fix1 — Fix a. Done when: ok. [areas: ${Array.from({ length: 7 }, (_, i) => `apps/admin/f${i}.ts`).join(", ")}] [files=7]`, c, items), undefined);
+	assert.match(admissionProblem("V90-fix1 — Fix a. Done when: ok. [areas: apps/admin/a.ts] [after: Z09]", c, items), /unknown items: Z09/);
+	assert.match(admissionProblem("V90 — again. Done when: ok. [areas: apps/admin/a.ts]", c, items), /already used/);
+	assert.deepEqual(checkOwners("V90a-fix1"), ["V90a-fix1", "V90a", "V90"]);
+});
+
+test("a [check] whose findings go through the queue: every fix job is within limits, and the check passes only after all of them", { timeout: 30000 }, async (t) => {
+	const gaps = ["GAP: First. Done when: a. [areas: out/a1.txt, out/a2.txt, out/a3.txt, out/fixture.txt]", "GAP: Second. Done when: b. [areas: out/b1.txt, out/b2.txt, out/b3.txt, out/fixture.txt]", "GAP: Third. Done when: c. [areas: out/c.txt]"];
+	const f = schedulerFixture(t, [{ id: "V90", check: true, area: "out", replies: [gaps.join("\n"), "DONE"] }], { parallel: 2, maxGapItems: 3 });
+	await f.start();
+	const st = f.state(), v90 = f.items[0];
+	const fixes = st.fixes[v90.key].map((l) => parseQueue(l)[0]);
+	assert.equal(fixes.length, 3);
+	for (const fx of fixes) assert.ok(fx.areas.length <= 5, fx.line);
+	const all = allItems(readFileSync(join(f.repo, ".tasks/sample/items.md"), "utf8"), st);
+	assert.ok(all.every((i) => st.done[i.key]), JSON.stringify(st.failed));
+	const ev = f.events();
+	const lastFix = Math.max(...fixes.map((fx) => ev.findLastIndex((e) => e.id === fx.id && e.kind === "end")));
+	assert.ok(ev.findLastIndex((e) => e.id === "V90" && e.kind === "start" && e.phase !== "check") > lastFix, "V90 checks again after every fix");
+});
+
+test("[produces]: passing checks without the declared output is not a pass, and the item that needs it never starts", { timeout: 30000 }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "B01", tags: "[produces: out/B01-baseline.md]", area: "out" }, { id: "T00", after: "B01" }], { parallel: 1, fixRounds: 1 });
+	await f.start();
+	const st = f.state(), [b01, t00] = f.items;
+	assert.match(st.failed[b01.key], /required output missing: out\/B01-baseline\.md|needs you: .*required output missing/);
+	assert.equal(st.failed[t00.key], "depends on B01, which failed");
+	assert.equal(f.events().some((e) => e.id === "T00"), false, "no worker spent on T00");
+	assert.match(runReport(allItems(readFileSync(join(f.repo, ".tasks/sample/items.md"), "utf8"), st), st), /\*\*0 landed\*\* · \*\*1 failed\*\* \(1 need you\) · \*\*1 never started\*\*/);
+	// once B01 no longer fails, T00 opens again by itself
+	delete st.failed[b01.key];
+	st.done[b01.key] = "abc";
+	assert.deepEqual(reopenDependents(st, allItems(readFileSync(join(f.repo, ".tasks/sample/items.md"), "utf8"), st)), ["T00"]);
+	assert.equal(st.failed[t00.key], undefined);
+	// with the output written, it passes and its consumer runs
+	const g = schedulerFixture(t, [{ id: "B01", tags: "[produces: out/B01-baseline.md]", area: "out", write: { "out/B01-baseline.md": 3 } }, { id: "T00", after: "B01" }], { parallel: 1 });
+	await g.start();
+	assert.equal(Object.keys(g.state().done).length, 2, JSON.stringify(g.state().failed));
+});
+
+// Review regressions: executable TODOs until the runner enforces these contracts.
+test("review: V90 cannot land while a reported finding has no job", { todo: "A0: a count does not preserve the leftover finding" }, async (t) => {
+	const gap = (p) => `GAP: Repair ${p}. Done when: corrected. [areas: out/${p}1.txt, out/${p}2.txt, out/${p}3.txt]`;
+	const f = schedulerFixture(t, [{ id: "V90", check: true, area: "out", replies: [[gap("a"), gap("b")].join("\n"), "DONE"] }], { parallel: 1, maxGapItems: 1, maxFilesGrowing: 5 });
+	await f.start();
+	const st = f.state(), key = f.items[0].key;
+	assert.ok(!st.done[key] || st.fixes[key].some((line) => line.includes("out/b1.txt")), "V90 passed without ever scheduling finding b");
+});
+
+test("review: a rejected first-round finding does not take its valid sibling down", { todo: "A1: notes directory does not exist yet" }, async (t) => {
+	const f = schedulerFixture(t, [{ id: "V90", check: true, area: "out", replies: ["GAP: Fix A. Done when: verified. [areas: out/a.txt]\nGAP: Needs scope. Done when: verified. [areas: other/b.txt]", "DONE"] }], { parallel: 1 });
+	await f.start();
+	assert.ok(f.seen("V90-fix1", "coding"), "the admitted sibling never ran");
+});
+
+test("an old config updates once when idle, preserving choices, backup and effective approval", async (t) => {
+	const { updateQueueConfig } = await import("./extension.ts");
+	const { approvedTask, readConfig } = await import("./runner.mjs");
+	const repo = fixture(t), dir = join(repo, ".pi-queue"), plan = join(repo, ".tasks/sample");
+	mkdirSync(dir); mkdirSync(plan, { recursive: true });
+	const config = join(dir, "config.json"), original = { task: "sample", queue: ".tasks/sample/items.md", allowedPaths: ["src"], checks: ["true"], setup: "", parallel: 2, copyFromRepo: ["local.json"], legacyKey: true };
+	for (const name of ["brief.md", "rules.md", "items.md", "questions.md"]) writeFileSync(join(plan, name), "");
+	saveJson(join(plan, "task.json"), { ...original, status: "queued", queuedAt: "today" });
+	saveJson(config, original);
+	const before = readFileSync(config, "utf8"), approval = approvedTask(repo, readConfig(repo));
+	assert.ok(approval);
+	writeFileSync(join(dir, "runner.pid"), `${process.pid}`);
+	updateQueueConfig(repo); assert.equal(readFileSync(config, "utf8"), before);
+	rmSync(join(dir, "runner.pid")); updateQueueConfig(repo); updateQueueConfig(repo);
+	assert.equal(readFileSync(`${config}.bak-unversioned`, "utf8"), before);
+	assert.deepEqual(loadJson(config, {}), { ...loadJson(config, {}), ...original, configVersion: 1, workerMode: "rpc" });
+	assert.equal(approvedTask(repo, readConfig(repo)), approval);
+	assert.equal(readFileSync(join(dir, "log.md"), "utf8").match(/Unrecognized keys retained: legacyKey/g)?.length, 1);
+});
+
+test("review: handoff validates the planned itemChecks before running baseline commands", { todo: "A1: handoff validates the old config, not task.itemChecks" }, async (t) => {
+	const { handoff } = await import("./extension.ts");
+	const repo = fixture(t), dir = join(repo, ".tasks/sample");
+	mkdirSync(dir, { recursive: true });
+	for (const f of ["brief.md", "rules.md", "questions.md"]) writeFileSync(join(dir, f), "");
+	writeFileSync(join(dir, "items.md"), `- [ ] ${item().line}`);
+	saveJson(join(dir, "task.json"), { allowedPaths: ["src"], checks: ["false"], itemChecks: { B01: ["true"] } });
+	const result = await handoff(repo, "sample", {});
+	assert.match(result.text, /A01: missing or invalid focused itemChecks/);
+});
+
+test("amend: one item gets exact extra files or new text without editing the plan; its key, dependents and history stay", () => {
+	const items = parseQueue("- [ ] O29 — Fix it. Done when: ok. [areas: apps/web/a.ts]\n- [ ] O30 — Use it. Done when: ok. [areas: apps/web/b.ts] [after: O29]");
+	const state = { done: {}, failed: { [items[0].key]: "agent: BLOCKED: also needs apps/web/a.test.ts", [items[1].key]: "depends on O29, which failed" }, running: {}, reworks: { [items[0].key]: 2 } };
+	assert.deepEqual(applyControl(state, items, { action: "amend", ids: ["O29"], paths: ["apps/web/a.test.ts", ".env"], by: "user" }), ["O29", "O30"]);
+	assert.deepEqual(state.scope[items[0].key], ["apps/web/a.test.ts"], ".env is never added");
+	assert.equal(state.failed[items[0].key], undefined);
+	assert.equal(state.reworks[items[0].key], undefined);
+	assert.equal(state.failed[items[1].key], undefined, "the dependent waits again instead of staying failed");
+	applyControl(state, items, { action: "amend", ids: ["O29"], line: "Fix it and its test. Done when: ok. [areas: apps/web/a.ts, apps/web/a.test.ts]", by: "user" });
+	const now = allItems(items.map((i) => `- [ ] ${i.line}`).join("\n"), state);
+	assert.equal(now[0].key, items[0].key);
+	assert.match(now[0].line, /^O29 — Fix it and its test/);
+	assert.deepEqual(applyControl(state, items, { action: "amend", ids: ["O29"], line: "no done-when here", by: "user" }), [], "an amendment without Done when changes nothing");
 });

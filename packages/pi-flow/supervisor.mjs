@@ -5,7 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { DIR, TRANSIENT, DECISION, acquireProcessLock, allItems, approvedTask, enqueueControl, ensureDir, findPiWeb, loadJson, piTurn, pidAlive, readConfig, resolvePi, saveJson, validateRecovery, webClient, webTurn } from "./runner.mjs";
+import { DIR, TRANSIENT, DECISION, reworkable, acquireProcessLock, allItems, approvedTask, enqueueControl, ensureDir, findPiWeb, loadJson, piTurn, pidAlive, readConfig, resolvePi, saveJson, validateRecovery, webClient, webTurn } from "./runner.mjs";
 
 export { approvedTask };
 
@@ -214,13 +214,41 @@ export async function supervise(repo, { tickMs = HEALTH_TICK_MS, reviewBackoffMs
 				enqueueControl(repo, control);
 				log(`retry ${item.id} · ${reason}`);
 			};
+			// One stuck item must not end the night: once it will not be retried any more, what waits on it runs anyway
+			// (told that it failed). Not for missing environment or credentials: its dependents would hit the same wall.
+			const releaseHeld = (item, failure) => {
+				const holdsUp = items.some((d) => d !== item && (d.after ?? []).some((a) => a === item.id || (item.child && item.id.startsWith(a))));
+				if (!holdsUp || c.releaseDependents === false || c.autonomy === "ask" || state.released?.[item.key] || manager.released?.[item.id] || /BLOCKED: env\b|credentials?|permission denied|not authorized/i.test(failure)) return false;
+				manager.released = { ...(manager.released ?? {}), [item.id]: true };
+				const control = { task: c.task, by: "auto", approval, action: "release", ids: [item.id], failures: { [item.id]: failure }, reason: "out of automatic retries; dependents run without it" };
+				manager.dispatches.push({ control, launched: false });
+				save();
+				enqueueControl(repo, control);
+				log(`release ${item.id} · out of automatic retries · items waiting on it run anyway`);
+				return true;
+			};
 			if (health === "failed") {
 				let dispatched = false;
 				for (const item of items) {
 					if (!state.failed?.[item.key] || manager.dispatches.some(({ control }) => control.ids.includes(item.id))) continue;
-					const decision = c.autonomy === "full" && DECISION.test(state.failed[item.key]);
+					const failure = state.failed[item.key];
+					const decision = c.autonomy === "full" && DECISION.test(failure);
+					let admitted = true;
 					try { validateProposal(decision ? { action: "decide", ids: [item.id], answer: "Admission check only." } : { action: "retry", ids: [item.id], reason: "Admission check" }, state, items, manager, health, c); }
-					catch { continue; } // no model turns for blockers, active/quarantined or exhausted targets
+					catch (e) {
+						// No model turns for blockers, active/quarantined or exhausted targets.
+						if (/recovery budget exhausted|needs human attention/.test(e.message) && releaseHeld(item, failure)) dispatched = true;
+						admitted = false;
+					}
+					if (!admitted) continue;
+					// The runner reworks failed items itself (a fresh look at the code that rewrites the item). A model review here
+					// could only retry the item unchanged, so there is none: one plain retry if the rework never ran, then release.
+					if (c.rework !== false && !decision && !TRANSIENT.test(failure)) {
+						if (reworkable(failure) && (state.reworks?.[item.key] ?? 0) < (c.maxReworks ?? 2)) dispatchRetry(item, "run it again; if it fails the runner reworks it");
+						else if (!releaseHeld(item, failure)) continue;
+						dispatched = true;
+						continue;
+					}
 					const token = hash([item.key, state.failed[item.key], manager.attempts[item.id] ?? 0]);
 					if (c.retryTransient !== false && TRANSIENT.test(state.failed[item.key])) { dispatchRetry(item, "transient failure (timeout, session or provider error): run it again"); dispatched = true; continue; }
 					if (!decision && c.retryTransient !== false && (manager.reviews[token]?.count ?? 0) >= MAX_REVIEW_ATTEMPTS && !manager.reviews[token]?.done) {

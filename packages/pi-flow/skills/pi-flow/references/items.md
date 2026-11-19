@@ -15,7 +15,8 @@
 | Tag | Meaning |
 |---|---|
 | `[areas: a, b]` | folders/files the item changes. Items with overlapping areas never run at the same time; disjoint ones run in parallel. Required. |
-| `[after: A01, A02]` | wait until these pass. If one fails, this item fails without running. `[after: *]` waits for everything else. |
+| `[after: A01, A02]` | wait until these pass. If one fails, this item does not start ("never started", not a failure) and opens again by itself once it passes. `[after: *]` waits for everything else. |
+| `[produces: docs/baseline.md]` | a file later items read. The item passes only when it exists (passing checks are not enough, also for a no-change [check]); items after it do not start without it. Must be inside its own `[areas]`. |
 | `[check]` | a verification item (see below) |
 | `[big]` | start at the `big` limits (15 files / 600 lines / 90 min) |
 | `[files=12 lines=400 min=60]` | start at these limits |
@@ -78,3 +79,7 @@ Everything the queue adds by itself (split parts beyond their parent, gap fixes,
 - The handoff lints the plan and refuses it until findings are fixed or `"planLint": "accept: <reason>"` is set: items to merge, an item naming another without `[after]`, and areas so broad that the plan runs one at a time.
 - No items that only investigate or review: every item builds something or is a `[check]`.
 - No item may depend on an unanswered question.
+
+## Read-only items
+
+`[readonly]` marks an item that changes no files: an audit, an investigation, a review. It takes no area locks, so any number run at once. It passes with no changes, and its findings (the reply after DONE) are saved to `.pi-queue/reports/<id>.md` and given to every item with `[after: <id>]`. Plan audit-then-fix as read-only audits followed by fix items that wait on them.

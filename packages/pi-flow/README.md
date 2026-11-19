@@ -138,7 +138,7 @@ Your own edits are kept across tasks. Useful ones:
 
 | Setting | Default | |
 |---|---|---|
-| `parallel` | from the plan | ceiling for each of coding and verification in worktree mode |
+| `parallel` | from the plan | the number of agent sessions at once (coding and `[check]` sessions together), and of background pi processes |
 | `parallelStart` / `parallelMin`, `adaptive` | 0 / 1, true | optional lower starting width; clean passes ramp up, conflicts never narrow the whole queue |
 | `model`, `thinking` | Pi default, high | default model for item sessions and the isolated manager |
 | `manager` | true | automatic bounded supervision after approved handoff; false disables it |
@@ -152,6 +152,12 @@ Your own edits are kept across tasks. Useful ones:
 | `gapRounds` | 2 | fix rounds a [check] may trigger |
 | `deleteSessions` | `"end"` | `"pass"` deletes right after each pass, `"archive"` archives in Pi Web, `false` keeps them |
 | `runIn` | `"auto"` | items as Pi Web sessions when Pi Web runs, else background `pi`; `"web"`/`"cli"` force one |
+| `workerMode` | `"rpc"` | background pi: `parallel` long-lived `pi --mode rpc` processes serve every item, turn and worktree. `"json"`: a new pi process per turn (old, heavy) |
+| `workerMcp` | false | MCP servers in item workers. Off: each worker would connect all of them, and some start a browser |
+| `workerRecycle` | 20 | a background pi process is replaced after this many item sessions |
+| `subagents` | false | let item workers start subagents (each is another pi process) |
+| `rework`, `maxReworks` | true, 2 | a failed item gets a fresh read-only look at the code that rewrites it, makes it wait for what it lacks, or gives up with the reason; never the same item again unchanged |
+| `widenScope`, `widenMax` | true, 12 | full autonomy: an item that needs a few files outside `allowedPaths` gets them (never `.env`, secrets, CI workflows, `.git`); logged in `decisions.md` |
 | `copyFromRepo` | [] | git-ignored files (`.env.local`) copied into each worktree |
 | `checkBroker` | auto | `false`: run checks directly even when pi-check is installed |
 

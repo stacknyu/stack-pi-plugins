@@ -1,5 +1,50 @@
 # pi-flow changelog
 
+## 1.11.1
+
+- Existing repositories get a one-time, no-prompt config update when idle. The original is backed up in `.pi-queue/config.json.bak-unversioned`; existing settings, including an explicit empty install command, are kept. New defaults and unknown keys are recorded in the queue log. The schema marker does not change task approval; an already outdated approval is never silently replaced.
+- Full-autonomy workers can continue with a named extra file when the task allows it but the item's original file list missed it. Protected files and project checks still apply.
+
+## 1.11.0
+
+From the feedback of two long real runs (1.8.2): pi-flow must refuse its own invalid jobs before a worker is spent on them.
+
+- **Generated fix jobs never exceed the file limit.** A [check]'s findings become one job each. Findings are merged only to fit the round's room, and only while the merged job stays within the task's `maxFilesGrowing`; findings that share a file (a test fixture) stay separate jobs and run one after the other. Before, two four-file findings that shared a fixture became one seven-file job in a five-file task. Findings that do not fit wait for the next round (that round does not count against `gapRounds`), never dropped. A single finding that needs more files starts at what it needs (`[files=n]`). Regression test: the six V90 findings.
+- **One admission check for every generated job** (gap fixes, split parts): Done when, areas inside the allowed paths, file count within its limit, focused checks that resolve, known prerequisites, an unused id. A rejected finding is logged (`REJECTED`) with the reason and written to the item's notes; its valid siblings still run, and the check stays open until every finding is resolved. A split is admitted all or nothing.
+- **Generated items use their parent's focused checks.** `V90-fix1`, `A01-repair2`, `A01a-fix1` resolve `itemChecks` through the items they came from. Before, they failed before coding with "missing focused itemChecks".
+- **`[produces: <path>]`: passing checks are not the result.** An item that declares an output passes only when the file exists, a no-change [check] included. An item whose prerequisite passed but whose declared output is not in the checkout does not start (it needs you). Handoff rejects outputs outside the item's own areas.
+- **Items that never started are not failures.** They are reported as "never started (a prerequisite failed)", and they open again by themselves as soon as the prerequisite passes, after a rework or a retry, not only on a manual retry (`REOPENED` in the log).
+- **`amend`** (manager tool and `/queue`): give one item exact extra files and/or corrected text without editing `items.md`. Its id, state, dependents and the approval stay; it runs again. `.env`, secrets and CI workflows are never added.
+- **Handoff shows the effective settings and where each came from:** setup (or "none"), worktrees, how items run, recovery, and everything kept from the previous run's config.
+- **Progress posts** say what landed, what failed, what never started, the root blockers and how many items each holds up, and for each running item whether it is coding or in checks and how long since its last real event.
+- Planner: declare `[produces]` for files later items read; keep task `checks` fast, give items focused `itemChecks`, and put full suites on milestone [check] items every 15–25 items; list protected behaviours in the brief (workers are told never to remove them).
+- Fix: changing `parallel` while the queue runs now also resizes the background pi pool (1.10).
+
+## 1.10.0
+
+The two things that made unattended runs unusable: a fixer that only retried, and a new pi for every turn.
+
+- **Failed items are reworked, never retried unchanged.** A fresh read-only session reads the code and the failure and rewrites the item: the real file paths, a Done when the code can meet, the files it must also change. Or it makes the item wait for the open item that provides what it lacks, or gives up with the reason (`rework`, `maxReworks: 2`). The next worker gets the rewritten item plus the diagnosis. Rewrites keep the item's id, model/tier and limit tags, and are logged in `decisions.md`. A rework that only repeats the item counts as giving up.
+- **Missing files are waited for, not retried.** When an item is BLOCKED on files that do not exist and an open item names them, it waits for exactly that item right away, with no session and no deferral to the end of the queue.
+- **Files outside the allowed paths.** Under full autonomy, a change that also touches a few files outside `allowedPaths` is kept and those files are allowed for the item (`widenScope`, at most `widenMax: 12`; never `.env`, secrets, keys, CI workflows, `.git`, `.pi-queue`, `.tasks`). A worker that stopped because it needed such files is told it may change them and continues in the same session. Each widening is logged in `decisions.md`.
+- **The supervisor no longer asks a model to retry.** With rework on, a failure gets at most one plain retry if the rework never ran; once rework is exhausted or gave up, the failure reads `needs you: …` and the items waiting on it are released. `rework: false` brings back the model review.
+- **No new pi process per turn.** Background items (no Pi Web) run on `parallel` long-lived `pi --mode rpc` processes shared by every item, turn and worktree: a session's tools run in the worktree its session file names, so one process serves any slot. Processes are replaced after `workerRecycle: 20` sessions and closed when the run ends. `workerMode: "json"` restores the old behaviour.
+- **Lean workers.** Item workers start without MCP servers (`workerMcp: true` to keep them; every worker used to connect all of them, and some start a browser) and are told not to start subagents (`subagents: true` to allow).
+- **`parallel` means agent sessions.** Coding turns and `[check]` sessions together never exceed `parallel` (it used to be up to `parallel` of each, so 2× the agents). Plain check commands still run alongside.
+- Tested against the real Pi 1.5.0 CLI (`realpi.test.mjs`): RPC protocol, session switching across worktrees, tool writes landing in the right worktree, rework, process count and cleanup.
+
+## 1.9.0
+
+Fixes for what broke unattended runs in practice.
+
+- **Your parallelism is the ceiling.** Handoff no longer lets the plan's `parallel` replace yours (a planner's 2 overrode a configured 20). The planner is told to leave it out unless you gave a number.
+- **Read-only items** (`[readonly]`): audits and investigations lock no areas, so any number run at once; they pass without changes, their findings are saved to `.pi-queue/reports/<id>.md` and given to every item with `[after]` on them. Changing a file fails them.
+- **One stuck item no longer ends the night.** When a failed item is out of automatic retries, the supervisor releases it: items waiting on it run anyway and are told it failed. Not for environment, credential or scope failures, and not with `autonomy: "ask"` (`releaseDependents: false` to opt out). WAITING on an item that already failed is BLOCKED at once instead of re-running.
+- **Retries run stronger.** A retried item (not a timeout or provider error) uses the plan's heavy tier if it has one, high reasoning effort and 1.5× the time.
+- **Repair budget grows with the queue:** at least 5% of the items (up to 10%), and at least 3 restarts.
+- **No more runaway RAM.** Workers are told to stop every server, emulator and watcher they start. After each item, processes still running inside its worktree are stopped, and iOS simulators booted during the run are shut down once nothing else runs (`killStrays: false` to opt out). No new item starts while less than `minFreeMemoryGB` is available (default max(4 GB, 12% of RAM)).
+- **The planning chat is the control room.** After handoff it acts as the manager (rules plus a fresh queue overview on every turn), and it posts a progress report every `progressMinutes` (20) without waking the model: counts, pace, ETA, what needs you, recent automatic actions; immediately when the queue stops or something needs you.
+
 ## 1.8.2
 
 Fixes from an independent review of 1.8.0/1.8.1.

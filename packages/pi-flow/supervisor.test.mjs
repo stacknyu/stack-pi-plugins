@@ -17,7 +17,7 @@ function fixture(t, mode = "recover") {
 	mkdirSync(join(repo, ".tasks", "sample"), { recursive: true });
 	mkdirSync(join(repo, ".pi-queue"));
 	writeFileSync(join(repo, ".gitignore"), ".pi-queue/\n");
-	const c = { ...DEFAULTS, task: "sample", queue: ".tasks/sample/items.md", checks: ["git diff --check"], checkBroker: false, allowedPaths: ["out"], model: "example/small", thinking: "off", runIn: "cli", retryTransient: false, outageMinutes: 0, autonomy: "ask", parallel: 1, setup: "", autoSplit: false, deferBlocked: false, fixRounds: 0, deleteSessions: false, piCommand: join(home, "fake-pi") };
+	const c = { ...DEFAULTS, task: "sample", queue: ".tasks/sample/items.md", checks: ["git diff --check"], checkBroker: false, allowedPaths: ["out"], model: "example/small", thinking: "off", runIn: "cli", retryTransient: false, outageMinutes: 0, autonomy: "ask", parallel: 1, setup: "", autoSplit: false, deferBlocked: false, fixRounds: 0, deleteSessions: false, piCommand: join(home, "fake-pi"), workerMode: "json", rework: false };
 	for (const f of ["brief.md", "rules.md", "questions.md"]) writeFileSync(join(repo, ".tasks/sample", f), "Approved fixture\n");
 	writeFileSync(join(repo, c.queue), "- [ ] A01 — Write out/a.txt. Done when: created. [areas: out]\n");
 	saveJson(join(repo, ".tasks/sample/task.json"), { status: "queued", queuedAt: "2026-01-01", allowedPaths: c.allowedPaths, checks: c.checks });
@@ -595,4 +595,56 @@ test("retry/limits/skip start the queue, but never over a pause", { timeout: 300
 	assert.match(await control(repo, { action: "retry", ids: ["A01"] }), /applies on the next start/);
 	assert.match(await control(repo, { action: "next", ids: ["A01"] }), /applies on the next start/);
 	assert.equal(existsSync(join(repo, ".pi-queue/supervisor.pid")), false);
+});
+
+test("an item that is out of retries no longer ends the night: items waiting on it run anyway, told it failed", { timeout: 30000 }, async (t) => {
+	const { repo, c, git, state } = fixture(t);
+	Object.assign(c, { autonomy: "full", allowedPaths: ["out", "other"], recovery: { maxAttempts: 0, maxRepairs: 0, maxRestarts: 2 } });
+	writeFileSync(join(repo, c.queue), "- [ ] A01 — Write out/a.txt. Done when: created. [areas: out]\n- [ ] B01 — Write other/b.txt. Done when: created. [areas: other] [after: A01]\n");
+	saveJson(join(repo, ".tasks/sample/task.json"), { status: "queued", queuedAt: "2026-01-01", allowedPaths: c.allowedPaths, checks: c.checks, recovery: c.recovery });
+	saveJson(join(repo, ".pi-queue/config.json"), c);
+	writeFileSync(c.piCommand, `#!/usr/bin/env node
+const fs=require("fs"),path=require("path"),prompt=process.argv.at(-1);
+let text;
+if(prompt.includes("ITEM: A01")) text="BLOCKED: the plan contradicts the code";
+else { fs.mkdirSync("other",{recursive:true}); fs.writeFileSync(path.join("other","b.txt"), prompt.includes("prerequisites FAILED") ? "without A01\\n" : "?\\n"); text="DONE"; }
+console.log(JSON.stringify({type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text}]}}));
+`, { mode: 0o755 });
+	git("add", "."); git("commit", "-m", "two items");
+	await supervise(repo, { tickMs: 20 });
+	const items = allItems(readFileSync(join(repo, c.queue), "utf8"), state());
+	assert.match(state().failed[items[0].key], /BLOCKED/);
+	assert.ok(state().done[items[1].key], readFileSync(join(repo, ".pi-queue/log.md"), "utf8"));
+	assert.equal(git("show", "main:other/b.txt"), "without A01\n");
+	assert.match(readFileSync(join(repo, ".pi-queue/log.md"), "utf8"), /release A01 · out of automatic retries/);
+});
+
+test("default rework: a failed item is reworked by the runner; the supervisor never asks a model to retry it unchanged, and releases what waits on it", { timeout: 60000 }, async (t) => {
+	const { repo, c, git, state, count } = fixture(t);
+	Object.assign(c, { autonomy: "full", rework: true, allowedPaths: ["out", "other"], recovery: { maxAttempts: 2, maxRepairs: 0, maxRestarts: 2 } });
+	writeFileSync(join(repo, c.queue), "- [ ] A01 — Write out/a.txt. Done when: created. [areas: out]\n- [ ] B01 — Write other/b.txt. Done when: created. [areas: other] [after: A01]\n");
+	saveJson(join(repo, ".tasks/sample/task.json"), { status: "queued", queuedAt: "2026-01-01", allowedPaths: c.allowedPaths, checks: c.checks, recovery: c.recovery });
+	saveJson(join(repo, ".pi-queue/config.json"), c);
+	writeFileSync(c.piCommand, `#!/usr/bin/env node
+const fs=require("fs"),path=require("path"),repo=${JSON.stringify(repo)},prompt=process.argv.at(-1),name=process.argv[process.argv.indexOf("-n")+1]||"";
+const bump=(n)=>{const f=path.join(repo,".pi-queue",n);const k=fs.existsSync(f)?Number(fs.readFileSync(f)):0;fs.writeFileSync(f,String(k+1));return k+1;};
+let text;
+if(process.argv.includes("--no-tools")){bump("manager-count");text='CONTROL: {"action":"retry","ids":["A01"],"reason":"same again"}';}
+else if(name.startsWith("rework A01")){const k=bump("rework-count");text=k===1?"REWRITE: Write out/a.txt with the header the code expects. Done when: out/a.txt exists. [areas: out/a.txt]":"GIVE UP: the plan contradicts the code";}
+else if(prompt.includes("ITEM: A01")){bump("a-count");text="BLOCKED: the plan contradicts the code";}
+else { fs.mkdirSync("other",{recursive:true}); fs.writeFileSync(path.join("other","b.txt"), prompt.includes("prerequisites FAILED") ? "without A01\\n" : "?\\n"); text="DONE"; }
+console.log(JSON.stringify({type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text}]}}));
+`, { mode: 0o755 });
+	git("add", "."); git("commit", "-m", "two items");
+	await supervise(repo, { tickMs: 20 });
+	const items = allItems(readFileSync(join(repo, c.queue), "utf8"), state());
+	const log = readFileSync(join(repo, ".pi-queue/log.md"), "utf8");
+	assert.equal(count("manager"), 0, "no model review");
+	assert.equal(count("rework"), 2, log);
+	assert.match(state().failed[items[0].key], /^needs you: the plan contradicts the code \(rework\)/);
+	assert.match(state().rewrites[items[0].key], /header the code expects/);
+	assert.ok(state().done[items[1].key], log);
+	assert.equal(git("show", "main:other/b.txt"), "without A01\n");
+	assert.match(log, /REWORK A01 · agent: BLOCKED: the plan contradicts the code → rewritten/);
+	assert.match(log, /release A01 · out of automatic retries/);
 });

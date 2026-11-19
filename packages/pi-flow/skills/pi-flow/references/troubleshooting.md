@@ -43,3 +43,11 @@ The checks fail on today's code, so every item would fail. `/queue problem` show
 **An overnight run stopped early.** Read `/queue report`. What is listed under "needs your decision" or "needs environment" could not be decided by the queue: answer with `/queue answer <id> <text>` (the queue starts again by itself). "interrupted workers remain" only appears now when a worker is still running and could not be stopped; stop that session and `/queue start`.
 
 **Many tiny items, each a full session on the strongest model.** A planning defect. The handoff now refuses plans with mergeable items; define `"tiers"` in `task.json` and tag mechanical items `[tier: light]`.
+
+**Only a few items run although `parallel` is high.** Check `/queue status` for MEMORY lines (not enough free RAM) and for items whose `[areas]` overlap. Audits should be `[readonly]`, which lock nothing. The plan cannot lower your `parallel` any more.
+
+**RAM fills up during a run.** 1.9 stops processes left running in each item's worktree after the item and shuts down simulators it booted, and holds new items while memory is low (`minFreeMemoryGB`).
+
+**Without Pi Web, every item started a whole new pi.** Before 1.10, background items started a new `pi` process for every turn, loading every extension and connecting every MCP server each time (some start a browser). Since 1.10 `parallel` long-lived `pi --mode rpc` processes serve all items, turns and worktrees, item workers start without MCP servers (`workerMcp: true` turns them back on) and without subagents (`subagents: true`), and never more than `parallel` agent sessions run at once. `workerMode: "json"` restores the old behaviour.
+
+**The fixer kept retrying the same failing item.** Since 1.10 a failed item is reworked from the code instead (see the manager reference). Look for `REWORK` and `SCOPE` lines in the log and the rewrites in `.pi-queue/decisions.md`.

@@ -6,15 +6,16 @@
 // Each item: its own git worktree + a fresh `pi -p` process. The runner (never the agent) checks
 // scope, size and the check commands. Passing items are rebased onto the branch, re-checked,
 // and fast-forwarded in one at a time. Failed work is kept on queue-failed/<id>.
-import { spawn, execFile } from "node:child_process";
+import { spawn, execFile, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, appendFileSync, rmSync, cpSync, openSync, closeSync, renameSync, lstatSync, readlinkSync, realpathSync, symlinkSync } from "node:fs";
 import { join, isAbsolute, basename, dirname, posix } from "node:path";
-import { homedir } from "node:os";
+import { totalmem, freemem, homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 
 export const DIR = ".pi-queue";
 
 export const DEFAULTS = {
+	configVersion: 1, // on-disk schema, not part of task approval
 	queue: "", // the work list; set by the task handoff (.tasks/<slug>/items.md)
 	task: "", // the task slug this run belongs to
 	allowedPaths: [], // the only folders/files items may change
@@ -60,7 +61,10 @@ export const DEFAULTS = {
 	maxWaits: 3, // how often one item may say WAITING: <ids> before it is treated as BLOCKED
 	outageMinutes: 180, // a provider/session error before any work is waited out (growing pauses) for up to this long, per item
 	autonomy: "full", // "full": the automatic manager also answers BLOCKED: decision questions from the plan and logs them in decisions.md; "ask": they wait for you
-	retryTransient: true, // timeouts and session/provider errors are retried by the supervisor without a model diagnosis
+	retryTransient: true,
+	releaseDependents: true, // when a failed item is out of automatic retries, items that wait on it run anyway (told it failed) instead of the night ending
+	minFreeMemoryGB: 0, // 0 = automatic: max(4 GB, 12% of RAM). No new item starts while less memory is available
+	killStrays: true, // after each item, stop processes left running inside its worktree (dev servers, emulators, watchers) and simulators it booted // timeouts and session/provider errors are retried by the supervisor without a model diagnosis
 	autoReconcile: true, // on start, preserve and release workers interrupted by a crash, sleep or a Pi Web restart
 	keepAwake: true, // macOS: keep the machine from idle-sleeping while the queue is supervised (caffeinate)
 	generatedPaths: [], // extra generated files/folders whose lines do not count toward size limits (lockfiles and __snapshots__ never count)
@@ -74,6 +78,19 @@ export const DEFAULTS = {
 	piCommand: "",
 	manager: true, // a detached supervisor diagnoses failures after approved handoff; healthy ticks use no model
 	runIn: "auto", // "auto": items are Pi Web sessions when Pi Web runs, else background `pi`; or "web" / "cli"
+	// Background pi (no Pi Web): "rpc" keeps ONE pi process per worktree slot and reuses it for every item and turn;
+	// "json" starts a new pi process for every turn (the old behaviour, much heavier).
+	workerMode: "rpc",
+	workerMcp: false, // MCP servers in item workers (each worker connects all of them; some start browsers). Off by default
+	workerRecycle: 20, // a slot's pi process is restarted after this many item sessions, to bound memory growth
+	subagents: false, // let item workers start subagents (each is another pi process). Off: parallel items already use the machine
+	// Failed items are reworked instead of retried unchanged: a fresh read-only session finds out why from the code and
+	// rewrites the item (real paths, a Done when the code can meet), makes it wait for the item that provides what it
+	// lacks, or gives up with the reason. maxReworks per item; after that it fails for you and its dependents run anyway.
+	rework: true,
+	maxReworks: 2,
+	widenScope: true, // autonomy full: an item that needs a few files outside allowedPaths gets them (logged in decisions.md)
+	widenMax: 12, // at most this many extra files/folders per item
 	piWebUrl: "", // empty: find the running Pi Web automatically
 	// What happens to finished (passed/split) item sessions: "end" deletes them when the run ends, "pass" right after
 	// each pass, "archive" archives them in Pi Web (hidden from the sidebar, still searchable), false keeps them.
@@ -118,6 +135,10 @@ export const tail = (s, n) => String(s ?? "").split("\n").slice(-n).join("\n");
 export function allItems(queueText, state) {
 	const out = [];
 	const push = (it) => {
+		// a reworked item keeps its id, key and kind; its text, areas and prerequisites come from the rework
+		const rw = state.rewrites?.[it.key];
+		const p = rw && parseQueue(`- [ ] ${rw}`)[0];
+		if (p) it = { ...it, line: p.line, title: p.title, areas: p.areas, after: [...new Set([...(it.after ?? []), ...p.after])], rewritten: true };
 		for (const line of state.fixes?.[it.key] ?? []) out.push(...parseQueue(line).map((f) => ({ ...f, child: true, fix: true, ...(f.id.startsWith(`${it.id}-repair`) ? { repairParent: it, after: it.after } : {}) })));
 		const wait = state.waitFor?.[it.key];
 		out.push(wait ? { ...it, after: [...new Set([...(it.after ?? []), ...wait])] } : it);
@@ -132,7 +153,7 @@ export function allItems(queueText, state) {
 	return out;
 }
 
-export const APPROVAL_VOLATILE = ["parallel", "parallelStart", "parallelMin", "piWebUrl", "keepAwake", "deleteSessions", "managerModel", "managerThinking"];
+export const APPROVAL_VOLATILE = ["configVersion", "parallel", "parallelStart", "parallelMin", "piWebUrl", "keepAwake", "deleteSessions", "managerModel", "managerThinking", "workerMode", "workerMcp", "workerRecycle"];
 export function approvedTask(repo, c) {
 	if (!c.task || basename(c.task) !== c.task || [".", ".."].includes(c.task)) return undefined;
 	const folder = join(repo, ".tasks", c.task);
@@ -214,6 +235,10 @@ export function applyControl(state, items, ctl) {
 		changed.push(parent.id);
 	} else if (ctl.action === "retry") {
 		for (const i of pick(ctl.ids)) {
+			// a second try on the same model and effort mostly repeats the failure: each retry runs stronger
+			if (state.failed[i.key] && !TRANSIENT.test(state.failed[i.key])) state.boost = { ...(state.boost ?? {}), [i.key]: (state.boost?.[i.key] ?? 0) + 1 };
+			// a person stepped in (an answer, more limits, their own retry): the item may be reworked again
+			if (ctl.by !== "auto" && state.reworks?.[i.key]) delete state.reworks[i.key];
 			if (state.failed[i.key] || state.retried?.[i.key] || state.deferred?.[i.key]) changed.push(i.id);
 			delete state.failed[i.key];
 			if (state.retried) delete state.retried[i.key];
@@ -243,6 +268,16 @@ export function applyControl(state, items, ctl) {
 		}
 		state.priority = [...new Set([...keys, ...(state.priority ?? [])])];
 		changed.push(...items.filter((i) => keys.includes(i.key)).map((i) => i.id));
+	} else if (ctl.action === "release") {
+		// a failed item will not be fixed automatically: what waits on it may run anyway, knowing it failed
+		for (const i of pick(ctl.ids)) {
+			if (!state.failed[i.key] || state.released?.[i.key]) continue;
+			state.released = { ...(state.released ?? {}), [i.key]: state.failed[i.key] };
+			changed.push(i.id);
+			for (const d of items) {
+				if (new RegExp(`^depends on ${i.id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[a-z]?, which failed$`).test(state.failed[d.key] ?? "")) { delete state.failed[d.key]; changed.push(d.id); }
+			}
+		}
 	} else if (ctl.action === "skip") {
 		// the user accepts these as done without running them: dependents may proceed
 		for (const i of pick(ctl.ids)) {
@@ -252,6 +287,25 @@ export function applyControl(state, items, ctl) {
 			if (state.retried) delete state.retried[i.key];
 			if (state.deferred) delete state.deferred[i.key];
 			changed.push(i.id);
+		}
+	} else if (ctl.action === "amend") {
+		// Change one item without editing items.md: its id, state key, dependents and the approval all stay.
+		// paths: extra files it may change (beyond allowedPaths); line: its new text (same id). Then it runs again.
+		const i = items.find((x) => x.id === String(ctl.ids?.[0] ?? "").trim());
+		if (i && !state.done[i.key] && !Object.values(state.running ?? {}).some((r) => r?.key === i.key)) {
+			const paths = (ctl.paths ?? []).map((p) => String(p).trim().replace(/^\.\//, "")).filter(widenable);
+			if (paths.length) state.scope = { ...(state.scope ?? {}), [i.key]: [...new Set([...(state.scope?.[i.key] ?? []), ...paths])] };
+			const text = String(ctl.line ?? "").trim().replace(/^-\s\[\s\]\s*/, "");
+			const parsed = text && (() => { try { return parseQueue(`- [ ] ${text.startsWith(i.id) ? text : `${i.id} — ${text}`}`)[0]; } catch { return undefined; } })();
+			const valid = parsed && /Done when:\s*\S/i.test(parsed.line) && parsed.id === i.id;
+			if (valid) state.rewrites = { ...(state.rewrites ?? {}), [i.key]: parsed.line };
+			if (paths.length || valid) {
+				delete state.failed[i.key];
+				if (state.reworks) delete state.reworks[i.key];
+				if (state.retried) delete state.retried[i.key];
+				if (state.deferred) delete state.deferred[i.key];
+				changed.push(i.id);
+			}
 		}
 	} else if (ctl.action === "limits") {
 		// raise (or set) size/time limits for these items, then let them run again
@@ -269,16 +323,23 @@ export function applyControl(state, items, ctl) {
 		state.added = [...(state.added ?? []), ...lines];
 		changed.push(...lines.flatMap((l) => parseQueue(l).map((i) => i.id)));
 	}
-	// Reopen only scheduler-generated dependency failures; real worker failures keep their evidence.
-	for (let reopened = true; changed.length && reopened;) {
-		reopened = false;
+	if (changed.length) changed.push(...reopenDependents(state, items));
+	return changed;
+}
+
+/** Items that never started because a prerequisite failed: open again once it no longer fails (it passed, was
+ *  retried or released). Only scheduler-made "depends on" failures; real worker failures keep their evidence. */
+export function reopenDependents(state, items) {
+	const reopened = [];
+	for (let again = true; again;) {
+		again = false;
 		for (const i of items) {
 			const dependency = state.failed[i.key]?.match(/^depends on (\S+), which failed$/)?.[1];
 			const parents = dependency && items.filter((p) => p.id === dependency || (p.child && p.id.startsWith(dependency) && /^[a-z]$/.test(p.id.slice(dependency.length))));
-			if (parents?.length && parents.every((p) => !state.failed[p.key])) { delete state.failed[i.key]; reopened = true; changed.push(i.id); }
+			if (parents?.length && parents.every((p) => !state.failed[p.key] || state.released?.[p.key])) { delete state.failed[i.key]; again = true; reopened.push(i.id); }
 		}
 	}
-	return changed;
+	return reopened;
 }
 
 function overtimePrompt(c) {
@@ -334,7 +395,8 @@ export function runReport(items, state) {
 	const { groups, waiting } = failureGroups(items, state);
 	const done = items.filter((i) => state.done?.[i.key]).length;
 	const open = items.filter((i) => !state.done?.[i.key] && !state.failed?.[i.key]).length;
-	const lines = [`# Queue report · ${new Date().toISOString().slice(0, 16).replace("T", " ")}`, "", `${items.length} items: ${done} passed, ${items.length - done - open} failed (${waiting} of them only wait on another failed item), ${open} open. The queue added ${growthUsed(state)} item(s) by itself.`];
+	const needs = items.filter((i) => NEEDS_PERSON.test(state.failed?.[i.key] ?? "")).length;
+	const lines = [`# Queue report · ${new Date().toISOString().slice(0, 16).replace("T", " ")}`, "", `${items.length} items: **${done} landed** · **${items.length - done - open - waiting} failed** (${needs} need you) · **${waiting} never started** (a prerequisite failed; they run by themselves once it passes) · ${open} still open. The queue added ${growthUsed(state)} item(s) by itself.`];
 	for (const g of groups) {
 		lines.push("", `## ${g.kind} (${g.items.length})`);
 		for (const f of g.items) lines.push(`- ${f.id}${f.blocks ? ` (holds up ${f.blocks})` : ""} — ${f.title.slice(0, 80)}: ${f.reason.slice(0, 240)}`);
@@ -344,30 +406,75 @@ export function runReport(items, state) {
 }
 
 /** Fold a check's GAP lines into at most `max` fix items: gaps on overlapping areas always share one item. */
-export function mergeGaps(gaps, max) {
-	const parsed = gaps.map((g) => {
-		const areas = (g.match(/\[areas?:\s*([^\]]+)\]/i)?.[1] ?? "").split(",").map((a) => a.trim()).filter(Boolean);
+/**
+ * Turns a [check]'s GAP findings into fix jobs. Each finding is its own job. Two findings are merged only to fit
+ * `room`, and only when the merged job still changes at most `maxFiles` files: findings that share a file (a test
+ * fixture, say) stay separate jobs and run one after the other (their areas overlap). Findings that do not fit the
+ * room are returned as `leftover` (fixed in the next round, never dropped); findings without areas, or outside the
+ * allowed paths, as `rejected`.
+ */
+export function planGapJobs(gaps, { room = 3, maxFiles = 5, allowedPaths } = {}) {
+	const rejected = [], jobs = [];
+	for (const g of gaps) {
+		const areas = [...new Set((g.match(/\[areas?:\s*([^\]]+)\]/i)?.[1] ?? "").split(",").map((a) => a.trim()).filter(Boolean))];
 		const body = g.replace(/\s*\[areas?:[^\]]*\]/gi, "").trim();
 		const [what, done] = body.split(/\s*Done when:\s*/i);
-		return { what: what.replace(/[.\s]+$/, ""), done: (done ?? "").replace(/[.\s]+$/, ""), areas };
-	});
-	const groups = [];
-	for (const g of parsed) {
-		const hit = groups.find((x) => g.areas.length && x.areas.length && areasOverlap(g.areas, x.areas));
-		if (hit) hit.parts.push(g), hit.areas.push(...g.areas);
-		else groups.push({ parts: [g], areas: [...g.areas] });
+		if (!areas.length) { rejected.push({ gap: g, why: "no [areas: …]" }); continue; }
+		const outside = allowedPaths ? areas.filter((a) => !pathAllowed(a, allowedPaths)) : [];
+		if (outside.length) { rejected.push({ gap: g, why: `outside the allowed paths: ${outside.join(", ")}` }); continue; }
+		jobs.push({ parts: [{ what: what.replace(/[.\s]+$/, ""), done: (done ?? "").replace(/[.\s]+$/, "") }], areas });
 	}
-	while (groups.length > Math.max(1, max)) {
-		groups.sort((a, b) => a.parts.length - b.parts.length);
-		const [a, b] = groups.splice(0, 2);
-		groups.push({ parts: [...a.parts, ...b.parts], areas: [...a.areas, ...b.areas] });
+	const union = (a, b) => [...new Set([...a.areas, ...b.areas])];
+	while (jobs.length > Math.max(1, room)) {
+		let best;
+		for (let x = 0; x < jobs.length; x++)
+			for (let y = x + 1; y < jobs.length; y++) {
+				const size = union(jobs[x], jobs[y]).length;
+				if (size <= maxFiles && (!best || size < best.size)) best = { x, y, size };
+			}
+		if (!best) break; // nothing fits together under the file limit: the rest waits for the next round
+		const b = jobs.splice(best.y, 1)[0], a = jobs[best.x];
+		jobs[best.x] = { parts: [...a.parts, ...b.parts], areas: union(a, b) };
 	}
-	return groups.map(({ parts, areas }) => {
+	const take = jobs.slice(0, Math.max(1, room)), leftover = jobs.slice(take.length);
+	const line = ({ parts, areas }) => {
 		const what = parts.map((p) => p.what).join("; ");
 		const done = parts.map((p) => p.done).filter(Boolean).join("; and ") || "the check can verify it";
-		const area = [...new Set(areas)];
-		return `${what}. Done when: ${done}.${area.length ? ` [areas: ${area.join(", ")}]` : ""}`;
-	});
+		// one finding that by itself needs more files than the limit starts at what it needs (never by merging)
+		return `${what}. Done when: ${done}. [areas: ${areas.join(", ")}]${areas.length > maxFiles ? ` [files=${areas.length}]` : ""}`;
+	};
+	return { jobs: take.map(line), leftover: leftover.map(line), rejected };
+}
+
+/** Compatibility: the fix job lines only. */
+export function mergeGaps(gaps, max, opts = {}) {
+	return planGapJobs(gaps, { room: max, maxFiles: opts.maxFiles ?? Infinity, allowedPaths: opts.allowedPaths }).jobs;
+}
+
+/**
+ * The admission check every job the queue generates passes before it is queued: gap fixes, split parts, repairs,
+ * reworked items and added lines. A job that fails it never costs a worker turn. Returns the reason, or undefined.
+ */
+export function admissionProblem(line, c, items = [], { maxFiles } = {}) {
+	let job;
+	try { job = parseQueue(line.startsWith("- [ ]") ? line : `- [ ] ${line}`)[0]; } catch (e) { return e.message; }
+	if (!job) return "not a work line";
+	if (!/Done when:\s*\S/i.test(job.line)) return `${job.id}: no "Done when"`;
+	if (!job.areas?.length) return `${job.id}: no [areas: …]`;
+	const outside = job.areas.filter((a) => !pathAllowed(a, c.allowedPaths ?? []));
+	if (outside.length) return `${job.id}: areas outside the allowed paths: ${outside.join(", ")}`;
+	let jc;
+	try { jc = itemConfig(c, job); } catch (e) { return e.message; }
+	// the job's own limit (its [files=] tag included); split parts may start higher, at the top size level
+	const limit = maxFiles ?? jc.maxFilesGrowing ?? 5;
+	const concrete = job.areas.filter((a) => !/[*?[{]/.test(a) && /\.[A-Za-z0-9]+$/.test(a));
+	if (concrete.length > limit) return `${job.id}: names ${concrete.length} files, more than its limit of ${limit}`;
+	if (!job.check && !job.readonly && !(jc.checks ?? []).length && (c.checks ?? []).length) return `${job.id}: no checks resolve for it`;
+	const known = new Set(items.map((i) => i.id));
+	const unknown = (job.after ?? []).filter((d) => d !== "*" && !known.has(d) && !items.some((i) => i.child && i.id.startsWith(d)));
+	if (unknown.length) return `${job.id}: [after] names unknown items: ${unknown.join(", ")}`;
+	if (known.has(job.id)) return `${job.id}: the id is already used`;
+	return undefined;
 }
 
 /** Do two [areas: …] lists touch the same path? (prefix match; globs cut at the first *) */
@@ -385,6 +492,30 @@ export function areasOverlap(a, b) {
 	return false;
 }
 
+const EFFORT = ["off", "minimal", "low", "medium", "high", "xhigh"];
+/** A retried item runs on the plan's heavy tier (if any) with more reasoning and time. */
+export function boosted(c, level) {
+	const heavy = c.tiers?.heavy ?? {};
+	const at = Math.max(EFFORT.indexOf(c.thinking ?? "medium"), EFFORT.indexOf(heavy.thinking ?? "high"));
+	return {
+		...c,
+		model: heavy.model ?? c.model,
+		thinking: EFFORT[Math.min(EFFORT.length - 2, Math.max(at, EFFORT.indexOf("high")) + (level > 1 ? 1 : 0))],
+		itemMinutes: Math.min(240, Math.round((c.itemMinutes ?? 40) * (1 + 0.5 * level))),
+	};
+}
+
+/** An id and the ids it was generated from, nearest first: V90a-fix1 → V90a-fix1, V90a, V90. */
+export function checkOwners(id) {
+	const out = [id];
+	for (let cur = id, prev; cur !== prev;) {
+		prev = cur;
+		cur = /-(fix|repair)\d+$/.test(cur) ? cur.replace(/-(fix|repair)\d+$/, "") : cur.replace(/^([A-Z]+\d+[A-Za-z0-9-]*?)[a-z]$/, "$1");
+		if (cur !== prev) out.push(cur);
+	}
+	return out;
+}
+
 export const TIER_KEYS = ["model", "thinking", "maxNetLines", "maxFilesGrowing", "itemMinutes"];
 export const LIMIT_KEYS = ["maxNetLines", "maxFilesGrowing", "itemMinutes"];
 
@@ -393,7 +524,8 @@ export function itemConfig(c, item) {
 	if (item.repairParent) return { ...itemConfig(c, item.repairParent), allowedPaths: item.areas };
 	const out = { ...c };
 	if (c.itemChecks) {
-		const checks = c.itemChecks[item.id] ?? c.itemChecks[item.id.match(/^([A-Z]+\d+)[a-z]$/)?.[1]];
+		// generated items (A01a split parts, V90-fix1 gap fixes, X-repair1, their own parts) use the checks of the planned item they came from
+		const checks = checkOwners(item.id).map((id) => c.itemChecks[id]).find((x) => x !== undefined);
 		if (!Array.isArray(checks) || checks.some((cmd) => typeof cmd !== "string" || !cmd.trim())) throw new Error(`${item.id}: missing or invalid focused itemChecks`);
 		out.checks = [...new Set([...c.checks, ...checks])];
 	}
@@ -431,7 +563,7 @@ export function parseQueue(text) {
 		const m = raw.match(/^\s*-\s\[\s\]\s+(.+?)\s*$/);
 		if (!m) continue;
 		const line = m[1];
-		for (const tag of ["areas?", "after"]) if ([...line.matchAll(new RegExp(`\\[${tag}:`, "gi"))].length > 1) throw new Error(`duplicate [${tag}] tag: ${line}`);
+		for (const tag of ["areas?", "after", "produces"]) if ([...line.matchAll(new RegExp(`\\[${tag}:`, "gi"))].length > 1) throw new Error(`duplicate [${tag}] tag: ${line}`);
 		const id = line.match(/^([A-Z]+[0-9]+[A-Za-z0-9-]*)/)?.[1] ?? `item${items.length + 1}`;
 		const title = line
 			.split(/\s+Done when:/i)[0]
@@ -445,11 +577,13 @@ export function parseQueue(text) {
 		items.push({
 			key: line,
 			id,
-			title: title.replace(/\s*\[(areas?|after|model|thinking|tier|big|check|files=|lines=|min=)[^\]]*\]/gi, "").trim(),
+			title: title.replace(/\s*\[(areas?|after|produces|model|thinking|tier|big|check|readonly|files=|lines=|min=)[^\]]*\]/gi, "").trim(),
 			line,
 			areas: tag("areas?"),
 			after: tag("after"),
+			produces: tag("produces"), // files later items read: the item passes only when they exist
 			check: /\[check\]/i.test(line),
+			readonly: /\[readonly\]/i.test(line),
 		});
 	}
 	return items;
@@ -492,7 +626,7 @@ export function simulatePlan(items, parallel) {
 		for (const i of left) {
 			if (now.length >= parallel) break;
 			if (!graph.get(i.id).every((d) => done.has(d))) continue;
-			if (now.some((r) => r.areas?.length && i.areas?.length && areasOverlap(r.areas, i.areas))) continue;
+			if (!i.readonly && now.some((r) => !r.readonly && r.areas?.length && i.areas?.length && areasOverlap(r.areas, i.areas))) continue;
 			now.push(i);
 		}
 		if (!now.length) break;
@@ -508,7 +642,7 @@ export function simulatePlan(items, parallel) {
 /** Objective plan defects that waste sessions or serialize the queue. Returned to the planner at handoff. */
 export function planLint(items, parallel) {
 	const findings = [];
-	const work = items.filter((i) => !i.check);
+	const work = items.filter((i) => !i.check && !i.readonly); // read-only audits share areas by design
 	const graph = dependencyGraph(items);
 	// 1. items on exactly the same files with no order between them: they run one after another anyway
 	const byAreas = new Map();
@@ -722,7 +856,8 @@ Rules (the script enforces the first two and throws away the whole change if bro
 - At most ${c.maxNetLines} net added lines and at most ${c.maxFilesGrowing} files that gain lines.
 - Make the smallest change that meets the item's "Done when". Reuse existing code. No new abstractions, wrappers, helper layers, generic utilities, or refactors the item does not require.
 - Do only this item. Do not fix other items, unrelated warnings or style.
-- You may use subagents to read, search and research. Only you edit files.
+- Never remove a behaviour listed under "Protected" in the brief, even to make the change smaller.
+${c.subagents === true ? "- You may use subagents to read, search and research. Only you edit files." : "- Do not start subagents or other agent sessions: other items run at the same time on this machine. Read and search yourself."}
 - Do not ask the user questions. Do not commit. Do not touch git history or branches.
 - Write focused regression coverage. The runner executes the configured checks after you stop, in separate verification capacity; do not run the mandatory suite in this coding turn. Use only a narrowly targeted diagnostic when needed to make the fix.${item.repaired ? "\n- Earlier verified repairs may already satisfy this item. Inspect them against the original Done when; if complete, report DONE without inventing another edit." : ""}
 - If the item clearly needs more than these size limits, do not start editing: reply with exactly one line NEEDS: <files> files, <lines> lines (your honest estimate). The limits are then raised for you.
@@ -730,11 +865,86 @@ Rules (the script enforces the first two and throws away the whole change if bro
 - If it needs work from another queue item that has not landed yet, undo your edits and reply with one line: WAITING: <item ids, e.g. A03, B02> — <what is missing>. It runs again after them.
 - If it cannot be done for any other reason, undo your edits and reply with exactly one line:
   BLOCKED: decision: <the question only the user can answer>   (a product/design choice the plan does not settle)
-  BLOCKED: env: <what is missing>   (credentials, a service, a tool that is not installed)
+  BLOCKED: env: <what is missing>   (credentials, a service, a tool that is not installed)${c.autonomy === "full" && c.widenScope !== false && !item.readonly && !item.repairParent ? "\n  BLOCKED: scope: <exact repo-relative file>   (only the item's path list is in the way; the runner can add the file without asking). Never use this to override an explicit task restriction or bypass a check." : ""}
   BLOCKED: <reason>   (anything else, e.g. the plan contradicts the code)
   Prefer the plan's rules and the existing code's conventions over asking; only real gaps are BLOCKED.
+- Stop every dev server, emulator, simulator, watcher or other background process you start before you reply. Never leave anything running.
 - DONE means every condition in "Done when" now holds because of your change. Never keep the old implementation, deliver only part of the item, or replace the change with an explanation or documentation and call that DONE. If the whole item does not fit the limits, reply NEEDS; if it truly cannot be done, reply BLOCKED with the evidence.
 - When finished, reply: DONE, then each changed file with one sentence.`;
+}
+
+// ---------- rework: change the item, not just run it again ----------
+
+const PROTECTED = /(^|\/)(\.git|\.pi-queue|\.tasks|node_modules|\.github\/workflows)(\/|$)|(^|\/)\.env(\.|$)|(^|\/)(secrets?|credentials?)(\/|\.|$)|\.(pem|key|p12|keystore)$/i;
+/** A path an item may be given beyond allowedPaths under full autonomy: inside the repo and not sensitive. */
+export function widenable(p) {
+	return typeof p === "string" && !!p.trim() && !isAbsolute(p) && !p.split("/").includes("..") && !PROTECTED.test(p);
+}
+
+/** Repo paths named in free text (an item, a failure, a worker's reply). */
+export function mentionedPaths(text) {
+	const plain = String(text ?? "").replace(/\b[a-z]+:\/\/\S+/gi, " ");
+	return [...new Set((plain.match(/(?:[\w@.+-]+\/)+[\w@.+-]*[\w]/g) ?? []).map((p) => p.replace(/^\.\//, "")).filter((p) => !/^\d/.test(p) && !p.startsWith("@") && /[A-Za-z]/.test(p.split("/").at(-1))))];
+}
+
+/** Failures a rewritten item can fix. Not: provider/session errors (retried as they are), decisions and missing
+ *  environment (a person or the manager answers those), budgets, stops. */
+export function reworkable(reason) {
+	return !!reason && !TRANSIENT.test(reason) && !/^agent: BLOCKED: (decision|env)\b/i.test(reason) && !/credentials?|permission denied|not authorized|^needs you|growth budget|^stopped by request|^commit failed|^could not fast-forward|^read-only item changed/i.test(reason);
+}
+
+// Unlike mentionedPaths (used for diagnostic hints), never extract a grant from part of a path.
+function scopeFiles(reason) {
+	const text = reason.replace(/^agent: BLOCKED:\s*/i, "");
+	const words = (text.replace(/\[areas?:[^\]]*\]/gi, "").match(/`[^`]+`|[^\s]+/g) ?? []).map((w) => w.replace(/[.,;:]$/, "").replace(/^[`"'(]+|[`"')]+$/g, "").replace(/^\.\//, ""));
+	return words.filter((w) => w.includes("/") || /\.[\w-]+$/.test(w) || (words.length === 2 && words[0] === "scope" && w !== "scope"));
+}
+
+function ordinaryScopeFile(wt, p) {
+	if (!widenable(p) || posix.normalize(p) !== p || /[\\:*?\[\]{}]/.test(p) || p.endsWith("/")) return false;
+	// A symlink anywhere in the path could turn an ordinary name into a protected or external target.
+	try {
+		let part = wt;
+		for (const name of p.split("/")) {
+			part = join(part, name);
+			const stat = lstatSync(part, { throwIfNoEntry: false });
+			if (stat && !(part === join(wt, p) ? stat.isFile() : stat.isDirectory())) return false;
+		}
+		return true;
+	} catch { return false; }
+}
+
+function scopePrompt(c, paths) {
+	return `You may now also change: ${paths.join(", ")} (added to this item's allowed files by the automatic manager).
+
+Do the item now, including those files. Explicit task safety restrictions and all configured checks still apply; do not edit a gate to grant yourself access. Same other rules: only ${c.allowedPaths.join(", ")}, at most ${c.maxNetLines} net added lines, at most ${c.maxFilesGrowing} files gaining lines, no questions, no commits. Reply DONE, then each changed file with one sentence. If it still cannot be done, reply with one line: BLOCKED: <reason>`;
+}
+
+function reworkPrompt(c, item, reason, reply, missing, others) {
+	return `A queue item failed. Running it again unchanged would fail the same way. Your job: find out from the code WHY it failed, then fix the ITEM (the instructions for the next worker), not the code.
+
+Do NOT edit, create or delete any file (anything you change is thrown away). Read and search only. Do not start subagents.
+
+ITEM: ${item.line}
+
+It failed with:
+${String(reason).slice(0, 4000)}
+
+The worker's last reply:
+${String(reply ?? "").slice(-3000) || "(none)"}
+${missing.length ? `\nPaths named in the item or the failure that do not exist in the code now:\n${missing.map((m) => `- ${m.path}${m.hits.length ? ` · files with that name: ${m.hits.join(", ")}` : " · no file with that name"}${m.providers.length ? ` · named by open items ${m.providers.join(", ")}` : ""}`).join("\n")}\n` : ""}
+Other items in the queue (id · status · title · areas):
+${others}
+
+Allowed paths: ${c.allowedPaths.join(", ")}
+
+Reply with exactly ONE of these as the FIRST line of your reply, then at most a few lines of evidence:
+REWRITE: <what to do, with the real file paths the code uses> Done when: <something observable the code can meet> [areas: <the real folders/files it changes>] [after: <ids of OPEN items it truly needs first, only if any>]
+AFTER: <ids of OPEN items that must land first, comma separated> — <what they provide>
+OBSOLETE: <where the code already meets every Done when condition>
+GIVE UP: <why no instructions can work: a decision or something only a person can provide>
+
+Keep the item's goal and every requirement; never make it easier by dropping parts. Fix wrong paths, wrong assumptions about the code, a missing prerequisite, a Done when that cannot be met as written, or files it must also change (name them in [areas]).`;
 }
 
 /** A DONE reply that admits part of the item was not done (kept the old way, hit a cap, deferred…). */
@@ -756,7 +966,7 @@ Compare the code now with every condition in "Done when". Keeping the old implem
 
 const UNLIMITED = { maxNetLines: 5000, maxFilesGrowing: 200 };
 const SIZE_REASON = /\b(limit|limits|net added|files? gain|five|5 files|150|broader|larger than|too (big|large)|exceed|beyond)\b/i;
-const SCOPE_REASON = /\b(outside the (permitted|allowed)|outside (apps|the scope)|frozen|not permitted)\b/i;
+const SCOPE_REASON = /\bBLOCKED: scope:|\b(out of scope|outside (of )?(the |its |my )?(item['’]s |item )?(declared )?(permitted|allowed|scope|\[?areas)|outside apps|not (in|within|under|part of) (the )?(allowed|permitted)|frozen|not permitted)\b/i;
 
 /** Did the item stop only because of the size limit? (The runner's own rejection, or an agent BLOCKED about size.) */
 function isSizeStop(reason) {
@@ -918,6 +1128,187 @@ function piTurn(ctx, cwd, sessionId, name, prompt, minutes, onActivity = () => {
 			resolve({ status, reply: reply || raw.trim(), err: (err + assistantError).trim(), code });
 		});
 	});
+}
+
+// ---------- background pi that stays up: one `pi --mode rpc` per worktree slot ----------
+// A fresh `pi` per turn loads every extension and connects every MCP server again (some start a browser each);
+// with many items at once that is what swamps the machine. One process per slot serves all its items and turns,
+// switching sessions instead of restarting. MCP servers stay off in workers unless workerMcp is true.
+
+export function workerArgs(c, repo) {
+	const args = ["--mode", "rpc", "--session-dir", join(repo, DIR, "sessions")];
+	if (c.model) args.push("--model", c.model);
+	if (c.thinking) args.push("--thinking", c.thinking);
+	if (c.workerMcp !== true) args.push("--no-mcp");
+	return args;
+}
+
+const UI_DIALOGS = new Set(["select", "confirm", "input", "editor"]);
+
+/** Starts one RPC pi and waits until it answers. Resolves the worker handle or throws. */
+export async function startRpcWorker({ pi, args, cwd, env }) {
+	const child = spawn(pi, args, { cwd, env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+	const w = { child, pid: child.pid, listeners: new Set(), pending: new Map(), stderr: "", served: 0, sessionId: undefined, thinking: undefined, dead: false };
+	let next = 0, buf = "";
+	w.exited = new Promise((resolve) => {
+		child.on("close", (code) => { w.dead = true; w.code = code; for (const p of w.pending.values()) p.reject(new Error(`pi exited (code ${code}): ${tail(w.stderr, 3).replace(/\n/g, " ")}`)); w.pending.clear(); resolve(code); });
+		child.on("error", (e) => { w.stderr += String(e); });
+	});
+	child.stdin.on("error", () => {});
+	const send = (record) => { if (!w.dead) child.stdin.write(`${JSON.stringify(record)}\n`); };
+	const onRecord = (line) => {
+		let ev;
+		try { ev = JSON.parse(line); } catch { return; }
+		if (ev.type === "response" && ev.id && w.pending.has(ev.id)) {
+			const p = w.pending.get(ev.id);
+			w.pending.delete(ev.id);
+			return ev.success === false ? p.reject(new Error(ev.error || `${ev.command} failed`)) : p.resolve(ev.data ?? {});
+		}
+		// nobody can answer an extension's dialog in an unattended run
+		if (ev.type === "extension_ui_request") return UI_DIALOGS.has(ev.method) ? send({ type: "extension_ui_response", id: ev.id, cancelled: true }) : undefined;
+		for (const l of w.listeners) l(ev);
+	};
+	// split on LF only: JSON strings may contain U+2028/U+2029
+	child.stdout.on("data", (d) => {
+		buf += d;
+		let i;
+		while ((i = buf.indexOf("\n")) >= 0) {
+			const line = buf.slice(0, i).replace(/\r$/, "");
+			buf = buf.slice(i + 1);
+			if (line.trim()) onRecord(line);
+		}
+	});
+	child.stderr.on("data", (d) => { w.stderr = (w.stderr + d).slice(-20_000); });
+	w.alive = () => !w.dead && pidAlive(w.pid);
+	w.request = (type, fields = {}, timeoutMs = 60_000) => new Promise((resolve, reject) => {
+		if (w.dead) return reject(new Error(`pi is not running: ${tail(w.stderr, 3).replace(/\n/g, " ")}`));
+		const id = `r${++next}`;
+		const timer = setTimeout(() => { w.pending.delete(id); reject(new Error(`pi did not answer ${type} within ${Math.round(timeoutMs / 1000)} s`)); }, timeoutMs);
+		w.pending.set(id, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject: (e) => { clearTimeout(timer); reject(e); } });
+		send({ id, type, ...fields });
+	});
+	w.close = async () => {
+		if (w.dead) return;
+		try { child.stdin.end(); } catch {} // orderly shutdown
+		const gone = await Promise.race([w.exited.then(() => true), sleep(5000).then(() => false)]);
+		if (!gone) { try { process.kill(-w.pid, "SIGTERM"); } catch {} }
+		if (!gone && !(await Promise.race([w.exited.then(() => true), sleep(5000).then(() => false)]))) { try { process.kill(-w.pid, "SIGKILL"); } catch {} }
+	};
+	try { await w.request("get_state", {}, 120_000); }
+	catch (e) { await w.close(); throw new Error(`could not start pi in RPC mode: ${e.message}`); }
+	return w;
+}
+
+/** A session file that only names its working folder: switching an RPC pi to it runs that session's tools there,
+ *  so one process can serve every worktree. */
+export function newSessionFile(repo, id, cwd) {
+	const dir = join(repo, DIR, "sessions");
+	mkdirSync(dir, { recursive: true });
+	const at = new Date().toISOString();
+	const file = join(dir, `${at.replace(/[:.]/g, "-")}_${id}.jsonl`);
+	writeFileSync(file, `${JSON.stringify({ type: "session", version: 3, id, timestamp: at, cwd })}\n`);
+	return file;
+}
+
+/** At most `max` RPC pi processes for the whole run, shared by all worktrees. Turns are already capped at `parallel`
+ *  by the session gate, so an idle process is always there or may be started. */
+async function rpcAcquire(ctx, c, ref) {
+	const pool = ctx.rpcPool;
+	const model = c.model || "";
+	// Everything up to marking a process busy or reserving a start happens without an await, so concurrent turns
+	// can neither share a process nor start more than `max`.
+	const stale = pool.workers.filter((w) => !w.busy && (!w.alive() || w.served >= (c.workerRecycle ?? 20))); // dead, or served enough: a fresh process bounds slow leaks
+	pool.workers = pool.workers.filter((w) => !stale.includes(w));
+	const idle = pool.workers.filter((w) => !w.busy);
+	let w = idle.find((x) => x.sessionId === ref.id && x.model === model) ?? idle.find((x) => x.model === model);
+	if (w) { w.busy = true; await Promise.all(stale.map((x) => x.close())); return w; }
+	const evict = pool.workers.length + (pool.starting ?? 0) >= pool.max && idle.length ? idle[0] : undefined; // an idle process on another model makes room
+	if (evict) pool.workers = pool.workers.filter((x) => x !== evict);
+	pool.starting = (pool.starting ?? 0) + 1;
+	try {
+		await Promise.all([...stale, ...(evict ? [evict] : [])].map((x) => x.close()));
+		w = await startRpcWorker({ pi: ctx.pi, args: workerArgs(c, ctx.repo), cwd: ctx.repo, env: ctx.env });
+	} finally { pool.starting--; }
+	w.model = model;
+	w.thinking = c.thinking || undefined;
+	w.busy = true;
+	pool.workers.push(w);
+	return w;
+}
+
+/** Same contract as piTurn, on a long-lived RPC pi from the run's pool. ref.id/ref.file name the item's session. */
+async function rpcTurn(ctx, cwd, ref, name, prompt, minutes, onActivity = () => {}) {
+	const { c, stopRequested } = ctx;
+	if (!ctx.rpcPool) throw new Error("rpcTurn needs ctx.rpcPool");
+	let w;
+	try { w = await rpcAcquire(ctx, c, ref); }
+	catch (e) { return { status: "error", reply: "", err: e.message, code: 1 }; }
+	const drop = async () => { const i = ctx.rpcPool.workers.indexOf(w); if (i >= 0) ctx.rpcPool.workers.splice(i, 1); await w.close(); };
+	ctx.onWorker?.({ rpcPid: w.pid });
+	try {
+		if (w.sessionId === undefined || w.sessionId !== ref.id) {
+			ref.id ??= randomUUID();
+			let file = ref.file ?? sessionFiles(ctx.repo, [ref.id])[ref.id];
+			const fresh = !file || !existsSync(file);
+			if (fresh) file = newSessionFile(ctx.repo, ref.id, cwd);
+			const sw = await w.request("switch_session", { sessionPath: file });
+			if (sw?.cancelled) throw new Error("an extension cancelled the session switch");
+			w.sessionId = ref.id;
+			ref.file = file;
+			w.thinking = undefined; // a resumed session restores its own level
+			if (fresh) { w.served++; await w.request("set_session_name", { name }); }
+			ctx.onWorker?.({ sessionId: ref.id, rpcPid: w.pid });
+		}
+		if (c.thinking && w.thinking !== c.thinking) { await w.request("set_thinking_level", { level: c.thinking }); w.thinking = c.thinking; }
+	} catch (e) {
+		await drop();
+		return { status: "error", reply: "", err: `pi (rpc): ${e.message}`, code: 1 };
+	}
+	return new Promise((resolve) => {
+		let reply = "", assistantError = "", status = "ok", done = false, killTimer;
+		const finish = (extra = "") => {
+			if (done) return;
+			done = true;
+			clearTimeout(timer); clearTimeout(killTimer); clearInterval(poll);
+			w.listeners.delete(onEvent);
+			w.busy = false;
+			if (ctx.rpcPool.workers.length > ctx.rpcPool.max) drop(); // parallel was lowered: one process fewer
+			if (status === "ok" && assistantError) status = "error";
+			resolve({ status, reply, err: `${assistantError}${extra}`.trim(), code: status === "error" ? 1 : 0 });
+		};
+		const onEvent = (ev) => {
+			if (ev.type === "tool_execution_start") onActivity(describeTool(ev.toolName, ev.args));
+			else if (ev.type === "tool_execution_end" && ev.isError) onActivity(`${ev.toolName} failed`);
+			else if (ev.type === "turn_start") onActivity("thinking");
+			else if (ev.type === "compaction_start") onActivity("compacting context");
+			else if (ev.type === "message_end" && ev.message?.role === "assistant") {
+				const t = textOf(ev.message);
+				if (t) reply = t;
+				assistantError = ["error", "aborted", "length"].includes(ev.message.stopReason) ? ev.message.errorMessage || `assistant stopped: ${ev.message.stopReason}` : "";
+			} else if (ev.type === "agent_settled") finish();
+		};
+		w.listeners.add(onEvent);
+		const kill = (why) => {
+			if (status !== "ok" || done) return;
+			status = why;
+			w.request("abort", {}, 15_000).catch(() => {});
+			// an abort that does not settle: stop the process (the pool starts another one)
+			killTimer = setTimeout(async () => { await drop(); finish(); }, 30_000);
+			killTimer.unref?.();
+		};
+		const timer = setTimeout(() => kill("timeout"), minutes * 60_000);
+		const poll = setInterval(() => stopRequested() && kill("stopped"), 3_000);
+		w.exited.then(() => { const i = ctx.rpcPool.workers.indexOf(w); if (i >= 0) ctx.rpcPool.workers.splice(i, 1); if (status === "ok") status = "error"; finish(`pi exited (code ${w.code}) ${tail(w.stderr, 5)}`); });
+		w.request("prompt", { message: prompt }, 120_000).then(
+			(d) => { if (d?.disposition === "handled") finish(); },
+			(e) => { if (status === "ok") status = "error"; finish(e.message); },
+		);
+	});
+}
+
+export async function closeRpcPool(ctx) {
+	const all = ctx.rpcPool?.workers.splice(0) ?? [];
+	await Promise.all(all.map((w) => w.close().catch(() => {})));
 }
 
 // ---------- running an item as a Pi Web session ----------
@@ -1238,6 +1629,10 @@ async function judge(c, cwd, base, reply, item = {}) {
 	const blocked = reply.match(/^\s*BLOCKED:\s*(.+)$/m);
 	if (blocked) return `agent: BLOCKED: ${blocked[1].slice(0, 300)}`;
 	const m = await measure(cwd, base, c.allowedPaths, c.generatedPaths ?? []);
+	if (item.readonly) return m.files.length ? `read-only item changed files: ${m.files.slice(0, 5).join(", ")}` : undefined;
+	// passing checks are not the result: what it declares it produces must exist (a no-change [check] included)
+	const missingOut = (item.produces ?? []).filter((p) => !existsSync(join(cwd, p)));
+	if (missingOut.length) return `required output missing: ${missingOut.join(", ")} (declared with [produces: …]; later items read it)`;
 	// an item whose result another item already delivered passes on the same checks, instead of failing its dependents
 	const already = /^\s*ALREADY DONE\b/im.test(reply);
 	if (m.files.length === 0) return item.check || item.repaired || already ? runChecks(c, cwd) : "no changes were made";
@@ -1371,6 +1766,8 @@ async function workItem(ctx, slot, wt, item) {
 	const itemChecks = loadJson(join(repo, ".tasks", ctx.c.task, "task.json"), {}).itemChecks;
 	let c = itemConfig({ ...ctx.c, itemChecks }, item); // keep worker, judge and rebase checks identical
 	if (state.limits?.[item.key]) c = { ...c, ...state.limits[item.key] }; // raised by you or the manager
+	if (state.boost?.[item.key]) c = boosted(c, state.boost[item.key]);
+	if (state.scope?.[item.key]) c = { ...c, allowedPaths: [...new Set([...c.allowedPaths, ...state.scope[item.key]])] }; // widened earlier
 	// Pi Web went away (restart, laptop lid, update): new items run as background pi instead of failing one by one
 	if (ctx.web && ctx.c.runIn !== "web" && !(await ctx.web.available())) {
 		ctx.web = null;
@@ -1387,15 +1784,20 @@ async function workItem(ctx, slot, wt, item) {
 	const cliId = randomUUID();
 	const web = ctx.web; // one backend for the whole item, even if Pi Web goes away meanwhile
 	const ref = { id: web ? undefined : cliId, web };
-	const turn = async (prompt, minutes, onAct, phase = "coding") => {
-		const worker = { ...ctx, web, c, onWorker: (identity) => { Object.assign(live, identity); save(); } };
+	const rpc = !web && ctx.c.workerMode !== "json";
+	const turn = async (prompt, minutes, onAct, phase = "coding", tref = ref, tname = name) => {
+		const worker = { ...ctx, web, c, onWorker: (identity) => { if (tref === ref) Object.assign(live, identity); else Object.assign(live, Object.fromEntries(Object.entries(identity).filter(([k]) => k !== "sessionId"))); save(); } };
 		const giveUpAt = Date.now() + (c.outageMinutes ?? 180) * 60_000;
 		for (let attempt = 0; ; attempt++) {
 			// a provider outage seen by any worker holds every worker back, instead of burning each item's retries
 			while (Date.now() < (ctx.outage?.until ?? 0) && !ctx.stopRequested()) await sleep(Math.min(5000, ctx.outage.until - Date.now()));
 			if (!(await ctx.acquirePhase(slot, phase))) return { status: "stopped", reply: "", err: "" };
+			// never more agent sessions at once than `parallel`, coding and verification together
+			const releaseSession = await (ctx.sessionGate?.() ?? (() => {}));
 			const toolsBefore = live.tools, startedAt = Date.now();
-			const result = await (web ? webTurn(worker, wt, ref, name, prompt, minutes, onAct) : piTurn(worker, wt, cliId, name, prompt, minutes, onAct));
+			let result;
+			try { result = await (web ? webTurn(worker, wt, tref, tname, prompt, minutes, onAct) : rpc ? rpcTurn(worker, wt, tref, tname, prompt, minutes, onAct) : piTurn(worker, wt, tref.id, tname, prompt, minutes, onAct)); }
+			finally { releaseSession(); }
 			if (result.quiescent === false) throw new Error(`${result.err}; worktree quarantined`);
 			// An error before the agent did anything (rate limit, overloaded provider, login expired, network) says nothing
 			// about the item: wait and ask again in the same session.
@@ -1436,11 +1838,18 @@ async function workItem(ctx, slot, wt, item) {
 	};
 	const onActivity = (what) => setDoing(what, what !== "thinking" && what !== "compacting context" && !what.endsWith(" failed"));
 
+	// what items this one depends on reported (read-only audits) or could not deliver (released failures)
+	const deps = allItems(ctx.queueText?.() ?? "", state).filter((o) => (item.after ?? []).some((d) => o.id === d || (o.child && o.id.startsWith(d))));
+	const reports = deps.filter((o) => o.readonly && existsSync(join(repo, DIR, "reports", `${o.id}.md`))).map((o) => join(repo, DIR, "reports", `${o.id}.md`));
+	const released = deps.filter((o) => state.released?.[o.key]);
+	const depNote = `${reports.length ? `\n\nFindings of the read-only items you depend on (read them first): ${reports.join(", ")}` : ""}${released.length ? `\n\nThese prerequisites FAILED and will not be retried; their work is NOT in the code: ${released.map((o) => `${o.id} (${String(state.released[o.key]).slice(0, 120)})`).join("; ")}. Do what you can without them. If your item truly cannot be done without one, reply BLOCKED: needs <id>.` : ""}${item.readonly ? "\n\nThis item is READ-ONLY: do not change any file. Investigate and reply DONE followed by your findings in full (they are saved and given to the items that depend on this one)." : ""}`;
 	const failedDeps = item.check ? allItems(ctx.queueText?.() ?? "", state).filter((o) => state.failed[o.key] && ((item.after ?? []).includes("*") || (item.after ?? []).some((d) => o.id === d || o.id.startsWith(d)))) : [];
 	const failedNote = failedDeps.length ? `\n\nThese covered items FAILED; their work is not in the code. Do not report GAPs for them (the queue tracks them): ${failedDeps.map((o) => `${o.id} (${String(state.failed[o.key]).slice(0, 120)})`).join("; ")}` : "";
 	const prior = join(repo, DIR, "notes", `${item.repairParent?.id ?? item.id}.md`);
 	const previous = existsSync(prior) ? `\n\nPrevious attempt and manager diagnosis (evidence, not permission to expand scope):\n${readFileSync(prior, "utf8").slice(-12000)}` : "";
-	let t = await turn(itemPrompt(c, item) + failedNote + previous, c.itemMinutes, onActivity, item.check ? "verification" : "coding");
+	// What its prerequisites declared they produce must be in this checkout before a worker is spent on it.
+	const missingInputs = deps.filter((o) => state.done[o.key] && !state.released?.[o.key]).flatMap((o) => (o.produces ?? []).filter((p) => !existsSync(join(wt, p))).map((p) => `${p} (from ${o.id})`));
+	let t = missingInputs.length ? { status: "ok", reply: "", err: "" } : await turn(itemPrompt(c, item) + depNote + failedNote + previous, c.itemMinutes, onActivity, item.check ? "verification" : "coding");
 	if (ref.id) {
 		state.sessions = { ...(state.sessions ?? {}), [ref.id]: { item: item.id, status: "running", web: !!web } };
 		save();
@@ -1480,7 +1889,7 @@ async function workItem(ctx, slot, wt, item) {
 		setDoing("finishing up after the time limit");
 		t = await turn(overtimePrompt(c), Math.max(10, Math.round(c.itemMinutes / 2)), onActivity, item.check ? "verification" : "coding");
 	}
-	let reason = await verdict();
+	let reason = missingInputs.length ? `needs you: required input missing: ${missingInputs.join(", ")} · the item that produces it passed but it is not in the code (git-ignored or removed later)` : await verdict();
 	// the next attempt (yours or the automatic one) gets more time
 	if (/^timed out after/.test(reason ?? "")) state.limits = { ...(state.limits ?? {}), [item.key]: { ...(state.limits?.[item.key] ?? {}), itemMinutes: Math.min(240, Math.round(c.itemMinutes * 1.5)) } };
 	// stopped only because of the size limit: raise it a level and let the same agent carry on in the same session
@@ -1494,10 +1903,42 @@ async function workItem(ctx, slot, wt, item) {
 		t = await turn(raisePrompt(c, reason), Math.max(c.itemMinutes, level.itemMinutes ?? 90), onActivity);
 		reason = await verdict();
 	}
+	// It needs a few files outside the allowed paths. With full autonomy they are allowed for this item (logged for
+	// review) and the work is kept, instead of throwing the change away and failing.
+	const canWiden = ctx.c.autonomy === "full" && c.widenScope !== false && !item.readonly && !item.repairParent;
+	const widen = (paths, why) => {
+		state.scope = { ...(state.scope ?? {}), [item.key]: [...new Set([...(state.scope?.[item.key] ?? []), ...paths])] };
+		c = { ...c, allowedPaths: [...new Set([...c.allowedPaths, ...paths])] };
+		log(`SCOPE ${item.id} · also allowed: ${paths.join(", ")} · ${firstLine(why).slice(0, 100)}`);
+		try { appendFileSync(join(repo, DIR, "decisions.md"), `\n## ${item.id} · ${new Date().toISOString().slice(0, 16).replace("T", " ")}\nScope widened for this item: ${paths.join(", ")}\nBecause: ${firstLine(why).slice(0, 300)}\n`); } catch {}
+		save();
+	};
+	const scopeNeeded = async (why) => {
+		if (!canWiden || !why) return undefined;
+		let paths = [];
+		if (/^files outside /.test(why)) paths = (await measure(wt, base, c.allowedPaths, c.generatedPaths ?? [])).outside;
+		else if (/^agent: BLOCKED/.test(why) && SCOPE_REASON.test(why) && !/^agent: BLOCKED: (decision|env)\b|\b(frozen|forbidden|protected|policy)\b/i.test(why)) {
+			// An item may stop at its [areas] even when the task already allows the file.
+			if (why.length >= "agent: BLOCKED: ".length + 300) return undefined; // judge may have truncated the path
+			paths = scopeFiles(why).filter((p) => !pathAllowed(p, c.allowedPaths) || (item.areas?.length && !pathAllowed(p, item.areas) && !state.scope?.[item.key]?.includes(p)));
+		}
+		paths = [...new Set(paths)];
+		if (!paths.length || paths.some((p) => !ordinaryScopeFile(wt, p)) || (state.scope?.[item.key]?.length ?? 0) + paths.length > (c.widenMax ?? 12)) return undefined;
+		return paths;
+	};
+	for (let round = 0; reason && t.status === "ok" && round < 2 && !ctx.stopRequested(); round++) {
+		const paths = await scopeNeeded(reason);
+		if (!paths) break;
+		widen(paths, reason);
+		if (/^files outside /.test(reason)) { reason = await verdict(); continue; } // the change is already there: judge it again
+		setDoing("continuing with the wider scope");
+		t = await turn(scopePrompt(c, paths), c.itemMinutes, onActivity);
+		reason = await verdict();
+	}
 	for (let round = 0; reason && t.status === "ok" && round < c.fixRounds; round++) {
 		// A size stop is never "fixed" by asking the agent to fit under the limit: that is how a worker
 		// drops the real change, keeps the old implementation and reports DONE. Too big stays too big.
-		if (/^agent: (BLOCKED|GAPS|WAITING)/.test(reason) || isSizeStop(reason) || reason === "no changes were made" || ctx.stopRequested()) break;
+		if (/^agent: (BLOCKED|GAPS|WAITING)|^needs you/.test(reason) || isSizeStop(reason) || reason === "no changes were made" || ctx.stopRequested()) break;
 		setDoing(`fixing: ${firstLine(reason).slice(0, 80)}`);
 		t = await turn(fixPrompt(c, reason), Math.max(10, Math.round(c.itemMinutes / 2)), onActivity);
 		reason = await verdict();
@@ -1515,22 +1956,39 @@ async function workItem(ctx, slot, wt, item) {
 	const release = () => ctx.growthReserved.delete(item.key);
 	// a check found production gaps: queue fix items before it and check again after them
 	if (reason?.startsWith("agent: GAPS") && item.check) {
-		const round = (state.gapRound?.[item.key] ?? 0) + 1;
+		// a round with findings left over (no room for them) does not count: they were never tried
+		const round = (state.gapRound?.[item.key] ?? 0) + (state.gapBacklog?.[item.key] ? 0 : 1);
 		const gaps = t.reply.split("\n").map((l) => l.match(/^\s*GAP:\s*(.+?)\s*$/)?.[1]).filter(Boolean).slice(0, 12);
 		const room = Math.min(Math.max(1, Math.floor(c.maxGapItems ?? 3)), growthLeft());
 		if (c.autoFix !== false && round <= (c.gapRounds ?? 2) && room > 0) {
 			const base0 = (state.fixes?.[item.key] ?? []).length;
-			reserve(room);
-			fixLines = mergeGaps(gaps, room).map((g, i) => `- [ ] ${item.id}-fix${base0 + i + 1} — ${g}${sessionTags}`);
-			kind = "gaps";
-			state.gapRound = { ...(state.gapRound ?? {}), [item.key]: round };
+			const plain = { ...ctx.c, itemChecks: c.itemChecks }; // the task's limits, not this check's
+			const plan = planGapJobs(gaps, { room, maxFiles: plain.maxFilesGrowing ?? 5, allowedPaths: c.allowedPaths });
+			const all = ctx.currentItems?.() ?? [];
+			const admitted = [], rejected = [...plan.rejected.map((r) => `${r.gap.slice(0, 140)} — ${r.why}`)];
+			for (const g of plan.jobs) {
+				const line = `- [ ] ${item.id}-fix${base0 + admitted.length + 1} — ${g}${sessionTags}`;
+				const why = admissionProblem(line, plain, [...all, ...admitted.flatMap((l) => parseQueue(l))]);
+				if (why) rejected.push(`${g.slice(0, 140)} — ${why}`);
+				else admitted.push(line);
+			}
+			for (const r of rejected) log(`REJECTED ${item.id} finding · ${r}`);
+			if (rejected.length) appendFileSync(join(repo, DIR, "notes", `${item.id}.md`), `\n\n## Findings not queued (round ${round})\n\n${rejected.map((r) => `- ${r}`).join("\n")}\n`);
+			if (admitted.length) {
+				reserve(admitted.length);
+				fixLines = admitted;
+				kind = "gaps";
+				state.gapRound = { ...(state.gapRound ?? {}), [item.key]: round };
+				state.gapBacklog = { ...(state.gapBacklog ?? {}), [item.key]: plan.leftover.length };
+				if (plan.leftover.length) log(`GAPS ${item.id} · ${plan.leftover.length} more finding(s) wait for the next round (no room now)`);
+			} else reason = `needs you: ${item.id}'s findings could not be queued: ${rejected.map((r) => r.slice(0, 200)).join(" | ")}`;
 		} else reason = room > 0 ? `gaps remain after ${round - 1} fix round(s): ${gaps.map((g) => g.slice(0, 120)).join(" | ")}` : `needs you: the queue's growth budget is used up (${growthUsed(state)} derived items); gaps: ${gaps.map((g) => g.slice(0, 100)).join(" | ")}`;
 	}
 	// WAITING: <ids> — it needs another item's work first: run it again after those items (no failure, no split)
 	if (reason?.startsWith("agent: WAITING")) {
 		const all = ctx.currentItems?.() ?? [];
 		const named = [...new Set((reason.match(/\b[A-Z]+\d+[A-Za-z0-9-]*\b/g) ?? []).filter((id) => id !== item.id))];
-		const open = named.filter((id) => all.some((i) => (i.id === id || (i.child && i.id.startsWith(id) && /^[a-z]$/.test(i.id.slice(id.length)))) && !state.done[i.key]));
+		const open = named.filter((id) => all.some((i) => (i.id === id || (i.child && i.id.startsWith(id) && /^[a-z]$/.test(i.id.slice(id.length)))) && !state.done[i.key] && !state.failed[i.key]));
 		const waits = (state.waits?.[item.key] ?? 0) + 1;
 		let ok = open.length > 0 && waits <= (c.maxWaits ?? 3);
 		if (ok) {
@@ -1544,6 +2002,32 @@ async function workItem(ctx, slot, wt, item) {
 			}
 		}
 		if (!ok) reason = `agent: BLOCKED: ${reason.slice("agent: WAITING: ".length)}${named.length && !open.length ? " (the items it waits for are already done or unknown)" : ""}`;
+	}
+	// Paths it names that do not exist: which files have that name, which open items name them (and so provide them).
+	const isOpen = (o) => o.key !== item.key && !state.done[o.key] && !state.failed[o.key];
+	const graphOk = (patch) => { try { dependencyGraph(allItems(ctx.queueText?.() ?? "", { ...state, ...patch })); return true; } catch { return false; } };
+	const missingPaths = async (why) => {
+		const all = ctx.currentItems?.() ?? [];
+		// files under its own areas are what the item itself creates: not missing
+		const named = mentionedPaths(`${item.line}\n${why}\n${t.reply}`).filter((p) => widenable(p) && !existsSync(join(wt, p)) && !pathAllowed(p, item.areas ?? [])).slice(0, 20);
+		if (!named.length) return [];
+		const files = (await git(wt, "ls-files")).out.split("\n").filter(Boolean);
+		return named.map((p) => {
+			const name = basename(p);
+			return { path: p, hits: files.filter((f) => f === name || f.endsWith(`/${name}`)).slice(0, 5), providers: all.filter((o) => isOpen(o) && o.line.includes(p)).map((o) => o.id) };
+		});
+	};
+	// It lacks files that items which have not run yet name: wait for exactly those, now (no session, no deferral to the end).
+	if (kind === "fail" && reason?.startsWith("agent: BLOCKED") && !/^agent: BLOCKED: (decision|env)\b/i.test(reason)) {
+		const missing = await missingPaths(reason);
+		const providers = [...new Set(missing.flatMap((m) => m.providers))];
+		const waitFor = { ...(state.waitFor ?? {}), [item.key]: [...new Set([...(state.waitFor?.[item.key] ?? []), ...providers])] };
+		if (missing.length && missing.every((m) => m.providers.length && !m.hits.length) && (state.waits?.[item.key] ?? 0) < (c.maxWaits ?? 3) && graphOk({ waitFor })) {
+			state.waitFor = waitFor;
+			state.waits = { ...(state.waits ?? {}), [item.key]: (state.waits?.[item.key] ?? 0) + 1 };
+			kind = "waiting";
+			log(`REWORK ${item.id} · ${firstLine(reason).slice(0, 100)} → waits for ${providers.join(", ")} (they provide ${missing.map((m) => m.path).join(", ")})`);
+		}
 	}
 	// BLOCKED while other work is still pending (often a prerequisite that has not run yet): try once more after it.
 	// A decision only the user can make is not deferred: it goes straight to "needs you".
@@ -1567,11 +2051,17 @@ async function workItem(ctx, slot, wt, item) {
 			if (st.status === "ok" && texts.length > allowed) reason = `needs you: too big for one session; the agent needs ${texts.length} parts but at most ${allowed} fit (splitMax / growth budget) · ${firstLine(reason)}`;
 			else if (st.status === "ok" && texts.length >= 2) {
 				const kid = (n) => `${item.id}${String.fromCharCode(96 + n)}`;
-				splitLines = texts.map(
+				const lines = texts.map(
 					(txt, i) =>
 						`- [ ] ${kid(i + 1)} — ${txt.replace(/\[after:\s*([^\]]+)\]/i, (_, deps) => `[after: ${deps.split(/[,\s]+/).filter(Boolean).map((d) => (/^\d+$/.test(d) ? kid(Number(d)) : d)).join(", ")}]`)}${sessionTags}`,
 				);
-				kind = "split";
+				// every part must be runnable as written (all or nothing: a dropped part is dropped work)
+				const others = (ctx.currentItems?.() ?? []).filter((o) => o.key !== item.key);
+				const parts = lines.flatMap((l) => { try { return parseQueue(l); } catch { return []; } });
+				const top = Math.max(c.maxFilesGrowing ?? 5, ...(c.escalate ?? []).map((l) => l.maxFilesGrowing ?? 0));
+				const problems = lines.map((l) => admissionProblem(l, { ...ctx.c, itemChecks: c.itemChecks }, [...others, ...parts.filter((p) => !l.includes(`${p.id} —`))], { maxFiles: top })).filter(Boolean);
+				if (problems.length) reason = `the split is not runnable as written: ${problems.join(" | ").slice(0, 600)} · ${firstLine(reason)}`;
+				else { splitLines = lines; kind = "split"; }
 			}
 		}
 	}
@@ -1582,6 +2072,11 @@ async function workItem(ctx, slot, wt, item) {
 		m = await measure(wt, base, c.allowedPaths);
 		if (m.files.length === 0) {
 			sha = "checked"; // a [check] item that verified without changing anything: nothing to commit
+			if (item.readonly) {
+				// the findings are the result: keep them for dependents and the morning report
+				mkdirSync(join(repo, DIR, "reports"), { recursive: true });
+				writeFileSync(join(repo, DIR, "reports", `${item.id}.md`), `# ${item.id} — ${item.title}\n\n${String(t.reply).replace(/^\s*DONE\b[^\n]*\n?/, "").trim()}\n`);
+			}
 			break;
 		}
 		await git(wt, "add", "-A");
@@ -1676,9 +2171,90 @@ async function workItem(ctx, slot, wt, item) {
 			}
 		});
 	}
-	if (solo) await git(wt, "reset", "--hard", reason ? base : "HEAD");
-	else await git(wt, "checkout", "--detach", "--force", (await git(repo, "rev-parse", branch)).out.trim());
-	await git(wt, "clean", "-fd");
+	const resetWorktree = async () => {
+		if (solo) await git(wt, "reset", "--hard", reason ? base : "HEAD");
+		else await git(wt, "checkout", "--detach", "--force", (await git(repo, "rev-parse", branch)).out.trim());
+		await git(wt, "clean", "-fd");
+	};
+	await resetWorktree();
+
+	// Rework: a failure that rewriting the item can fix gets a fresh read-only look at the code, which rewrites the item,
+	// makes it wait for what it lacks, or gives up with the reason. Never the same item again unchanged.
+	const count = () => { state.reworks = { ...(state.reworks ?? {}), [item.key]: reworks + 1 }; };
+	const reworkItem = async (why) => {
+		const all = ctx.currentItems?.() ?? [];
+		const missing = await missingPaths(why);
+		const waitOn = (ids, note) => {
+			const waitFor = { ...(state.waitFor ?? {}), [item.key]: [...new Set([...(state.waitFor?.[item.key] ?? []), ...ids])] };
+			if (!graphOk({ waitFor })) return undefined;
+			state.waitFor = waitFor;
+			count();
+			return { note };
+		};
+		const related = all.filter((o) => o.key !== item.key && (areasOverlap(o.areas ?? [], item.areas ?? []) || `${why}\n${t.reply}`.includes(o.id)));
+		const rest = all.filter((o) => o.key !== item.key && !related.includes(o) && isOpen(o));
+		const status = (o) => state.done[o.key] ? "done" : state.failed[o.key] ? "failed" : "open";
+		const others = [...related, ...rest].slice(0, 80).map((o) => `- ${o.id} · ${status(o)} · ${o.title.slice(0, 90)}${o.areas?.length ? ` · ${o.areas.join(", ")}` : ""}`).join("\n") || "(none)";
+		setDoing("rework: finding out why it failed");
+		save();
+		const rref = { id: web ? undefined : randomUUID(), web };
+		const rt = await turn(reworkPrompt(c, item, why, t.reply, missing, others), Math.min(30, Math.max(10, Math.round(c.itemMinutes / 2))), onActivity, "coding", rref, `rework ${item.id}: ${item.title}`.slice(0, 80));
+		await resetWorktree(); // read-only: whatever it changed goes
+		if (rref.id) state.sessions = { ...(state.sessions ?? {}), [rref.id]: { item: item.id, status: "rework", web: !!web } };
+		if (rt.status !== "ok") return undefined; // could not look: the failure stays as it is
+		appendFileSync(join(repo, DIR, "notes", `${item.id}.md`), `\n\n## Rework (fresh read-only session)\n\n${rt.reply}\n`);
+		const first = (re) => rt.reply.match(re)?.[1]?.trim();
+		const give = first(/^\s*GIVE UP:\s*(.+)$/im);
+		const rewrite = first(/^\s*REWRITE:\s*(.+)$/im);
+		const after = first(/^\s*AFTER:\s*(.+)$/im);
+		const obsolete = first(/^\s*OBSOLETE:\s*(.+)$/im);
+		if (rewrite || obsolete) {
+			const KEEP = /\[(model|thinking|tier|big|check|readonly|files=|lines=|min=)[^\]]*\]/gi;
+			const keep = (item.line.match(KEEP) ?? []).join(" ");
+			let body = rewrite
+				? rewrite.replace(/^-\s\[\s\]\s*/, "").replace(/^[A-Z]+\d+[A-Za-z0-9-]*\s*[—:-]\s*/, "").replace(KEEP, "").trim()
+				// "already met": the item runs once more to show it (ALREADY DONE runs the checks), it is never just marked done
+				: `${item.line.replace(KEEP, "").trim()} (A rework found it may already be met: ${obsolete.slice(0, 400)}. Verify every Done when condition; if all hold, change nothing and reply ALREADY DONE.)`;
+			if (!/Done when:\s*\S/i.test(body)) { count(); return { giveUp: "the rework gave no usable Done when" }; }
+			if (!/\[areas?:/i.test(body) && item.areas?.length) body += ` [areas: ${item.areas.join(", ")}]`;
+			let line = `${item.id} — ${body}${keep ? ` ${keep}` : ""}`;
+			let parsed;
+			try { parsed = parseQueue(`- [ ] ${line}`)[0]; } catch { parsed = undefined; }
+			if (!parsed) { count(); return { giveUp: "the rework's item line was malformed" }; }
+			if (parsed.line.replace(/\s+/g, " ") === item.line.replace(/\s+/g, " ")) { count(); return { giveUp: "the rework could only repeat the item unchanged" }; }
+			const outside = (parsed.areas ?? []).filter((a) => !pathAllowed(a, c.allowedPaths));
+			if (outside.length) {
+				if (!canWiden || outside.some((a) => !ordinaryScopeFile(wt, a)) || (state.scope?.[item.key]?.length ?? 0) + outside.length > (c.widenMax ?? 12)) { count(); return { giveUp: `the item needs ${outside.join(", ")}, outside the allowed paths` }; }
+				widen(outside, `rework: the item also changes ${outside.join(", ")}`);
+			}
+			const known = new Set(all.map((o) => o.id));
+			const unknown = (parsed.after ?? []).filter((d) => d !== "*" && !known.has(d) && !all.some((o) => o.id.startsWith(d)));
+			if (unknown.length || !graphOk({ rewrites: { ...(state.rewrites ?? {}), [item.key]: line } })) line = line.replace(/\s*\[after:[^\]]*\]/i, ""); // drop prerequisites that do not exist or would close a cycle
+			state.rewrites = { ...(state.rewrites ?? {}), [item.key]: line };
+			count();
+			try { appendFileSync(join(repo, DIR, "decisions.md"), `\n## ${item.id} · ${new Date().toISOString().slice(0, 16).replace("T", " ")}\nReworked after: ${firstLine(why).slice(0, 300)}\nWas: ${item.line}\nNow: ${line}\n`); } catch {}
+			return { note: rewrite ? `rewritten: ${parseQueue(`- [ ] ${line}`)[0].title.slice(0, 120)}` : "may already be met · runs once more to verify" };
+		}
+		if (after) {
+			const ids = [...new Set(after.split("—")[0].match(/\b[A-Z]+\d+[A-Za-z0-9-]*\b/g) ?? [])].filter((id) => all.some((o) => (o.id === id || (o.child && o.id.startsWith(id))) && isOpen(o)));
+			const r = ids.length && waitOn(ids, `waits for ${ids.join(", ")}: ${after.split("—").slice(1).join("—").trim().slice(0, 120)}`);
+			if (r) return r;
+			count();
+			return { giveUp: `needs ${after.slice(0, 120)}, which is not an open item` };
+		}
+		count();
+		return { giveUp: give ? give : `the rework gave no answer: ${firstLine(rt.reply).slice(0, 120)}` };
+	};
+	let reworkNote = "";
+	const reworks = state.reworks?.[item.key] ?? 0;
+	if (kind === "fail" && c.rework !== false && !item.check && reworkable(reason) && !ctx.stopRequested()) {
+		if (reworks >= (c.maxReworks ?? 2)) reason = `needs you: reworked ${reworks}× and still failing · ${firstLine(reason)}`;
+		else {
+			const outcome = await reworkItem(reason);
+			if (outcome?.giveUp) reason = `needs you: ${outcome.giveUp.slice(0, 200)} (rework) · ${firstLine(reason)}`;
+			else if (outcome) { kind = "reworked"; reworkNote = outcome.note; }
+		}
+	}
 	delete state.running[slot];
 
 	if (!reason) {
@@ -1702,6 +2278,9 @@ async function workItem(ctx, slot, wt, item) {
 		state.splits = { ...(state.splits ?? {}), [item.key]: splitLines };
 		delete state.failed[item.key];
 		log(`SPLIT ${item.id} · could not be done in one go (${firstLine(reason).slice(0, 80)}) · now ${splitLines.length} smaller items ${item.id}a…${item.id}${String.fromCharCode(96 + splitLines.length)}${kept}`);
+	} else if (kind === "reworked") {
+		delete state.failed[item.key];
+		log(`REWORK ${item.id} · ${firstLine(reason).slice(0, 100)} → ${reworkNote}${kept} · ${mins} min`);
 	} else if (kind === "conflict" && !state.retried[item.key]) {
 		state.retried[item.key] = true;
 		log(`CONFLICT ${item.id} · ${firstLine(reason)}${kept} · will retry at the end · ${mins} min`);
@@ -1712,13 +2291,78 @@ async function workItem(ctx, slot, wt, item) {
 		log(`STOPPED ${item.id}${kept}`);
 	}
 	if (ref.id && state.sessions?.[ref.id]) {
-		state.sessions[ref.id].status = !reason ? "pass" : ["split", "gaps", "deferred", "waiting"].includes(kind) ? kind : reason === "stopped by request" ? "stopped" : "fail";
+		state.sessions[ref.id].status = !reason ? "pass" : ["split", "gaps", "deferred", "waiting", "reworked"].includes(kind) ? kind : reason === "stopped by request" ? "stopped" : "fail";
 		if (!reason && ctx.c.deleteSessions === "pass") await deleteSessions(ctx, [ref.id]);
 	}
 	save();
 	release(); // recorded in state.splits / state.fixes by now, or not added at all
-	notifyRunner(!reason ? "completion" : ["deferred", "conflict", "gaps", "split", "waiting"].includes(kind) ? "deferred" : "failure", { id: item.id, kind, runId: state.runId });
+	notifyRunner(!reason ? "completion" : ["deferred", "conflict", "gaps", "split", "waiting", "reworked"].includes(kind) ? "deferred" : "failure", { id: item.id, kind, runId: state.runId });
 	return { pass: !reason, kind, redone, stopped: reason === "stopped by request" };
+}
+
+// ---------- resources: stray processes, simulators, memory ----------
+
+/** Processes whose working directory is inside `dir`: dev servers, emulators and watchers a worker left running. */
+export async function straysIn(dir) {
+	let root;
+	try { root = realpathSync(dir); } catch { return []; }
+	const inside = (p) => p === root || p.startsWith(`${root}/`);
+	const mine = new Set([process.pid, process.ppid]);
+	const pids = [];
+	if (process.platform === "linux") {
+		for (const p of readdirSync("/proc")) {
+			if (!/^\d+$/.test(p) || mine.has(Number(p))) continue;
+			try { if (inside(readlinkSync(`/proc/${p}/cwd`))) pids.push(Number(p)); } catch {}
+		}
+		return pids;
+	}
+	const r = await run(root, "lsof", ["-n", "-P", "-d", "cwd", "-Fpn"], { timeoutMs: 20_000 });
+	let pid;
+	for (const line of r.out.split("\n")) {
+		if (line.startsWith("p")) pid = Number(line.slice(1));
+		else if (line.startsWith("n") && pid && !mine.has(pid) && inside(line.slice(1))) pids.push(pid);
+	}
+	return [...new Set(pids)];
+}
+
+export async function killStrays(dir, log, label = "", keep = new Set()) {
+	const pids = (await straysIn(dir)).filter((p) => !keep.has(p));
+	if (!pids.length) return 0;
+	for (const pid of pids) { try { process.kill(pid, "SIGTERM"); } catch {} }
+	for (let i = 0; i < 12 && pids.some(pidAlive); i++) await sleep(250);
+	for (const pid of pids.filter(pidAlive)) { try { process.kill(pid, "SIGKILL"); } catch {} }
+	log?.(`CLEANUP ${label} · stopped ${pids.length} process(es) left running in its worktree`);
+	return pids.length;
+}
+
+/** iOS simulators currently booted (macOS with Xcode only); undefined elsewhere. */
+export function bootedSimulators() {
+	if (process.platform !== "darwin") return undefined;
+	const r = spawnSync("xcrun", ["simctl", "list", "devices", "booted", "-j"], { encoding: "utf8", timeout: 15_000 });
+	if (r.status !== 0) return undefined;
+	try { return new Set(Object.values(JSON.parse(r.stdout).devices ?? {}).flat().map((d) => d.udid)); } catch { return undefined; }
+}
+
+/** Memory a new item may still use, in GB (macOS counts inactive and purgeable pages as available). */
+export function availableMemoryGB() {
+	try {
+		if (process.platform === "linux") {
+			const kb = Number(readFileSync("/proc/meminfo", "utf8").match(/^MemAvailable:\s+(\d+)/m)?.[1]);
+			if (kb) return kb / 1024 / 1024;
+		}
+		if (process.platform === "darwin") {
+			const out = spawnSync("vm_stat", [], { encoding: "utf8", timeout: 5000 }).stdout ?? "";
+			const page = Number(out.match(/page size of (\d+)/)?.[1] ?? 4096);
+			const pages = (name) => Number(out.match(new RegExp(`Pages ${name}:\\s+(\\d+)`))?.[1] ?? 0);
+			const n = pages("free") + pages("inactive") + pages("speculative") + pages("purgeable");
+			if (n) return (n * page) / 1024 ** 3;
+		}
+	} catch {}
+	return freemem() / 1024 ** 3;
+}
+
+export function memoryFloorGB(c) {
+	return Number(c.minFreeMemoryGB) > 0 ? Number(c.minFreeMemoryGB) : Math.max(4, (totalmem() / 1024 ** 3) * 0.12);
 }
 
 // ---------- interrupted workers ----------
@@ -1788,6 +2432,15 @@ export async function reconcileInterrupted({ repo, c, state, save, log, branch }
 			}
 			alive = pidAlive(r.pid);
 		}
+		// the dead runner's shared background pi (its stdin closed, so it is normally gone already)
+		if (Number.isInteger(r?.rpcPid) && pidAlive(r.rpcPid)) {
+			for (const sig of ["SIGTERM", "SIGKILL"]) {
+				try { process.kill(-r.rpcPid, sig); } catch { try { process.kill(r.rpcPid, sig); } catch {} }
+				for (let i = 0; i < 20 && pidAlive(r.rpcPid); i++) await sleep(250);
+				if (!pidAlive(r.rpcPid)) break;
+			}
+			if (pidAlive(r.rpcPid)) alive = true;
+		}
 		if (!alive && r?.web && r.sessionId) {
 			const w = await webClientFor();
 			if (w === "unknown") alive = true;
@@ -1813,6 +2466,7 @@ export async function reconcileInterrupted({ repo, c, state, save, log, branch }
 		}
 		if (alive) { unresolved.push(`${id}: its worker is still running`); continue; }
 		const wt = r?.worktree ?? (c.worktrees === false ? repo : join(worktreeRoot(repo), `w${slot}`));
+		if (c.killStrays !== false && wt !== repo) await killStrays(wt, log, id);
 		let kept = "";
 		if (existsSync(join(wt, ".git"))) {
 			await git(wt, "rebase", "--abort");
@@ -1889,7 +2543,8 @@ export async function main(repo) {
 	try { dependencyGraph(allItems(readFileSync(queuePath, "utf8"), state)); }
 	catch (e) { return log(`NOT STARTED: ${e.message}`); }
 
-	const ctx = { repo, c, state, save, log, lock: mutex(), branch, stopRequested, pi: await resolvePi(c), env: await loginEnv(), web: null };
+	// rpcPool is shared by reference: turns run on copies of ctx, and each copy must find the same slot processes
+	const ctx = { repo, c, state, save, log, lock: mutex(), branch, stopRequested, pi: await resolvePi(c), env: await loginEnv(), web: null, rpcPool: { max: 1, workers: [] } };
 	ctx.queueText = () => { try { return readFileSync(queuePath, "utf8"); } catch { return ""; } };
 	ctx.currentItems = () => allItems(ctx.queueText(), state);
 	ctx.plannedCount = () => parseQueue(ctx.queueText()).length;
@@ -1907,10 +2562,13 @@ export async function main(repo) {
 
 	// worktrees are made when a slot is first used; w0 now, for the baseline check
 	let maxW = c.worktrees ? Math.max(1, Math.floor(c.parallel) || 1) : 1;
+	ctx.rpcPool.max = maxW;
 	const minW = Math.min(maxW, Math.max(1, Math.floor(c.parallelMin) || 1));
 	let width = Math.min(maxW, Math.max(minW, Math.floor(c.parallelStart) || maxW));
 	const wts = [];
 	const prepLock = mutex();
+	let memCheck = { at: 0, gb: Infinity, logged: 0 };
+	const simsAtStart = c.killStrays !== false ? bootedSimulators() : undefined;
 	try {
 		wts[0] = c.worktrees ? await prepareWorktree(ctx, 0) : repo;
 	} catch (e) {
@@ -1954,9 +2612,9 @@ export async function main(repo) {
 		const depState = (id) => {
 			if (id === "*") return "wildcard";
 			const i = byId.get(id);
-			if (i) return state.done[i.key] ? "done" : state.failed[i.key] ? "failed" : "open";
+			if (i) return state.done[i.key] || state.released?.[i.key] ? "done" : state.failed[i.key] ? "failed" : "open";
 			const kids = items.filter((k) => k.child && k.id.startsWith(id) && /^[a-z]$/.test(k.id.slice(id.length)));
-			if (kids.length) return kids.every((k) => state.done[k.key]) ? "done" : kids.some((k) => state.failed[k.key]) ? "failed" : "open";
+			if (kids.length) return kids.every((k) => state.done[k.key] || state.released?.[k.key]) ? "done" : kids.some((k) => state.failed[k.key] && !state.released?.[k.key]) ? "failed" : "open";
 			return "unknown"; // a typo or an id from elsewhere: ignored
 		};
 		const open = items.filter((i) => !finished(i) && !inFlight.has(i.key));
@@ -1982,7 +2640,8 @@ export async function main(repo) {
 				if (st === "wildcard" && (items.some((o) => o !== i && !finished(o) && !(o.after ?? []).includes("*")) || inFlight.size)) wait = true;
 			}
 			if (wait) continue;
-			if ([...inFlight.values()].some((r) => (r.quarantined && (!r.areas?.length || !i.areas?.length)) || (i.areas?.length && r.areas?.length && areasOverlap(i.areas, r.areas)))) continue;
+			// read-only items lock nothing: they read their own worktree snapshot and never merge
+			if (!i.readonly && [...inFlight.values()].some((r) => (r.quarantined && (!r.areas?.length || !i.areas?.length)) || (!r.readonly && i.areas?.length && r.areas?.length && areasOverlap(i.areas, r.areas)))) continue;
 			if (!parked(i)) firstPassPending = true;
 			if (state.deferred?.[i.key] && firstPassPending) continue;
 			if (!hasCapacity(i.check ? "verification" : "coding")) continue;
@@ -2016,7 +2675,8 @@ export async function main(repo) {
 			if (ctl.task !== c.task) { log("CONTROL ignored: stale task"); continue; }
 			if (ctl.by === "auto") {
 				if (stopRequested() || pauseRequested() || readConfig(repo).manager === false || !ctl.approval || ctl.approval !== approvedTask(repo, readConfig(repo)) || !ctl.ids?.length || !ctl.ids.every((id) => items.some((i) => i.id === id && state.failed[i.key] === ctl.failures?.[id]))) continue;
-				try {
+				// release only lets dependents run; it changes nothing about the failed item itself
+				if (ctl.action !== "release") try {
 					// Budgets were reserved by the supervisor; repeat scope/ownership validation on live state.
 					Object.assign(ctl, validateRecovery(ctl, state, allItems(readFileSync(queuePath, "utf8"), state), {}, c));
 				} catch (e) { log(`CONTROL rejected: ${e.message}`); continue; }
@@ -2029,6 +2689,7 @@ export async function main(repo) {
 				}
 				while (slots < 2 * n) free.push(slots++);
 				maxW = n; // both phase ceilings follow the configured parallelism
+				ctx.rpcPool.max = n; // and the background pi processes (extra idle ones close as they are replaced)
 				setWidth(n, "asked by you");
 				try {
 					const cf = join(repo, DIR, "config.json");
@@ -2037,7 +2698,7 @@ export async function main(repo) {
 				continue;
 			}
 			const changed = applyControl(state, items, ctl ?? {});
-			if (changed.length && ["retry", "repair", "rerun", "recheck", "next"].includes(ctl.action)) { failsInARow = 0; state.failureStreak = 0; halted = ""; }
+			if (changed.length && ["retry", "repair", "amend", "limits", "rerun", "recheck", "next"].includes(ctl.action)) { failsInARow = 0; state.failureStreak = 0; halted = ""; }
 			log(`CONTROL ${ctl?.action} ${(ctl?.ids ?? []).join(",") || (ctl?.action === "add" ? "" : "all")} · ${changed.length ? changed.join(", ") : "nothing matched"}${ctl?.by ? ` · by ${ctl.by}` : ""}`);
 		}
 		state.controlReceipts = [...(state.controlReceipts ?? []), ...files].slice(-1000);
@@ -2093,6 +2754,13 @@ export async function main(repo) {
 			resolve(true);
 		}
 	};
+	// one agent session per `parallel`: coding turns and [check] sessions share it (checks without a session do not)
+	let sessionsOpen = 0;
+	const sessionWaiters = [];
+	ctx.sessionGate = () => new Promise((resolve) => {
+		const grant = () => { sessionsOpen++; let once = false; resolve(() => { if (once) return; once = true; sessionsOpen--; sessionWaiters.shift()?.(); }); };
+		if (sessionsOpen < maxW) grant(); else sessionWaiters.push(grant);
+	});
 	ctx.acquirePhase = async (slot, phase) => {
 		if (stopRequested()) return false;
 		if (phases.get(slot) === phase) return true;
@@ -2119,6 +2787,12 @@ export async function main(repo) {
 		while (!halted && free.length && !stopRequested() && !pauseRequested()) {
 			free.sort((a, b) => a - b);
 			if (free[0] >= slotLimit()) break; // slots above a lowered ceiling stay idle
+			// never start more work than the machine has memory for (servers, emulators, test runners add up fast)
+			if (running.size > 0 && (memCheck.at === 0 || Date.now() - memCheck.at > 15_000)) memCheck = { ...memCheck, at: Date.now(), gb: availableMemoryGB() };
+			if (running.size > 0 && memCheck.gb < memoryFloorGB(c)) {
+				if (Date.now() - memCheck.logged > 10 * 60_000) { memCheck.logged = Date.now(); log(`MEMORY ${memCheck.gb.toFixed(1)} GB available (< ${memoryFloorGB(c).toFixed(0)} GB) · not starting more items until some finish`); }
+				break;
+			}
 			const item = nextItem();
 			if (!item) break;
 			free.sort((a, b) => a - b);
@@ -2145,7 +2819,8 @@ export async function main(repo) {
 					if (c.autoReconcile !== false && !stopRequested()) {
 						const errors = (state.runnerErrors?.[item.key] ?? 0) + 1;
 						state.runnerErrors = { ...(state.runnerErrors ?? {}), [item.key]: errors };
-						const only = { ...state, running: { [slot]: state.running[slot] }, failed: errors <= 2 ? state.failed : {} };
+						// the item's turn is over: the pi process it used is shared with other items and stays
+						const only = { ...state, running: { [slot]: { ...state.running[slot], rpcPid: undefined } }, failed: errors <= 2 ? state.failed : {} };
 						const left = await reconcileInterrupted({ repo, c, state: only, save: () => {}, log, branch }).catch((err) => [String(err?.message ?? err)]);
 						if (!left.length) {
 							delete state.running[slot];
@@ -2175,6 +2850,18 @@ export async function main(repo) {
 		if (!done) continue;
 		const { r, slot, item } = done;
 		running.delete(slot);
+		if (c.killStrays !== false && wts[slot]) {
+			// what the item started (servers, emulators, watchers) goes; the pool's pi processes run from the repo and stay
+			if (wts[slot] !== repo) await killStrays(wts[slot], log, item.id, new Set(ctx.rpcPool.workers.map((w) => w.pid))).catch(() => {});
+		}
+		// simulators booted during the run are shut down once no other item could still be using them
+		if (c.killStrays !== false && simsAtStart && running.size === 0) {
+			const now = bootedSimulators();
+			const extra = [...(now ?? [])].filter((u) => !simsAtStart.has(u));
+			for (const u of extra) spawnSync("xcrun", ["simctl", "shutdown", u], { timeout: 60_000 });
+			if (extra.length) log(`CLEANUP · shut down ${extra.length} simulator(s) booted by items`);
+		}
+		memCheck.at = 0;
 		if (!state.running[slot]?.quarantined) {
 			free.push(slot);
 			phases.delete(slot);
@@ -2185,6 +2872,11 @@ export async function main(repo) {
 			failsInARow = 0;
 			recheckAfter(item);
 		} else if (r.kind === "fail" && !r.stopped) failsInARow++;
+		// a prerequisite that passes now (after a rework or a retry) lets the items that never started run
+		try {
+			const back = reopenDependents(state, allItems(readFileSync(queuePath, "utf8"), state));
+			if (back.length) log(`REOPENED ${back.slice(0, 12).join(", ")}${back.length > 12 ? ` and ${back.length - 12} more` : ""} · their prerequisite no longer fails`);
+		} catch {}
 		state.failureStreak = failsInARow;
 		save();
 		if (c.adaptive !== false && c.worktrees) {
@@ -2204,8 +2896,10 @@ export async function main(repo) {
 		onSignal();
 		pumpPhases();
 		await Promise.all(running.values());
+		await closeRpcPool(ctx);
 		throw e;
 	}
+	await closeRpcPool(ctx);
 	if (pauseRequested() && !halted) halted = "paused after running items finished";
 	state.phase = halted || (Object.keys(state.running).length ? "blocked: quarantined workers" : "finished");
 	save();

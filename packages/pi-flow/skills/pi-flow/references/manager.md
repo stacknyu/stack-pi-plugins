@@ -11,7 +11,7 @@ After an approved handoff passes its baseline, a detached supervisor watches the
 - One repair proposal targets one original failed item with up to three concrete work lines. Repairs must fit both its original areas and task allowed paths, inherit checks/model/size limits, and run before the original item is attempted again. Repairs cannot spawn further repairs. No changed checks, guessed provider/model, new goal, destructive reset or fabricated credentials.
 - Manual pause/stop, changed approval/configuration and uncertain target ownership prevent recovery. Missing decisions/credentials and exhausted budgets remain recorded failures; they do not freeze independent safe work. Quarantined work is preserved, never reclaimed automatically.
 - A dead runner is restarted without a model turn; the restart budget (`maxRestarts`) counts restarts with no item passing in between. On start the runner reconciles interrupted workers: it stops any that still run, keeps their changes on `queue-failed/<id>-interrupted-*`, frees the worktree and queues the item again (`autoReconcile: false` keeps the old fail-closed behaviour).
-- Timeouts and session/provider errors are retried without a model (`retryTransient`). `BLOCKED: decision:` / `BLOCKED: env:`, scope and exhausted budgets are left for you; other failures are diagnosed by the manager model, and retried on the recorded evidence if that model cannot be reached.
+- Timeouts and session/provider errors are retried without a model (`retryTransient`). Every other failure is **reworked by the runner**, not retried unchanged (`rework`, default on): a fresh read-only session reads the code and the failure, then rewrites the item (real paths, a Done when the code can meet, the files it must also change), makes it wait for the open item that provides what it lacks, or gives up with the reason (`maxReworks`, default 2). Missing files that another open item names are waited for without any session. Under full autonomy, an item that needs a few files outside `allowedPaths` gets them (`widenScope`; never `.env`, secrets, CI workflows or `.git`). Every rewrite and widening is logged in `decisions.md` and the morning report. When rework is exhausted or gives up, the failure starts with `needs you:` and the items waiting on it run anyway. With `rework: false` the old model review (retry/repair proposals) is used instead.
 - The manager runs as background pi (`managerIn: "web"` to use Pi Web); `managerModel` / `managerThinking` pick a cheaper model for it. Changing `parallel` does not revoke management. On macOS the supervisor keeps the machine awake (`keepAwake`).
 - Set `manager: false` in `.pi-queue/config.json` to disable automatic management. A direct `node runner.mjs` invocation is unsupervised; normal handoff and `/queue start` launch the supervisor.
 - Models requiring a custom provider extension cannot run in the isolated chat-only manager; configure an available built-in/configured provider. No model fallback is guessed.
@@ -26,13 +26,14 @@ After an approved handoff passes its baseline, a detached supervisor watches the
 |---|---|
 | `queue_overview` | counts, running items, failed items with reasons, parked and open items, recent log |
 | `queue_item` | one item: its line, status, commit (files changed), last result, activity |
-| `queue_control` | `stop`, `pause`, `start`, `retry`, `answer`, `limits`, `skip`, `recheck`, `rerun`, `unpark`, `next`, `add`, `parallel` |
+| `queue_control` | `stop`, `pause`, `start`, `retry`, `answer`, `limits`, `amend`, `skip`, `recheck`, `rerun`, `unpark`, `next`, `add`, `parallel` |
 
 `ids` are item ids or prefixes: `V04` matches `V04a…V04h`. Empty ids means all.
 
 | Action | Effect |
 |---|---|
 | `retry` | failed or parked items run again; starts the queue if it is not running |
+| `amend` | one item: `paths` = exact extra files it may change, and/or `line` = its corrected text (same id, with Done when). The plan file is not edited, so the item's id, state, dependents and the approval stay; it runs again. Show the user the exact change first. |
 | `answer` | ids + text: your decision or guidance is added to the items' evidence, then they run again. The way to resolve `BLOCKED: decision` |
 | `limits` | ids + `{maxNetLines, maxFilesGrowing, itemMinutes}`: raise limits for those items, then run them again |
 | `skip` | accept items as done without running them; their dependents proceed |
